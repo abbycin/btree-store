@@ -1,0 +1,20 @@
+[package]
+name = "btree-store"
+version = "0.1.0"
+edition = "2024"
+authors = ["AbbyCin <abbytsing@gmail.com>"]
+readme = "README.md"
+homepage = "https://github.com/abbycin/btree-store"
+repository = "https://github.com/abbycin/btree-store"
+description = "A persistent, embedded key-value storage engine in Rust featuring a Copy-On-Write (COW) B-Tree, ACID compliance, and crash safety with multi-bucket support"
+license = "MIT"
+keywords = ["database", "kv", "btree", "storage", "embedded"]
+categories = ["database-implementations", "data-structures"]
+
+[dependencies]
+crc32c = "0.6.8"
+parking_lot = "0.12.5"
+
+[dev-dependencies]
+tempfile = "3.0"
+rand = "0.8.5"

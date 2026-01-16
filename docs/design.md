@@ -16,7 +16,7 @@
 The system is layered as follows:
 
 ### 2.1. User API Layer (`src/lib.rs`)
-- **`BTree`**: The main entry point. It manages a "Catalog Tree" which maps bucket names to their Root Page IDs.
+- **`BTree`**: The main entry point. It manages a "Catalog Tree" which maps bucket names to their Root Page IDs. It now includes a **Bucket Handle Cache** to ensure that all threads accessing the same bucket share the same `root_page_id` lock.
 - **`Bucket`**: A handle to a specific named B+ Tree. Users perform `put`, `get`, `del`, and `iter` operations here.
 
 ### 2.2. Tree Logic Layer (`Tree` struct in `src/lib.rs`)
@@ -72,38 +72,25 @@ Manages the physical file, page cache, and free space.
 
 ## 3. Core Mechanisms
 
-### 3.1. Crash Safety & Commit Protocol
-The system uses a **2-Phase Commit** inspired approach with a helper log (`.pending`) to handle page lifecycle safely.
+### 3.1. Transaction Isolation & Commit Protocol
+The system implements **Snapshot Isolation (SI)** to ensure data consistency and prevent "Lost Update" anomalies.
 
-1.  **Phase 1: Prepare (In-Memory & Data Sync)**
-    - All new data and nodes are written to *newly allocated* pages.
-    - `fsync` is called to ensure these new pages are durable.
-    - **Invariant:** The old tree structure is untouched on disk.
+#### Snapshot Isolation Logic:
+1.  **Transaction Start:** When a `BTree` instance is opened or a commit succeeds, it captures the current disk `root_current` as its `start_root_id` (the snapshot).
+2.  **Isolated Writes:** All modifications (`put`, `del`) within a `Bucket` are recorded in a `pending_bucket_updates` map and the global `pending_free/alloc` lists. These changes are **invisible** to other threads or instances until `commit()` is called.
+3.  **Read-Your-Writes:** A `BTree` instance can see its own uncommitted changes by checking the pending updates before falling back to the shared lock/disk state.
 
-2.  **Phase 2: Write Pending Log**
-    - A `.pending` file is written containing:
-        - `freed`: List of Page IDs that *will* be freed if commit succeeds.
-        - `alloc`: List of Page IDs allocated in this transaction.
-    - This log is `fsync`ed.
-
-3.  **Phase 3: Atomic Switch**
-    - The **Superblock** is updated to point to the new Root Page ID.
-    - This is the "Point of No Return". Once the Superblock is synced, the transaction is committed.
-
-4.  **Phase 4: Post-Commit Cleanup**
-    - **Physical Free:** Pages in the `freed` list are added to the on-disk Free List.
-    - **Log Clear:** The `.pending` file is deleted.
-
-**Recovery Logic (`recover_pending`):**
-- **Undo-Alloc:** If crash happens *before* Superblock update, the transaction is invalid. The `alloc` pages from the log are reclaimed (freed).
-- **Redo-Free:** If crash happens *after* Superblock update (but before Post-Commit), the transaction is valid. The `freed` pages from the log are reclaimed.
+#### Commit Protocol (First-Committer-Wins):
+1.  **Conflict Detection (CAS):** Upon `commit()`, the engine re-reads the disk Superblock. If the disk's `root_current` differs from the transaction's `start_root_id`, it means another instance has committed in the interim. The commit fails with `Error::Conflict`.
+2.  **Metadata Sync:** If no conflict is detected, the engine applies all pending bucket updates to the Catalog Tree.
+3.  **Atomic Switch:** The Superblock is updated with the new Catalog Tree root and a new transaction sequence.
+4.  **Memory Sync:** After a successful disk commit, the engine atomically updates all shared `Bucket` locks in the cache so that subsequent operations (and other threads) see the new state.
 
 ### 3.2. Concurrency Control
-- **RwLock:** The `BTree` uses `RwLock` for the Root Page ID and Free/Alloc lists.
-    - Multiple Readers: Allowed (read `root_page_id`).
-    - Single Writer: Only one thread can `commit` at a time.
-- **Deadlock Prevention:**
-    - Strict locking order is enforced: **Lock `pending_free` FIRST, then `pending_alloc`**.
+- **Shared Locking:** `BTree` uses an internal `buckets` cache (`HashMap<Vec<u8>, Arc<RwLock<u64>>>`). This ensures that multiple handles to the same logical bucket share the same physical lock, preventing structural corruption.
+- **Granular Locking:** Uses `parking_lot::RwLock` for high-performance, non-recursive locking of metadata and page lists.
+- **Snapshot Stability:** Once a handle is obtained or an iterator is created, it is guaranteed to see a consistent snapshot of the data.
+- **Explicit Refresh:** Users can call `db.refresh()` to discard pending changes and "jump" to the latest disk snapshot, which is the recommended way to resolve `Conflict` errors.
 
 ### 3.4. Large Value Storage (Overflow Pages)
 Values larger than `MAX_INLINE_LEN` (64 bytes) are stored in separate overflow pages to keep B-Tree nodes compact.
@@ -191,10 +178,9 @@ The `.pending` file is a temporary WAL used only during commit.
 ## 5. Implementation Details
 
 - **Iterators:**
-    - `TreeIterator` maintains a stack of `(Node, index)` to perform Depth-First Search (DFS).
-    - It holds a reference to `Store` to load pages lazily.
-- **Checksums:**
-    - Every page (Node, Meta, Free) has a CRC32C checksum.
-    - Checksums are verified on read and updated on write.
+    - `TreeIterator` captures a `root_id` at creation time, providing a stable snapshot even if the tree is modified concurrently.
+    - `BTreeIterator` (for buckets) now uses the `get_bucket` cache to ensure handle consistency during iteration.
+- **Conflict Resolution Pattern:**
+    - The standard retry pattern is: `loop { do_work(); if db.commit().is_ok() { break; } db.refresh()?; }`.
 - **Root Collapse:**
     - Optimization: If a root deletion results in a branch node with a single child, that child is promoted to be the new root. This keeps the tree height minimal.

@@ -551,6 +551,50 @@ impl Store {
         self.sb.lock().root_current
     }
 
+    pub fn refresh_sb(&self) -> Result<u64> {
+        let file = self.file.lock();
+        let mut buf0 = vec![0u8; PAGE_SIZE];
+        let mut buf1 = vec![0u8; PAGE_SIZE];
+
+        let r0 = file.pread_exact(&mut buf0, 0);
+        let r1 = file.pread_exact(&mut buf1, PAGE_SIZE as u64);
+
+        let sb0 = if r0.is_ok() {
+            let s = MetaNode::from_slice(&buf0);
+            if s.validate().is_ok() { Some(s) } else { None }
+        } else {
+            None
+        };
+
+        let sb1 = if r1.is_ok() {
+            let s = MetaNode::from_slice(&buf1);
+            if s.validate().is_ok() { Some(s) } else { None }
+        } else {
+            None
+        };
+
+        let sb = match (sb0, sb1) {
+            (Some(s0), Some(s1)) => {
+                if s0.seq >= s1.seq {
+                    s0
+                } else {
+                    s1
+                }
+            }
+            (Some(s0), None) => s0,
+            (None, Some(s1)) => s1,
+            (None, None) => return Err(Error::Corruption),
+        };
+
+        let mut current_sb = self.sb.lock();
+        if sb.seq > current_sb.seq {
+            *current_sb = sb;
+            Ok(sb.root_current)
+        } else {
+            Ok(current_sb.root_current)
+        }
+    }
+
     pub(crate) fn update_root(&self, root_id: u64) -> Result<()> {
         let mut sb = self.sb.lock();
 

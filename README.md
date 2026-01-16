@@ -4,20 +4,21 @@
 
 ## Features
 
-*   **ACID Compliance:** Atomic commits using COW and double-buffered meta pages.
+*   **ACID Compliance:** Atomic commits using COW, Snapshot Isolation, and double-buffered meta pages.
+*   **Conflict Detection:** Built-in "First-Committer-Wins" strategy ensures data integrity in multi-process environments.
 *   **Crash Safety:** A dedicated `.pending` log recovery mechanism reclaims leaked pages from interrupted transactions.
 *   **Buckets:** Logical namespaces for data separation within a single database file.
-*   **Zero-Allocation Iterators:** High-performance iterators returning `(&[u8], &[u8])` with internal buffer reuse to minimize GC pressure and memory overhead.
-*   **Efficient Concurrency:** Granular locking using `parking_lot` and sharded node caching.
+*   **Zero-Allocation Iterators:** High-performance iterators returning `(&[u8], &[u8])` with internal buffer reuse.
+*   **Efficient Concurrency:** Shared bucket handles and Snapshot Isolation (SI) using `parking_lot` for scalable access.
 *   **Data Integrity:** Full CRC32C checksum validation for every page (nodes, meta, and free lists).
-*   **Zero External Dependencies:** Core engine built using native Rust standard library for a lightweight footprint.
+*   **Zero External Dependencies:** Core engine built using native Rust standard library.
 
 ## Architecture
 
 *   **Store (`src/store.rs`):** Low-level page management, sharded LRU caching, and positional I/O.
 *   **Node (`src/node.rs`):** B-Tree node serialization, splitting, compacting, and checksumming.
-*   **Tree (`src/lib.rs`):** Core B+ Tree algorithms including COW insertion, deletion with root collapse optimization, and search.
-*   **Bucket (`src/lib.rs`):** High-level API for user-facing key-value operations.
+*   **Tree (`src/lib.rs`):** Core B+ Tree algorithms and Snapshot Isolation logic.
+*   **Bucket (`src/lib.rs`):** High-level API with shared handle caching.
 
 ## Usage
 
@@ -28,33 +29,28 @@ Add this to your `Cargo.toml`:
 btree-store = "0.1.0"
 ```
 
-### Basic Example
+### Basic Example (with Conflict Handling)
 
 ```rust
-use btree_store::BTree;
+use btree_store::{BTree, Error};
 
-fn main() -> Result<(), btree_store::Error> {
-    // Open or create the database
+fn main() -> Result<(), Error> {
     let db = BTree::open("data.db")?;
+    let bucket = db.get_bucket("users").or_else(|_| db.new_bucket("users"))?;
 
-    // Create or retrieve a bucket
-    let bucket = db.new_bucket("users")?;
+    loop {
+        // Perform operations
+        bucket.put(b"id:100", b"Alice")?;
 
-    // Insert data
-    bucket.put(b"id:100", b"Alice")?;
-    
-    // Retrieve data
-    if let Some(val) = bucket.get(b"id:100").ok() {
-        println!("Found user: {:?}", String::from_utf8_lossy(&val));
-    }
-
-    // Commit changes to disk
-    db.commit()?;
-
-    // Iterate efficiently
-    let mut iter = bucket.iter()?;
-    while let Some((k, v)) = iter.next() {
-        println!("Key: {:?}, Value: {:?}", k, v);
+        // Commit changes
+        match db.commit() {
+            Ok(_) => break,
+            Err(Error::Conflict) => {
+                // Another instance committed first, refresh and retry
+                db.refresh()?;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     Ok(())
@@ -64,9 +60,11 @@ fn main() -> Result<(), btree_store::Error> {
 ## Performance Design
 
 The engine is optimized for high-throughput scenarios:
+*   **Snapshot Isolation (SI)** allows concurrent readers and writers to operate without blocking each other.
+*   **Bucket Handle Caching** ensures all threads share the same metadata locks, preventing structural corruption.
 *   **Cursor-based path traversal** avoids redundant tree searches.
 *   **RAII CommitContext** ensures zero-leak automatic rollbacks on failure.
-*   **Transmute-based lifetime extension** in iterators allows returning direct references to internal buffers under a read lock, achieving C-like performance in Rust.
+*   **Transmute-based lifetime extension** in iterators allows returning direct references to internal buffers under a read lock.
 
 ## Testing
 

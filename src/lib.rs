@@ -1,4 +1,9 @@
-use std::{collections::HashSet, fmt, io, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, io,
+    path::Path,
+    sync::Arc,
+};
 
 use parking_lot::{RwLock, RwLockReadGuard};
 
@@ -15,6 +20,7 @@ pub enum Error {
     IoError,
     Invalid,
     Duplicate,
+    Conflict,
 }
 
 impl fmt::Display for Error {
@@ -243,13 +249,13 @@ pub struct Tree {
 impl Tree {
     pub fn open(
         store: Arc<Store>,
-        initial_root_id: u64,
+        root_page_id: Arc<RwLock<u64>>,
         pending_free: Arc<RwLock<Vec<(u64, u32)>>>,
         pending_alloc: Arc<RwLock<HashSet<u64>>>,
     ) -> Result<Self> {
         Ok(Self {
             store,
-            root_page_id: Arc::new(RwLock::new(initial_root_id)),
+            root_page_id,
             pending_free,
             pending_alloc,
         })
@@ -805,7 +811,6 @@ impl<'a> Iterator for BucketIterator<'a> {
 
 pub struct BTreeIterator<'a> {
     tree_iter: TreeIterator,
-    store: Arc<Store>,
     main_tree: Arc<BTree>,
     key_buf: Vec<u8>,
     val_buf: Vec<u8>,
@@ -820,13 +825,12 @@ impl<'a> Iterator for BTreeIterator<'a> {
             .tree_iter
             .next_ref(&mut self.key_buf, &mut self.val_buf)
         {
-            let metadata = BucketMetadata::from_slice(&self.val_buf);
-            Some(Bucket {
-                store: self.store.clone(),
-                name: self.key_buf.clone(),
-                root_page_id: Arc::new(RwLock::new(metadata.root_page_id)),
-                main_tree: self.main_tree.clone(),
-            })
+            let name_str = std::str::from_utf8(&self.key_buf).expect("invalid bucket name");
+            Some(
+                self.main_tree
+                    .get_bucket(name_str)
+                    .expect("failed to get bucket during iteration"),
+            )
         } else {
             None
         }
@@ -863,10 +867,9 @@ pub struct Bucket {
 impl Bucket {
     pub fn iter(&self) -> Result<BucketIterator<'_>> {
         let lock = self.main_tree.writer_lock.read();
-        let root_id = *self.root_page_id.read();
         let tree = Tree::open(
             self.store.clone(),
-            root_id,
+            self.root_page_id.clone(),
             self.main_tree.pending_free.clone(),
             self.main_tree.pending_alloc.clone(),
         )?;
@@ -888,10 +891,20 @@ impl Bucket {
         V: AsRef<[u8]>,
     {
         let _lock = self.main_tree.writer_lock.write();
-        let old_root_id = *self.root_page_id.read();
+
+        // Read-your-writes: check pending updates first, then the shared lock
+        // if shared bucket is not commited it will use root_page_id and when commit the first committer wins
+        let current_root_id = self
+            .main_tree
+            .pending_bucket_updates
+            .read()
+            .get(&self.name)
+            .cloned()
+            .unwrap_or_else(|| *self.root_page_id.read());
+
         let tree_instance = Tree::open(
             self.store.clone(),
-            old_root_id,
+            Arc::new(RwLock::new(current_root_id)),
             self.main_tree.pending_free.clone(),
             self.main_tree.pending_alloc.clone(),
         )?;
@@ -899,12 +912,11 @@ impl Bucket {
 
         let new_root_id = *tree_instance.root_page_id.read();
 
-        if old_root_id != new_root_id {
-            let bucket_metadata = BucketMetadata {
-                root_page_id: new_root_id,
-            };
-            self.main_tree.put_metadata(&self.name, &bucket_metadata)?;
-            *self.root_page_id.write() = new_root_id;
+        if current_root_id != new_root_id {
+            self.main_tree
+                .pending_bucket_updates
+                .write()
+                .insert(self.name.clone(), new_root_id);
         }
 
         Ok(())
@@ -915,10 +927,19 @@ impl Bucket {
         K: AsRef<[u8]>,
     {
         let _lock = self.main_tree.writer_lock.read();
-        let root_id = *self.root_page_id.read();
+
+        // Read-your-writes
+        let current_root_id = self
+            .main_tree
+            .pending_bucket_updates
+            .read()
+            .get(&self.name)
+            .cloned()
+            .unwrap_or_else(|| *self.root_page_id.read());
+
         let tree_instance = Tree::open(
             self.store.clone(),
-            root_id,
+            Arc::new(RwLock::new(current_root_id)),
             self.main_tree.pending_free.clone(),
             self.main_tree.pending_alloc.clone(),
         )?;
@@ -930,10 +951,18 @@ impl Bucket {
         K: AsRef<[u8]>,
     {
         let _lock = self.main_tree.writer_lock.write();
-        let old_root_id = *self.root_page_id.read();
+
+        let current_root_id = self
+            .main_tree
+            .pending_bucket_updates
+            .read()
+            .get(&self.name)
+            .cloned()
+            .unwrap_or_else(|| *self.root_page_id.read());
+
         let tree_instance = Tree::open(
             self.store.clone(),
-            old_root_id,
+            Arc::new(RwLock::new(current_root_id)),
             self.main_tree.pending_free.clone(),
             self.main_tree.pending_alloc.clone(),
         )?;
@@ -941,17 +970,12 @@ impl Bucket {
 
         let new_root_id = *tree_instance.root_page_id.read();
 
-        if old_root_id != new_root_id {
-            let bucket_metadata = BucketMetadata {
-                root_page_id: new_root_id,
-            };
-            self.main_tree.put_metadata(&self.name, &bucket_metadata)?;
-            *self.root_page_id.write() = new_root_id;
-        } else if new_root_id == 0 {
-            self.main_tree.del_metadata(&self.name)?;
-            *self.root_page_id.write() = 0;
+        if current_root_id != new_root_id {
+            self.main_tree
+                .pending_bucket_updates
+                .write()
+                .insert(self.name.clone(), new_root_id);
         }
-
         Ok(())
     }
 }
@@ -962,6 +986,9 @@ pub struct BTree {
     pending_free: Arc<RwLock<Vec<(u64, u32)>>>,
     pending_alloc: Arc<RwLock<HashSet<u64>>>,
     writer_lock: Arc<RwLock<()>>,
+    buckets: Arc<RwLock<HashMap<Vec<u8>, Arc<RwLock<u64>>>>>,
+    pending_bucket_updates: Arc<RwLock<HashMap<Vec<u8>, u64>>>,
+    start_root_id: Arc<RwLock<u64>>,
 }
 
 impl BTree {
@@ -970,9 +997,10 @@ impl BTree {
         let initial_catalog_root_id = store.get_root_id();
         let pending_free = Arc::new(RwLock::new(Vec::new()));
         let pending_alloc = Arc::new(RwLock::new(HashSet::new()));
+        let catalog_tree_root_lock = Arc::new(RwLock::new(initial_catalog_root_id));
         let catalog_tree = Arc::new(Tree::open(
             store.clone(),
-            initial_catalog_root_id,
+            catalog_tree_root_lock,
             pending_free.clone(),
             pending_alloc.clone(),
         )?);
@@ -983,6 +1011,9 @@ impl BTree {
             pending_free,
             pending_alloc,
             writer_lock: Arc::new(RwLock::new(())),
+            buckets: Arc::new(RwLock::new(HashMap::new())),
+            pending_bucket_updates: Arc::new(RwLock::new(HashMap::new())),
+            start_root_id: Arc::new(RwLock::new(initial_catalog_root_id)),
         })
     }
 
@@ -991,50 +1022,98 @@ impl BTree {
         N: AsRef<str>,
     {
         let _lock = self.writer_lock.write();
-        if self.catalog_tree.get(name.as_ref().as_bytes()).is_ok() {
+        let name_bytes = name.as_ref().as_bytes();
+
+        if self.catalog_tree.get(name_bytes).is_ok() {
             return Err(Error::Duplicate);
         }
 
         let new_bucket_root_id = 0;
-        let bucket_metadata = BucketMetadata {
-            root_page_id: new_bucket_root_id,
-        };
 
-        self.put_metadata(name.as_ref().as_bytes(), &bucket_metadata)?;
+        // Add to pending updates so it's written during commit
+        self.pending_bucket_updates
+            .write()
+            .insert(name_bytes.to_vec(), new_bucket_root_id);
+
+        let root_page_id_lock = Arc::new(RwLock::new(new_bucket_root_id));
+        self.buckets
+            .write()
+            .insert(name_bytes.to_vec(), root_page_id_lock.clone());
 
         Ok(Bucket {
             store: self.store.clone(),
-            name: name.as_ref().as_bytes().to_vec(),
-            root_page_id: Arc::new(RwLock::new(new_bucket_root_id)),
+            name: name_bytes.to_vec(),
+            root_page_id: root_page_id_lock,
             main_tree: Arc::new(self.clone()),
         })
+    }
+
+    /// Refreshes the BTree instance to the latest disk state.                                                                        │
+    /// This will discard all pending (uncommitted) changes in this instance.                                                         │
+    ///                                                                                                                               │
+    /// # Best Practice (Conflict Resolution)                                                                                         │
+    /// When `commit()` returns `Err(Error::Conflict)`, it means another instance or process                                          │
+    /// has committed changes since this transaction started. To resolve this:                                                        │
+    /// 1. Call `refresh()` to sync with the latest disk state and clear stale pending updates.                                       │
+    /// 2. Re-fetch your buckets and re-apply your operations (puts/deletes).                                                         │
+    /// 3. Call `commit()` again.  
+    pub fn refresh(&self) -> Result<()> {
+        let _lock = self.writer_lock.write();
+        self.pending_bucket_updates.write().clear();
+        self.pending_free.write().clear();
+        self.pending_alloc.write().clear();
+
+        let latest_root = self.store.refresh_sb()?;
+        let mut cat_root = self.catalog_tree.root_page_id.write();
+        *cat_root = latest_root;
+        *self.start_root_id.write() = latest_root;
+        Ok(())
     }
 
     pub fn get_bucket<N>(&self, name: N) -> Result<Bucket>
     where
         N: AsRef<str>,
     {
-        // Snapshot Read from committed root
-        let committed_catalog_root = self.store.get_root_id();
-        let tree = Tree::open(
-            self.store.clone(),
-            committed_catalog_root,
-            Arc::new(RwLock::new(Vec::new())),
-            Arc::new(RwLock::new(HashSet::new())),
-        )?;
+        let name_bytes = name.as_ref().as_bytes();
 
-        match tree.get(name.as_ref().as_bytes()) {
-            Ok(metadata_bytes) => {
-                let metadata = BucketMetadata::from_slice(&metadata_bytes);
-                Ok(Bucket {
-                    store: self.store.clone(),
-                    name: name.as_ref().as_bytes().to_vec(),
-                    root_page_id: Arc::new(RwLock::new(metadata.root_page_id)),
-                    main_tree: Arc::new(self.clone()),
-                })
-            }
-            Err(e) => Err(e),
+        // 1. Check pending updates (Read-Your-Writes)
+        // If the bucket was created or modified in the current transaction,
+        // it might not be in the catalog_tree yet.
+        if let Some(&pending_root) = self.pending_bucket_updates.read().get(name_bytes) {
+            let mut buckets = self.buckets.write();
+            let lock = buckets
+                .entry(name_bytes.to_vec())
+                .or_insert_with(|| Arc::new(RwLock::new(pending_root)));
+
+            return Ok(Bucket {
+                store: self.store.clone(),
+                name: name_bytes.to_vec(),
+                root_page_id: lock.clone(),
+                main_tree: Arc::new(self.clone()),
+            });
         }
+
+        // 2. Load metadata from our snapshot
+        let metadata_bytes = self.catalog_tree.get(name_bytes)?;
+        let metadata = BucketMetadata::from_slice(&metadata_bytes);
+
+        let mut buckets = self.buckets.write();
+        let lock = buckets
+            .entry(name_bytes.to_vec())
+            .or_insert_with(|| Arc::new(RwLock::new(metadata.root_page_id)));
+
+        // Ensure the lock matches our snapshot root
+        let mut lock_val = lock.write();
+        if *lock_val != metadata.root_page_id {
+            *lock_val = metadata.root_page_id;
+        }
+
+        Ok(Bucket {
+            store: self.store.clone(),
+            name: name_bytes.to_vec(),
+            root_page_id: lock.clone(),
+            main_tree: Arc::new(self.clone()),
+        })
     }
 
     pub fn del_bucket<N>(&self, name: N) -> Result<()>
@@ -1056,23 +1135,51 @@ impl BTree {
             )?;
         }
 
-        self.del_metadata(name.as_ref().as_bytes())?;
+        self.catalog_tree.del(name.as_ref().as_bytes())?;
+        self.buckets.write().remove(name.as_ref().as_bytes());
         self.pending_free.write().extend(pages_to_free);
 
         Ok(())
     }
 
-    fn put_metadata(&self, name: &[u8], metadata: &BucketMetadata) -> Result<()> {
-        self.catalog_tree.put(name, metadata.as_slice())
-    }
-
-    fn del_metadata(&self, name: &[u8]) -> Result<()> {
-        self.catalog_tree.del(name)
-    }
-
     pub fn commit(&self) -> Result<()> {
         let _lock = self.writer_lock.write();
-        self.catalog_tree.commit()
+
+        // 1. Conflict Detection (CAS)
+        // Check if someone else committed while we were working
+        let current_disk_root = self.store.refresh_sb()?;
+        let start_root = *self.start_root_id.read();
+
+        if current_disk_root != start_root {
+            return Err(Error::Conflict);
+        }
+
+        // 2. Apply all pending bucket updates to the catalog tree
+        let pending_updates = self.pending_bucket_updates.read().clone();
+        for (name, new_root) in &pending_updates {
+            let metadata = BucketMetadata {
+                root_page_id: *new_root,
+            };
+            self.catalog_tree.put(name, metadata.as_slice())?;
+        }
+
+        // 3. Commit the catalog tree (and thus the whole Store)
+        self.catalog_tree.commit()?;
+
+        // 4. Success! Synchronize all memory locks
+        let new_committed_root = self.store.get_root_id();
+        let buckets = self.buckets.write();
+        for (name, new_root) in pending_updates {
+            if let Some(lock) = buckets.get(&name) {
+                *lock.write() = new_root;
+            }
+        }
+
+        // 5. Reset transaction state
+        *self.start_root_id.write() = new_committed_root;
+        self.pending_bucket_updates.write().clear();
+
+        Ok(())
     }
 
     pub fn iter(&self) -> BTreeIterator<'_> {
@@ -1082,7 +1189,6 @@ impl BTree {
 
         BTreeIterator {
             tree_iter,
-            store: self.store.clone(),
             main_tree: Arc::new(self.clone()),
             key_buf: Vec::new(),
             val_buf: Vec::new(),
@@ -1099,6 +1205,9 @@ impl Clone for BTree {
             pending_free: self.pending_free.clone(),
             pending_alloc: self.pending_alloc.clone(),
             writer_lock: self.writer_lock.clone(),
+            buckets: self.buckets.clone(),
+            pending_bucket_updates: self.pending_bucket_updates.clone(),
+            start_root_id: self.start_root_id.clone(),
         }
     }
 }

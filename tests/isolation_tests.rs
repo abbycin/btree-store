@@ -2,33 +2,27 @@ use btree_store::BTree;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
-
-fn cleanup(path: &str) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.pending", path));
-}
+use tempfile::TempDir;
 
 #[test]
-fn test_iterator_isolation_blocks_writer() {
-    let path = "test_isolation.db";
-    cleanup(path);
-
-    let tree = Arc::new(BTree::open(path).unwrap());
+fn test_view_isolation_blocks_writer() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("isolation.db");
+    let tree = BTree::open(&db_path).unwrap();
     let bucket_name = "iso_bucket";
 
     // 1. Setup initial data
-    {
-        let bucket = tree.new_bucket(bucket_name).unwrap();
+    tree.exec(bucket_name, |txn| {
         for i in 0..100 {
-            bucket
-                .put(
-                    format!("key_{:03}", i).as_bytes(),
-                    format!("val_{:03}", i).as_bytes(),
-                )
-                .unwrap();
+            txn.put(
+                format!("key_{:03}", i).as_bytes(),
+                format!("val_{:03}", i).as_bytes(),
+            )
+            .unwrap();
         }
-        tree.commit().unwrap();
-    }
+        Ok(())
+    })
+    .unwrap();
 
     let tree_clone_reader = tree.clone();
     let tree_clone_writer = tree.clone();
@@ -38,33 +32,33 @@ fn test_iterator_isolation_blocks_writer() {
 
     // 2. Reader Thread
     let reader_handle = thread::spawn(move || {
-        let bucket = tree_clone_reader.get_bucket(bucket_name).unwrap();
-        let mut iter = bucket.iter().unwrap();
+        tree_clone_reader
+            .view(bucket_name, |txn| {
+                // Read first item
+                let _ = txn.get("key_000").unwrap();
 
-        // Read first item to ensure lock is acquired
-        let _ = iter.next().unwrap();
+                // Signal writer to start
+                barrier_clone.wait();
 
-        // Signal writer to start
-        barrier_clone.wait();
+                // Sleep to hold the lock for a significant time
+                // This forces the writer to wait because view holds writer_lock.read()
+                thread::sleep(Duration::from_millis(500));
 
-        // Sleep to hold the lock for a significant time
-        // This forces the writer to wait
-        thread::sleep(Duration::from_millis(500));
-
-        // Continue reading remaining items
-        let mut count = 1;
-        while let Some(_) = iter.next() {
-            count += 1;
-        }
-
-        // iter is dropped here, releasing the lock
-        count
+                // Continue reading to verify isolation
+                let mut count = 0;
+                let mut iter = txn.iter();
+                let mut key_buf = Vec::new();
+                let mut val_buf = Vec::new();
+                while iter.next_ref(&mut key_buf, &mut val_buf) {
+                    count += 1;
+                }
+                Ok(count)
+            })
+            .unwrap()
     });
 
     // 3. Writer Thread
     let writer_handle = thread::spawn(move || {
-        let bucket = tree_clone_writer.get_bucket(bucket_name).unwrap();
-
         // Wait for reader to start and grab lock
         barrier.wait();
 
@@ -73,10 +67,13 @@ fn test_iterator_isolation_blocks_writer() {
 
         let start = Instant::now();
 
-        // This PUT should be BLOCKED because Reader holds the global read lock.
-        // It should only proceed after Reader drops the iterator (~500ms).
-        bucket.put(b"new_key", b"new_value").unwrap();
-        tree_clone_writer.commit().unwrap();
+        // This EXEC should be BLOCKED because View holds the global read lock.
+        tree_clone_writer
+            .exec(bucket_name, |txn| {
+                txn.put(b"new_key", b"new_value").unwrap();
+                Ok(())
+            })
+            .unwrap();
 
         start.elapsed()
     });
@@ -87,12 +84,9 @@ fn test_iterator_isolation_blocks_writer() {
     // 4. Verifications
 
     // Consistency: Reader must see exactly the original 100 items.
-    // If isolation failed, it might crash or see weird state.
     assert_eq!(reader_count, 100, "Reader should see all original items");
 
     // Isolation: Writer must have been blocked.
-    // We expect duration > 500ms (reader sleep) - 10ms (writer wait) ~= 490ms.
-    // We use 200ms as a safe threshold to rule out OS scheduling noise.
     assert!(
         writer_duration > Duration::from_millis(200),
         "Writer should be blocked by Reader's lock. Actual duration: {:?}",
@@ -100,8 +94,9 @@ fn test_iterator_isolation_blocks_writer() {
     );
 
     // Verify write eventually succeeded
-    let bucket = tree.get_bucket(bucket_name).unwrap();
-    assert_eq!(bucket.get(b"new_key").unwrap(), b"new_value".to_vec());
-
-    cleanup(path);
+    tree.view(bucket_name, |txn| {
+        assert_eq!(txn.get(b"new_key").unwrap(), b"new_value".to_vec());
+        Ok(())
+    })
+    .unwrap();
 }

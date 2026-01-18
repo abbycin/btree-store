@@ -1,5 +1,7 @@
 use crate::{Error, Result, store::Store};
+use std::alloc::{Layout, alloc, dealloc};
 use std::cmp::Ordering;
+use std::ptr;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_INLINE_LEN: usize = 64;
@@ -9,7 +11,70 @@ const OFFSET_CHECKSUM: usize = PAGE_SIZE - 8;
 const OFFSET_NEXT_INDIRECT: usize = PAGE_SIZE - 16;
 const IDS_PER_INDIRECT_PAGE: usize = OFFSET_NEXT_INDIRECT / std::mem::size_of::<u64>();
 
-#[repr(C)]
+pub struct AlignedPage {
+    ptr: *mut u8,
+    layout: Layout,
+}
+
+impl AlignedPage {
+    fn new() -> Self {
+        let layout = Layout::from_size_align(PAGE_SIZE, 8).unwrap();
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        unsafe { ptr::write_bytes(ptr, 0, PAGE_SIZE) };
+        Self { ptr, layout }
+    }
+
+    fn from_vec(data: Vec<u8>) -> Self {
+        let page = Self::new();
+        let len = std::cmp::min(data.len(), PAGE_SIZE);
+        unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), page.ptr, len);
+        }
+        page
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, PAGE_SIZE) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, PAGE_SIZE) }
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+unsafe impl Send for AlignedPage {}
+unsafe impl Sync for AlignedPage {}
+
+impl Drop for AlignedPage {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr, self.layout);
+        }
+    }
+}
+
+impl Clone for AlignedPage {
+    fn clone(&self) -> Self {
+        let new_page = Self::new();
+        unsafe {
+            ptr::copy_nonoverlapping(self.ptr, new_page.ptr, PAGE_SIZE);
+        }
+        new_page
+    }
+}
+
+#[repr(C, align(8))]
 #[derive(Clone, Copy, Debug)]
 pub struct NodeHeader {
     pub checksum: u64,
@@ -26,12 +91,13 @@ pub const fn size_to_pages(size: usize) -> usize {
     size.div_ceil(PAGE_SIZE)
 }
 
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone, Copy, Debug)]
 pub struct Slot {
     pub pos: u32,
     pub klen: u32,
     pub vlen: u32,
+    pub _padding: u32,
     pub page_id: [u64; NR_INLINE_PAGE],
 }
 
@@ -67,7 +133,7 @@ impl Slot {
 
 #[derive(Clone)]
 pub struct Node {
-    pub data: Vec<u8>,
+    pub page: AlignedPage,
     pub dirty: bool,
 }
 
@@ -80,19 +146,19 @@ impl Node {
 
     pub(crate) fn slot_at(&self, pos: usize) -> &Slot {
         let slot_off = HEADER_SIZE + pos * SLOT_SIZE;
-        unsafe { &*self.data.as_ptr().add(slot_off).cast::<Slot>() }
+        unsafe { &*self.page.as_ptr().add(slot_off).cast::<Slot>() }
     }
 
     pub(crate) fn slot_at_mut(&mut self, pos: usize) -> &mut Slot {
         let slot_off = HEADER_SIZE + pos * SLOT_SIZE;
-        unsafe { &mut *self.data.as_mut_ptr().add(slot_off).cast::<Slot>() }
+        unsafe { &mut *self.page.as_mut_ptr().add(slot_off).cast::<Slot>() }
     }
 
     pub fn key_at(&self, pos: usize) -> &[u8] {
         let slot = self.slot_at(pos);
         let off = slot.data_offset();
         let len = slot.key_len();
-        &self.data[off..off + len]
+        &self.page.as_slice()[off..off + len]
     }
 
     pub fn value_at(&self, pos: usize) -> &[u8] {
@@ -100,14 +166,14 @@ impl Node {
         assert!(slot.is_inline());
         let off = slot.data_offset() + slot.key_len();
         let len = slot.value_len();
-        &self.data[off..off + len]
+        &self.page.as_slice()[off..off + len]
     }
 
     fn key_at_mut(&mut self, pos: usize) -> &mut [u8] {
         let slot = *self.slot_at(pos);
         let off = slot.data_offset();
         let len = slot.key_len();
-        &mut self.data[off..off + len]
+        &mut self.page.as_mut_slice()[off..off + len]
     }
 
     fn value_at_mut(&mut self, pos: usize) -> &mut [u8] {
@@ -115,7 +181,7 @@ impl Node {
         assert!(slot.is_inline());
         let off = slot.data_offset() + slot.key_len();
         let len = slot.value_len();
-        &mut self.data[off..off + len]
+        &mut self.page.as_mut_slice()[off..off + len]
     }
 
     fn emplace_at(&mut self, pos: usize, slot: &Slot, data: &[u8]) {
@@ -129,8 +195,10 @@ impl Node {
         *dst_slot = *slot;
         dst_slot.pos = data_off as u32;
 
-        self.data[data_off as usize..data_off as usize + data.len()].copy_from_slice(data);
+        self.page.as_mut_slice()[data_off as usize..data_off as usize + data.len()]
+            .copy_from_slice(data);
         self.header_mut().elems += 1;
+        self.dirty = true;
     }
 
     pub(crate) fn collect_page_ids(&self, store: &Store, slot: &Slot) -> Result<Vec<u64>> {
@@ -148,6 +216,7 @@ impl Node {
                 u64::from_le_bytes(data[OFFSET_CHECKSUM..PAGE_SIZE].try_into().unwrap());
             let computed_checksum = crc32c::crc32c(&data[..OFFSET_CHECKSUM]) as u64;
             if stored_checksum != computed_checksum {
+                eprintln!("VALIDATION FAILED: index page checksum mismatch");
                 return Err(Error::Corruption);
             }
 
@@ -212,6 +281,7 @@ impl Node {
             let page_id = u64::from_le_bytes(value.try_into().unwrap());
             let slot = self.slot_at_mut(pos);
             slot.page_id[0] = page_id;
+            self.dirty = true;
             return Ok(());
         }
 
@@ -322,11 +392,13 @@ impl Node {
         let last_slot_off = HEADER_SIZE + elems as usize * SLOT_SIZE;
 
         if pos < elems as usize {
-            self.data
+            self.page
+                .as_mut_slice()
                 .copy_within(slot_off..last_slot_off, slot_off + SLOT_SIZE);
         }
 
         self.header_mut().elems += 1;
+        self.dirty = true;
         self.slot_at_mut(pos)
     }
 
@@ -338,11 +410,13 @@ impl Node {
         let last_slot_off = HEADER_SIZE + elems as usize * SLOT_SIZE;
 
         if pos + 1 < elems as usize {
-            self.data
+            self.page
+                .as_mut_slice()
                 .copy_within(next_slot_off..last_slot_off, slot_off);
         }
 
         self.header_mut().elems -= 1;
+        self.dirty = true;
         slot
     }
 
@@ -373,6 +447,7 @@ impl Node {
             pos: 0,
             klen: key.len() as u32,
             vlen: value.len() as u32,
+            _padding: 0,
             page_id: [0; NR_INLINE_PAGE],
         };
 
@@ -409,13 +484,14 @@ impl Node {
     }
 
     fn compact(&mut self) {
-        let mut new_data = vec![0; PAGE_SIZE];
+        let mut new_page = AlignedPage::new();
         let src_hdr = *self.header();
         let elems = src_hdr.elems as usize;
         let mut offset = PAGE_SIZE as u64;
 
         // Copy header
-        new_data[..HEADER_SIZE].copy_from_slice(&self.data[..HEADER_SIZE]);
+        new_page.as_mut_slice()[..HEADER_SIZE]
+            .copy_from_slice(&self.page.as_slice()[..HEADER_SIZE]);
 
         for i in 0..elems {
             let src_slot = *self.slot_at(i);
@@ -432,21 +508,22 @@ impl Node {
 
             offset -= kv_len;
             let dst_slot_off = HEADER_SIZE + i * SLOT_SIZE;
-            let dst_slot = unsafe { &mut *new_data.as_mut_ptr().add(dst_slot_off).cast::<Slot>() };
+            let dst_slot = unsafe { &mut *new_page.as_mut_ptr().add(dst_slot_off).cast::<Slot>() };
             *dst_slot = src_slot;
             dst_slot.pos = offset as u32;
 
-            new_data[offset as usize..offset as usize + k.len()].copy_from_slice(k);
+            new_page.as_mut_slice()[offset as usize..offset as usize + k.len()].copy_from_slice(k);
             if let Some(val) = v {
-                new_data[offset as usize + k.len()..offset as usize + k.len() + val.len()]
+                new_page.as_mut_slice()
+                    [offset as usize + k.len()..offset as usize + k.len() + val.len()]
                     .copy_from_slice(val);
             }
         }
 
-        let dst_hdr = unsafe { &mut *new_data.as_mut_ptr().cast::<NodeHeader>() };
+        let dst_hdr = unsafe { &mut *new_page.as_mut_ptr().cast::<NodeHeader>() };
         dst_hdr.offset = offset;
 
-        self.data = new_data;
+        self.page = new_page;
         self.update_checksum();
     }
 
@@ -454,19 +531,37 @@ impl Node {
         if data.len() != PAGE_SIZE {
             return Err(Error::Corruption);
         }
-        let this = Self { data, dirty: false };
+        let this = Self {
+            page: AlignedPage::from_vec(data),
+            dirty: false,
+        };
         this.validate()?;
         Ok(this)
     }
 
     fn validate(&self) -> Result<()> {
-        let stored_checksum = self.header().checksum;
-        if stored_checksum == 0 {
-            return Ok(());
+        let hdr = self.header();
+
+        // 1. Physical invariants check (Type and boundaries)
+        if hdr.is_leaf > 1 || hdr.elems > 127 {
+            return Err(Error::Corruption);
         }
 
+        // offset must be within [min_possible_offset, PAGE_SIZE]
+        let min_offset = HEADER_SIZE + (hdr.elems as usize * SLOT_SIZE);
+        if hdr.offset < min_offset as u64 || hdr.offset > PAGE_SIZE as u64 {
+            return Err(Error::Corruption);
+        }
+
+        // 2. Cryptographic integrity check
+        let stored_checksum = hdr.checksum;
         let computed = self.calc_checksum() as u64;
         if stored_checksum != computed {
+            // Special case: allow checksum 0 only for a completely valid-looking empty node
+            // (common in fresh DB initializations or transient empty roots)
+            if stored_checksum == 0 && hdr.elems == 0 && hdr.offset == PAGE_SIZE as u64 {
+                return Ok(());
+            }
             return Err(Error::Corruption);
         }
         Ok(())
@@ -474,7 +569,7 @@ impl Node {
 
     fn new(is_leaf: bool) -> Self {
         let mut this = Node {
-            data: vec![0; PAGE_SIZE],
+            page: AlignedPage::new(),
             dirty: true,
         };
         let h = this.header_mut();
@@ -496,15 +591,15 @@ impl Node {
             self.update_checksum();
             self.dirty = false;
         }
-        &self.data
+        self.page.as_slice()
     }
 
     pub fn header(&self) -> &NodeHeader {
-        unsafe { &*self.data.as_ptr().cast::<NodeHeader>() }
+        unsafe { &*self.page.as_ptr().cast::<NodeHeader>() }
     }
 
     pub fn header_mut(&mut self) -> &mut NodeHeader {
-        unsafe { &mut *self.data.as_mut_ptr().cast::<NodeHeader>() }
+        unsafe { &mut *self.page.as_mut_ptr().cast::<NodeHeader>() }
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -628,7 +723,7 @@ impl Node {
     }
 
     fn calc_checksum(&self) -> u32 {
-        let mut data_copy = self.data.clone();
+        let mut data_copy = self.page.as_slice().to_vec();
         unsafe {
             let hdr = &mut *data_copy.as_mut_ptr().cast::<NodeHeader>();
             hdr.checksum = 0;
@@ -644,7 +739,7 @@ impl Node {
             slot.key_len()
         };
         let off = slot.data_offset();
-        &self.data[off..off + len]
+        &self.page.as_slice()[off..off + len]
     }
 
     pub fn child_at(&self, pos: usize) -> u64 {

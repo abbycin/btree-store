@@ -1,112 +1,116 @@
 use btree_store::BTree;
-
-fn cleanup(path: &str) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{}.pending", path));
-}
+use tempfile::TempDir;
 
 #[test]
 fn test_bucket_iterator() {
-    let path = "test_bucket_iter.db";
-    cleanup(path);
-
-    let tree = BTree::open(path).unwrap();
-    let bucket = tree.new_bucket("my_bucket").unwrap();
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("iterator.db");
+    let tree = BTree::open(&db_path).unwrap();
 
     let mut expected = std::collections::BTreeMap::new();
-    for i in 0..100 {
-        let key = format!("key_{:03}", i).into_bytes();
-        let value = format!("val_{:03}", i).into_bytes();
-        bucket.put(&key, &value).unwrap();
-        expected.insert(key, value);
-    }
-    tree.commit().unwrap();
+    tree.exec("my_bucket", |txn| {
+        for i in 0..100 {
+            let key = format!("key_{:03}", i).into_bytes();
+            let value = format!("val_{:03}", i).into_bytes();
+            txn.put(&key, &value).unwrap();
+            expected.insert(key, value);
+        }
+        Ok(())
+    })
+    .unwrap();
 
-    let mut iter = bucket.iter().unwrap();
-    let mut count = 0;
-    while let Some((k, v)) = iter.next() {
-        assert_eq!(expected.get(k).map(|ev| ev.as_slice()), Some(v));
-        count += 1;
-    }
-    assert_eq!(count, 100);
-
-    cleanup(path);
+    tree.view("my_bucket", |txn| {
+        let mut iter = txn.iter();
+        let mut key_buf = Vec::new();
+        let mut val_buf = Vec::new();
+        let mut count = 0;
+        while iter.next_ref(&mut key_buf, &mut val_buf) {
+            assert_eq!(
+                expected.get(key_buf.as_slice()).map(|ev| ev.as_slice()),
+                Some(val_buf.as_slice())
+            );
+            count += 1;
+        }
+        assert_eq!(count, 100);
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
-fn test_btree_iterator() {
-    let path = "test_btree_iter.db";
-    cleanup(path);
-
-    let tree = BTree::open(path).unwrap();
+fn test_btree_buckets_list() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("buckets.db");
+    let tree = BTree::open(&db_path).unwrap();
 
     let bucket_names = vec!["bucket_1", "bucket_2", "bucket_3"];
     for name in &bucket_names {
-        tree.new_bucket(*name).unwrap();
-    }
-    tree.commit().unwrap();
-
-    let mut iter = tree.iter();
-    let mut buckets = Vec::new();
-    while let Some(bucket) = iter.next() {
-        buckets.push(bucket);
-    }
-    // Explicitly drop iterator to release the read lock
-    drop(iter);
-
-    assert_eq!(buckets.len(), 3);
-
-    for bucket in buckets {
-        // Verify we can use the bucket for writes after iteration
-        bucket.put(b"k", b"v").unwrap();
-        assert_eq!(bucket.get(b"k").unwrap(), b"v".to_vec());
+        tree.exec(*name, |_txn| Ok(())).unwrap();
     }
 
-    cleanup(path);
+    let mut buckets = tree.buckets().unwrap();
+    buckets.sort();
+    assert_eq!(buckets, vec!["bucket_1", "bucket_2", "bucket_3"]);
+
+    for name in &buckets {
+        tree.exec(name, |txn| {
+            txn.put(b"k", b"v").unwrap();
+            assert_eq!(txn.get(b"k").unwrap(), b"v".to_vec());
+            Ok(())
+        })
+        .unwrap();
+    }
 }
 
 #[test]
 fn test_empty_bucket_iterator() {
-    let path = "test_empty_bucket_iter.db";
-    cleanup(path);
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("empty_iter.db");
+    let tree = BTree::open(&db_path).unwrap();
 
-    let tree = BTree::open(path).unwrap();
-    let bucket = tree.new_bucket("empty_bucket").unwrap();
-    tree.commit().unwrap();
+    tree.exec("empty_bucket", |_txn| Ok(())).unwrap();
 
-    let mut iter = bucket.iter().unwrap();
-    assert!(iter.next().is_none());
-
-    cleanup(path);
+    tree.view("empty_bucket", |txn| {
+        let mut iter = txn.iter();
+        let mut k = Vec::new();
+        let mut v = Vec::new();
+        assert!(!iter.next_ref(&mut k, &mut v));
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
 fn test_iterator_after_reopen() {
-    let path = "test_iter_reopen.db";
-    cleanup(path);
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("reopen_iter.db");
 
     {
-        let tree = BTree::open(path).unwrap();
-        let bucket = tree.new_bucket("data").unwrap();
-        bucket.put(b"k1", b"v1").unwrap();
-        bucket.put(b"k2", b"v2").unwrap();
-        tree.commit().unwrap();
+        let tree = BTree::open(&db_path).unwrap();
+        tree.exec("data", |txn| {
+            txn.put(b"k1", b"v1").unwrap();
+            txn.put(b"k2", b"v2").unwrap();
+            Ok(())
+        })
+        .unwrap();
     }
 
     {
-        let tree = BTree::open(path).unwrap();
-        let bucket = tree.get_bucket("data").unwrap();
-        let mut iter = bucket.iter().unwrap();
-
-        let mut kv = Vec::new();
-        while let Some((k, v)) = iter.next() {
-            kv.push((k.to_vec(), v.to_vec()));
-        }
-        kv.sort();
-        assert_eq!(kv.len(), 2);
-        assert_eq!(kv[0], (b"k1".to_vec(), b"v1".to_vec()));
-        assert_eq!(kv[1], (b"k2".to_vec(), b"v2".to_vec()));
+        let tree = BTree::open(&db_path).unwrap();
+        tree.view("data", |txn| {
+            let mut iter = txn.iter();
+            let mut key_buf = Vec::new();
+            let mut val_buf = Vec::new();
+            let mut kv = Vec::new();
+            while iter.next_ref(&mut key_buf, &mut val_buf) {
+                kv.push((key_buf.clone(), val_buf.clone()));
+            }
+            kv.sort();
+            assert_eq!(kv.len(), 2);
+            assert_eq!(kv[0], (b"k1".to_vec(), b"v1".to_vec()));
+            assert_eq!(kv[1], (b"k2".to_vec(), b"v2".to_vec()));
+            Ok(())
+        })
+        .unwrap();
     }
-
-    cleanup(path);
 }

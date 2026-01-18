@@ -141,6 +141,7 @@ impl Store {
                 .create(true)
                 .truncate(true)
                 .open(path)?;
+
             let mut sb = MetaNode::new();
 
             file.pwrite_all(&sb.as_page_slice(), 0)?;
@@ -202,7 +203,7 @@ impl Store {
     }
 
     fn recover_pending(&self) -> Result<()> {
-        if !self.pending_path.exists() {
+        if !self.pending_path.exists() || std::fs::metadata(&self.pending_path)?.len() == 0 {
             return Ok(());
         }
 
@@ -212,7 +213,7 @@ impl Store {
 
         let header_size = std::mem::size_of::<PendingLogHeader>();
         if buf.len() < header_size {
-            let _ = std::fs::remove_file(&self.pending_path);
+            let _ = self.clear_pending_log();
             return Ok(());
         }
 
@@ -220,7 +221,7 @@ impl Store {
         let data_part = &buf[header_size..];
 
         if crc32c::crc32c(data_part) != header.checksum {
-            let _ = std::fs::remove_file(&self.pending_path);
+            let _ = self.clear_pending_log();
             return Ok(());
         }
 
@@ -266,8 +267,7 @@ impl Store {
             // stale/future/malformed log: ignore
         }
 
-        let _ = std::fs::remove_file(&self.pending_path);
-        let _ = fsync_parent_dir(&self.pending_path);
+        let _ = self.clear_pending_log();
         Ok(())
     }
 
@@ -329,13 +329,17 @@ impl Store {
         }
 
         std::fs::rename(&temp_path, &self.pending_path)?;
+        // After rename, we still need to fsync the parent dir to ensure the rename is permanent
         fsync_parent_dir(&self.pending_path)?;
         Ok(())
     }
 
     pub fn clear_pending_log(&self) -> Result<()> {
-        let _ = std::fs::remove_file(&self.pending_path);
-        fsync_parent_dir(&self.pending_path)?;
+        if self.pending_path.exists() {
+            let f = OpenOptions::new().write(true).open(&self.pending_path)?;
+            f.set_len(0)?;
+            f.sync_all()?;
+        }
         Ok(())
     }
 
@@ -355,19 +359,16 @@ impl Store {
         let mut temp_sb = *sb_guard;
         let mut gathered = Vec::new();
 
-        // 1. try to allocate from the cached head chunk
+        // 1. Try to allocate from the cached head chunk
         if temp_sb.nr_free >= nr_pages as u64 {
             let start_id = (temp_sb.free_list_head + temp_sb.nr_free) - nr_pages as u64;
-            temp_sb.nr_free -= nr_pages as u64;
 
-            if temp_sb.nr_free == 0 {
-                let current_head = temp_sb.free_list_head;
+            if start_id == temp_sb.free_list_head {
+                // Allocating the head page itself. Read the next pointer first.
                 let mut buf = [0u8; FREE_NODE_SIZE];
-                let offset = current_head * PAGE_SIZE as u64;
-
-                f.pread_exact(&mut buf, offset)?;
-
+                f.pread_exact(&mut buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
                 let free_node = FreeNode::from_slice(&buf);
+
                 temp_sb.free_list_head = free_node.next;
                 if temp_sb.free_list_head != 0 {
                     let mut next_buf = [0u8; FREE_NODE_SIZE];
@@ -380,18 +381,27 @@ impl Store {
                 } else {
                     temp_sb.nr_free = 0;
                 }
+            } else {
+                temp_sb.nr_free -= nr_pages as u64;
+            }
+
+            for i in 0..nr_pages {
+                self.cache.invalidate(start_id + i as u64);
             }
             *sb_guard = temp_sb;
             return Ok((0..nr_pages).map(|i| start_id + i as u64).collect());
         }
 
-        // 2. gather discrete pages from free list
+        // 2. Gather discrete pages from free list
         while gathered.len() < nr_pages as usize && temp_sb.free_list_head != 0 {
             let to_take =
                 std::cmp::min(nr_pages as usize - gathered.len(), temp_sb.nr_free as usize);
             let start_id = (temp_sb.free_list_head + temp_sb.nr_free) - to_take as u64;
+
             for i in 0..to_take {
-                gathered.push(start_id + i as u64);
+                let pid = start_id + i as u64;
+                self.cache.invalidate(pid);
+                gathered.push(pid);
             }
             temp_sb.nr_free -= to_take as u64;
 
@@ -415,13 +425,15 @@ impl Store {
             }
         }
 
-        // 3. allocate from end of file for remaining
+        // 3. Allocate from end of file for remaining
         if gathered.len() < nr_pages as usize {
             let needed = nr_pages as usize - gathered.len();
             let start_id = temp_sb.next_page_id;
             temp_sb.next_page_id += needed as u64;
             for i in 0..needed {
-                gathered.push(start_id + i as u64);
+                let pid = start_id + i as u64;
+                self.cache.invalidate(pid);
+                gathered.push(pid);
             }
         }
 
@@ -430,37 +442,41 @@ impl Store {
     }
 
     pub fn free_pages(&self, page_id: u64, nr_pages: u32) -> Result<()> {
+        if page_id == 0 {
+            return Ok(());
+        }
+
         for i in 0..nr_pages {
             self.cache.invalidate(page_id + i as u64);
         }
+
         let mut sb = self.sb.lock();
         let f = self.file.lock();
 
         if sb.free_list_head == page_id {
-            // already freed (possible during recovery redo)
             return Ok(());
         }
 
-        // ensure the cached head's nr_pages is synced to disk before we update head
+        // Ensure cached head's state is persisted before moving head
         if sb.free_list_head != 0 {
             let mut buf = vec![0u8; FREE_NODE_SIZE];
-            f.pread_exact(&mut buf, sb.free_list_head * PAGE_SIZE as u64)?;
-            let mut head_node = FreeNode::from_slice(&buf);
-            if !head_node.validate() {
-                return Err(Error::Corruption);
-            }
-            if head_node.nr_pages as u64 != sb.nr_free {
-                head_node.nr_pages = sb.nr_free as u32;
-                head_node.update_checksum();
-                f.pwrite_all(
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            (&head_node as *const FreeNode) as *const u8,
-                            FREE_NODE_SIZE,
-                        )
-                    },
-                    sb.free_list_head * PAGE_SIZE as u64,
-                )?;
+            if f.pread_exact(&mut buf, sb.free_list_head * PAGE_SIZE as u64)
+                .is_ok()
+            {
+                let mut head_node = FreeNode::from_slice(&buf);
+                if head_node.validate() && head_node.nr_pages as u64 != sb.nr_free {
+                    head_node.nr_pages = sb.nr_free as u32;
+                    head_node.update_checksum();
+                    let _ = f.pwrite_all(
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                (&head_node as *const FreeNode) as *const u8,
+                                FREE_NODE_SIZE,
+                            )
+                        },
+                        sb.free_list_head * PAGE_SIZE as u64,
+                    );
+                }
             }
         }
 
@@ -479,6 +495,7 @@ impl Store {
             },
             page_id * PAGE_SIZE as u64,
         )?;
+
         sb.free_list_head = page_id;
         sb.nr_free = nr_pages as u64;
 
@@ -558,6 +575,7 @@ impl Store {
 
         let r0 = file.pread_exact(&mut buf0, 0);
         let r1 = file.pread_exact(&mut buf1, PAGE_SIZE as u64);
+        drop(file);
 
         let sb0 = if r0.is_ok() {
             let s = MetaNode::from_slice(&buf0);
@@ -592,6 +610,14 @@ impl Store {
             Ok(sb.root_current)
         } else {
             Ok(current_sb.root_current)
+        }
+    }
+
+    pub fn clear_cache(&self) {
+        for shard in &self.cache.shards {
+            let mut guard = shard.lock();
+            guard.entries.iter_mut().for_each(|e| *e = None);
+            guard.map.clear();
         }
     }
 

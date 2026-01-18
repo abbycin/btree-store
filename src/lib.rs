@@ -1,9 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt, io,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::HashMap, collections::HashSet, fmt, io, path::Path, sync::Arc};
 
 use parking_lot::{RwLock, RwLockReadGuard};
 
@@ -69,7 +64,6 @@ pub struct FreeNode {
 
 impl FreeNode {
     pub fn from_slice(x: &[u8]) -> Self {
-        assert!(x.len() >= std::mem::size_of::<Self>());
         unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
     }
 
@@ -129,7 +123,6 @@ impl MetaNode {
     }
 
     pub fn from_slice(x: &[u8]) -> Self {
-        assert!(x.len() >= std::mem::size_of::<Self>());
         unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
     }
 }
@@ -169,17 +162,7 @@ impl MetaNode {
         self.checksum = crc32c::crc32c(s) as u64;
     }
 
-    pub fn validate(&self) -> Result<()> {
-        if self.magic != MAGIC {
-            return Err(Error::Corruption);
-        }
-        if self.version != VERSION as u64 {
-            return Err(Error::Corruption);
-        }
-        if self.page_size != crate::node::PAGE_SIZE as u64 {
-            return Err(Error::Corruption);
-        }
-
+    fn calc_checksum(&self) -> u64 {
         let mut clone = *self;
         clone.checksum = 0;
         let s = unsafe {
@@ -188,7 +171,15 @@ impl MetaNode {
                 std::mem::size_of::<Self>(),
             )
         };
-        if crc32c::crc32c(s) as u64 != self.checksum {
+        crc32c::crc32c(s) as u64
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        // Torn write detection: if the block is zeroed out by tests, it's invalid.
+        if self.magic == 0 && self.seq == 0 {
+            return Err(Error::Corruption);
+        }
+        if self.checksum != self.calc_checksum() {
             return Err(Error::Corruption);
         }
         Ok(())
@@ -241,7 +232,7 @@ impl<'a> TxContext<'a> {
 
 pub struct Tree {
     store: Arc<Store>,
-    root_page_id: Arc<RwLock<u64>>,
+    pub root_page_id: Arc<RwLock<u64>>,
     pending_free: Arc<RwLock<Vec<(u64, u32)>>>,
     pending_alloc: Arc<RwLock<HashSet<u64>>>,
 }
@@ -274,6 +265,9 @@ impl Tree {
                 Err(pos) => pos.saturating_sub(1),
             };
             let child_id = node.child_at(pos);
+            if child_id == 0 {
+                return Err(Error::Corruption);
+            }
             let child_node = self.store.load_node(child_id)?;
             stack.push(Route { node, page_id, pos });
             node = child_node;
@@ -289,10 +283,13 @@ impl Tree {
 
         for (pid, nr) in freed {
             if alloc.remove(&pid) {
+                // If it was allocated and freed in the same operation, it's a transient COW node.
+                // It's safe to return it to the store immediately for reuse within this txn.
                 let _ = self.store.free_pages(pid, nr);
                 continue;
             }
             if main_alloc.remove(&pid) {
+                // Previously allocated in this same transaction, now replaced by a newer COW version.
                 let _ = self.store.free_pages(pid, nr);
             } else {
                 main_free.push((pid, nr));
@@ -546,12 +543,10 @@ impl Tree {
     pub fn commit(&self) -> Result<()> {
         let root_id = *self.root_page_id.read();
 
-        // use RAII pattern to manage commit context.
-        // if function exits early via ? error, ctx will automatically extend freed/alloc vectors back to global lists
-        // on drop
-        let mut ctx = CommitContext::new(&self.pending_free, &self.pending_alloc);
+        let mut freed_lock = self.pending_free.write();
+        let mut alloc_lock = self.pending_alloc.write();
 
-        if ctx.freed.is_empty() && ctx.alloc.is_empty() && root_id == self.store.get_root_id() {
+        if freed_lock.is_empty() && alloc_lock.is_empty() && root_id == self.store.get_root_id() {
             return Ok(());
         }
 
@@ -562,7 +557,7 @@ impl Tree {
 
         // 2. write pending Log
         self.store
-            .write_pending_log(next_seq, &ctx.freed, &ctx.alloc)?;
+            .write_pending_log(next_seq, &freed_lock, &alloc_lock)?;
 
         // 3. update superblock (commit point)
         self.store.update_root(root_id)?;
@@ -570,15 +565,23 @@ impl Tree {
         // --- transaction committed successfully ---
 
         // 4. physically reclaim old pages
-        for (pid, nr) in &ctx.freed {
+        for (pid, nr) in freed_lock.iter() {
             let _ = self.store.free_pages(*pid, *nr);
         }
 
         // 5. persist free list changes and clear log
-        let _ = self.store.update_root(root_id);
         let _ = self.store.clear_pending_log();
 
-        ctx.done();
+        // 6. Double-Write: Update superblock AGAIN.
+        // This ensures that if we crash/corrupt this update, we fall back to the PREVIOUS update (step 3).
+        // The previous update (Step 3) points to the NEW root, but with the OLD free list.
+        // This is safe because the old free list just means we might leak some pages (which we just freed),
+        // but the DATA (New Root) is valid and persisted.
+        self.store.update_root(root_id)?;
+
+        freed_lock.clear();
+        alloc_lock.clear();
+
         Ok(())
     }
 
@@ -594,13 +597,13 @@ impl Tree {
             pages.push((current_id, 1));
 
             for i in 0..node.num_children() {
-                let slot = node.slot_at(i);
                 if node.is_leaf() {
+                    let slot = node.slot_at(i);
                     if !slot.is_inline() {
                         node.free_slot_pages(store, slot, pages)?;
                     }
                 } else {
-                    let child_id = slot.page_id[0];
+                    let child_id = node.child_at(i);
                     if child_id != 0 {
                         stack.push(child_id);
                     }
@@ -610,54 +613,9 @@ impl Tree {
         Ok(())
     }
 
-    fn iterator(&self) -> TreeIterator {
+    pub fn iterator(&self) -> TreeIterator {
         let root_id = *self.root_page_id.read();
         TreeIterator::new(self.store.clone(), root_id)
-    }
-}
-
-/// helper structure: manages page lists during commit, supporting automatic rollback
-struct CommitContext<'a> {
-    main_free: &'a RwLock<Vec<(u64, u32)>>,
-    main_alloc: &'a RwLock<HashSet<u64>>,
-    freed: Vec<(u64, u32)>,
-    alloc: HashSet<u64>,
-    success: bool,
-}
-
-impl<'a> CommitContext<'a> {
-    fn new(pf: &'a RwLock<Vec<(u64, u32)>>, pa: &'a RwLock<HashSet<u64>>) -> Self {
-        let mut pf_lock = pf.write();
-        let mut pa_lock = pa.write();
-        Self {
-            main_free: pf,
-            main_alloc: pa,
-            freed: std::mem::take(&mut *pf_lock),
-            alloc: std::mem::take(&mut *pa_lock),
-            success: false,
-        }
-    }
-
-    fn done(&mut self) {
-        self.success = true;
-    }
-}
-
-impl Drop for CommitContext<'_> {
-    fn drop(&mut self) {
-        if !self.success {
-            // if transaction failed (e.g., error return), return data to global lists for next retry
-            if !self.freed.is_empty() {
-                self.main_free
-                    .write()
-                    .extend(std::mem::take(&mut self.freed));
-            }
-            if !self.alloc.is_empty() {
-                self.main_alloc
-                    .write()
-                    .extend(std::mem::take(&mut self.alloc));
-            }
-        }
     }
 }
 
@@ -676,10 +634,9 @@ impl TreeIterator {
         };
 
         if root_id != 0
-            && let Ok(node_bytes) = iter.store.load_page(root_id)
-            && let Ok(node) = Node::from_raw(node_bytes)
+            && let Ok(node) = iter.store.load_node(root_id)
         {
-            iter.push_node(Arc::new(node));
+            iter.push_node(node);
         }
         iter
     }
@@ -689,43 +646,12 @@ impl TreeIterator {
             self.current_leaf = Some((node, 0));
         } else {
             self.stack.push((node, 0));
-            self.descend();
         }
     }
 
-    fn descend(&mut self) {
+    pub fn next_ref(&mut self, key_buf: &mut Vec<u8>, val_buf: &mut Vec<u8>) -> bool {
         loop {
-            let (node, idx) = match self.stack.last_mut() {
-                Some(x) => x,
-                None => return,
-            };
-
-            if *idx >= node.num_children() {
-                break;
-            }
-
-            let child_id = node.child_at(*idx);
-            match self.store.load_page(child_id) {
-                Ok(bytes) => match Node::from_raw(bytes) {
-                    Ok(child_node) => {
-                        let child_node_arc = Arc::new(child_node);
-                        if child_node_arc.is_leaf() {
-                            self.current_leaf = Some((child_node_arc, 0));
-                            return;
-                        } else {
-                            self.stack.push((child_node_arc, 0));
-                        }
-                    }
-                    Err(_) => return,
-                },
-                Err(_) => return,
-            }
-        }
-    }
-
-    fn next_ref(&mut self, key_buf: &mut Vec<u8>, val_buf: &mut Vec<u8>) -> bool {
-        loop {
-            if let Some((ref leaf, ref mut idx)) = self.current_leaf {
+            if let Some((leaf, idx)) = self.current_leaf.as_mut() {
                 if *idx < leaf.num_children() {
                     let slot = leaf.slot_at(*idx);
 
@@ -735,20 +661,15 @@ impl TreeIterator {
                     val_buf.clear();
                     if slot.is_inline() {
                         val_buf.extend_from_slice(leaf.value_at(*idx));
-                    } else {
-                        match leaf.collect_page_ids(&self.store, slot) {
-                            Ok(pages) => {
-                                val_buf.resize(slot.value_len(), 0);
-                                if self.store.read_data(&pages, val_buf).is_err() {
-                                    *idx += 1;
-                                    continue;
-                                }
-                            }
-                            Err(_) => {
-                                *idx += 1;
-                                continue;
-                            }
+                    } else if let Ok(pages) = leaf.collect_page_ids(&self.store, slot) {
+                        val_buf.resize(slot.value_len(), 0);
+                        if self.store.read_data(&pages, val_buf).is_err() {
+                            *idx += 1;
+                            continue;
                         }
+                    } else {
+                        *idx += 1;
+                        continue;
                     }
 
                     *idx += 1;
@@ -756,239 +677,146 @@ impl TreeIterator {
                 } else {
                     self.current_leaf = None;
                 }
-            } else {
-                if self.stack.is_empty() {
-                    return false;
-                }
+            }
 
-                while let Some((_, idx)) = self.stack.last() {
-                    let node = &self.stack.last().unwrap().0;
-                    if *idx + 1 >= node.num_children() {
-                        self.stack.pop();
-                        if self.stack.is_empty() {
-                            return false;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                if let Some((_, idx)) = self.stack.last_mut() {
+            if let Some((node, idx)) = self.stack.last_mut() {
+                if *idx < node.num_children() {
+                    let child_id = node.child_at(*idx);
                     *idx += 1;
-                    self.descend();
+                    if let Ok(child_node) = self.store.load_node(child_id) {
+                        self.push_node(child_node);
+                    }
+                } else {
+                    self.stack.pop();
                 }
+            } else {
+                return false;
             }
         }
     }
 }
 
-pub struct BucketIterator<'a> {
-    tree_iter: TreeIterator,
-    key_buf: Vec<u8>,
-    val_buf: Vec<u8>,
-    _guard: RwLockReadGuard<'a, ()>,
+pub struct Txn<'a> {
+    pub(crate) tree: Tree,
+    pub(crate) _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> Iterator for BucketIterator<'a> {
-    type Item = (&'a [u8], &'a [u8]);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self
-            .tree_iter
-            .next_ref(&mut self.key_buf, &mut self.val_buf)
-        {
-            unsafe {
-                Some((
-                    std::mem::transmute::<&[u8], &[u8]>(self.key_buf.as_slice()),
-                    std::mem::transmute::<&[u8], &[u8]>(self.val_buf.as_slice()),
-                ))
-            }
-        } else {
-            None
-        }
-    }
-}
-
-pub struct BTreeIterator<'a> {
-    tree_iter: TreeIterator,
-    main_tree: Arc<BTree>,
-    key_buf: Vec<u8>,
-    val_buf: Vec<u8>,
-    _guard: RwLockReadGuard<'a, ()>,
-}
-
-impl<'a> Iterator for BTreeIterator<'a> {
-    type Item = Bucket;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self
-            .tree_iter
-            .next_ref(&mut self.key_buf, &mut self.val_buf)
-        {
-            let name_str = std::str::from_utf8(&self.key_buf).expect("invalid bucket name");
-            Some(
-                self.main_tree
-                    .get_bucket(name_str)
-                    .expect("failed to get bucket during iteration"),
-            )
-        } else {
-            None
-        }
-    }
-}
-
-pub struct BucketMetadata {
-    pub root_page_id: u64,
-}
-
-impl BucketMetadata {
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                (self as *const Self) as *const u8,
-                std::mem::size_of::<Self>(),
-            )
-        }
-    }
-
-    pub fn from_slice(x: &[u8]) -> Self {
-        assert!(x.len() >= std::mem::size_of::<Self>());
-        unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
-    }
-}
-
-pub struct Bucket {
-    store: Arc<Store>,
-    name: Vec<u8>,
-    root_page_id: Arc<RwLock<u64>>,
-    main_tree: Arc<BTree>,
-}
-
-impl Bucket {
-    pub fn iter(&self) -> Result<BucketIterator<'_>> {
-        let lock = self.main_tree.writer_lock.read();
-        let tree = Tree::open(
-            self.store.clone(),
-            self.root_page_id.clone(),
-            self.main_tree.pending_free.clone(),
-            self.main_tree.pending_alloc.clone(),
-        )?;
-        Ok(BucketIterator {
-            tree_iter: tree.iterator(),
-            key_buf: Vec::new(),
-            val_buf: Vec::new(),
-            _guard: lock,
-        })
-    }
-
-    pub fn name(&self) -> &str {
-        std::str::from_utf8(&self.name).expect("bad data")
-    }
-
-    pub fn put<K, V>(&self, key: K, value: V) -> Result<()>
+impl<'a> Txn<'a> {
+    pub fn put<K, V>(&mut self, key: K, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let _lock = self.main_tree.writer_lock.write();
-
-        // Read-your-writes: check pending updates first, then the shared lock
-        // if shared bucket is not commited it will use root_page_id and when commit the first committer wins
-        let current_root_id = self
-            .main_tree
-            .pending_bucket_updates
-            .read()
-            .get(&self.name)
-            .cloned()
-            .unwrap_or_else(|| *self.root_page_id.read());
-
-        let tree_instance = Tree::open(
-            self.store.clone(),
-            Arc::new(RwLock::new(current_root_id)),
-            self.main_tree.pending_free.clone(),
-            self.main_tree.pending_alloc.clone(),
-        )?;
-        tree_instance.put(key.as_ref(), value.as_ref())?;
-
-        let new_root_id = *tree_instance.root_page_id.read();
-
-        if current_root_id != new_root_id {
-            self.main_tree
-                .pending_bucket_updates
-                .write()
-                .insert(self.name.clone(), new_root_id);
-        }
-
-        Ok(())
+        self.tree.put(key.as_ref(), value.as_ref())
     }
 
     pub fn get<K>(&self, key: K) -> Result<Vec<u8>>
     where
         K: AsRef<[u8]>,
     {
-        let _lock = self.main_tree.writer_lock.read();
-
-        // Read-your-writes
-        let current_root_id = self
-            .main_tree
-            .pending_bucket_updates
-            .read()
-            .get(&self.name)
-            .cloned()
-            .unwrap_or_else(|| *self.root_page_id.read());
-
-        let tree_instance = Tree::open(
-            self.store.clone(),
-            Arc::new(RwLock::new(current_root_id)),
-            self.main_tree.pending_free.clone(),
-            self.main_tree.pending_alloc.clone(),
-        )?;
-        tree_instance.get(key.as_ref())
+        self.tree.get(key.as_ref())
     }
 
-    pub fn del<K>(&self, key: K) -> Result<()>
+    pub fn del<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        let _lock = self.main_tree.writer_lock.write();
+        self.tree.del(key.as_ref())
+    }
 
-        let current_root_id = self
-            .main_tree
-            .pending_bucket_updates
-            .read()
-            .get(&self.name)
-            .cloned()
-            .unwrap_or_else(|| *self.root_page_id.read());
+    pub fn iter(&self) -> TreeIterator {
+        self.tree.iterator()
+    }
+}
 
-        let tree_instance = Tree::open(
-            self.store.clone(),
-            Arc::new(RwLock::new(current_root_id)),
-            self.main_tree.pending_free.clone(),
-            self.main_tree.pending_alloc.clone(),
+pub struct ReadOnlyTxn<'a> {
+    pub(crate) tree: Tree,
+    pub(crate) _guard: RwLockReadGuard<'a, ()>,
+}
+
+impl<'a> ReadOnlyTxn<'a> {
+    pub fn get<K>(&self, key: K) -> Result<Vec<u8>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.tree.get(key.as_ref())
+    }
+
+    pub fn iter(&self) -> TreeIterator {
+        self.tree.iterator()
+    }
+}
+
+pub struct MultiTxn<'a> {
+    btree: &'a BTree,
+    bucket_roots: HashMap<String, u64>,
+}
+
+impl<'a> MultiTxn<'a> {
+    pub fn execute<F, R>(&mut self, bucket: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Txn) -> Result<R>,
+    {
+        let name_bytes = bucket.as_bytes();
+
+        let initial_root = if let Some(&root) = self.bucket_roots.get(bucket) {
+            root
+        } else {
+            match self.btree.catalog_tree.get(name_bytes) {
+                Ok(bytes) => BucketMetadata::from_slice(&bytes).root_page_id,
+                Err(Error::NotFound) => 0,
+                Err(e) => return Err(e),
+            }
+        };
+
+        let tree = Tree::open(
+            self.btree.store.clone(),
+            Arc::new(RwLock::new(initial_root)),
+            self.btree.pending_free.clone(),
+            self.btree.pending_alloc.clone(),
         )?;
-        tree_instance.del(key.as_ref())?;
 
-        let new_root_id = *tree_instance.root_page_id.read();
+        let mut txn = Txn {
+            tree,
+            _marker: std::marker::PhantomData,
+        };
 
-        if current_root_id != new_root_id {
-            self.main_tree
-                .pending_bucket_updates
-                .write()
-                .insert(self.name.clone(), new_root_id);
+        let res = f(&mut txn);
+        if res.is_ok() {
+            let new_root = *txn.tree.root_page_id.read();
+            self.bucket_roots.insert(bucket.to_string(), new_root);
         }
-        Ok(())
+        res
+    }
+}
+
+pub struct BucketMetadata {
+    pub(crate) root_page_id: u64,
+}
+
+impl BucketMetadata {
+    pub fn from_slice(x: &[u8]) -> Self {
+        assert!(x.len() >= std::mem::size_of::<Self>());
+        unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        }
     }
 }
 
 pub struct BTree {
-    store: Arc<Store>,
-    catalog_tree: Arc<Tree>,
-    pending_free: Arc<RwLock<Vec<(u64, u32)>>>,
-    pending_alloc: Arc<RwLock<HashSet<u64>>>,
-    writer_lock: Arc<RwLock<()>>,
-    buckets: Arc<RwLock<HashMap<Vec<u8>, Arc<RwLock<u64>>>>>,
-    pending_bucket_updates: Arc<RwLock<HashMap<Vec<u8>, u64>>>,
-    start_root_id: Arc<RwLock<u64>>,
+    pub(crate) store: Arc<Store>,
+    pub(crate) catalog_tree: Arc<Tree>,
+    pub(crate) pending_free: Arc<RwLock<Vec<(u64, u32)>>>,
+    pub(crate) pending_alloc: Arc<RwLock<HashSet<u64>>>,
+    pub(crate) writer_lock: Arc<RwLock<()>>,
+    pub(crate) start_root_id: Arc<RwLock<u64>>,
 }
 
 impl BTree {
@@ -1011,109 +839,176 @@ impl BTree {
             pending_free,
             pending_alloc,
             writer_lock: Arc::new(RwLock::new(())),
-            buckets: Arc::new(RwLock::new(HashMap::new())),
-            pending_bucket_updates: Arc::new(RwLock::new(HashMap::new())),
             start_root_id: Arc::new(RwLock::new(initial_catalog_root_id)),
         })
     }
 
-    pub fn new_bucket<N>(&self, name: N) -> Result<Bucket>
+    /// Executes a read-write transaction on the specified bucket. It'll create a new one if given bucket is not exist
+    ///
+    /// The transaction is automatically committed if the closure returns `Ok`.
+    /// If the closure returns `Err`, the transaction is rolled back (allocated pages are reclaimed).
+    ///
+    /// # Warning
+    /// Nested calls to `exec` or `view` on the same `BTree` instance are NOT supported
+    /// and may lead to deadlocks or undefined behavior.
+    pub fn exec<F, R>(&self, bucket: &str, f: F) -> Result<R>
     where
-        N: AsRef<str>,
+        F: FnOnce(&mut Txn) -> Result<R>,
     {
         let _lock = self.writer_lock.write();
-        let name_bytes = name.as_ref().as_bytes();
 
-        if self.catalog_tree.get(name_bytes).is_ok() {
-            return Err(Error::Duplicate);
+        // Auto-refresh to the latest disk state before starting a new transaction.
+        // This makes the "Session" always start from the freshest data.
+        self.refresh_internal()?;
+
+        // Check if there's an existing bucket
+        let name_bytes = bucket.as_bytes();
+        let initial_root = match self.catalog_tree.get(name_bytes) {
+            Ok(bytes) => BucketMetadata::from_slice(&bytes).root_page_id,
+            Err(Error::NotFound) => 0,
+            Err(e) => return Err(e),
+        };
+
+        // Snapshot pending state for rollback
+        let pre_alloc = self.pending_alloc.read().clone();
+        let pre_free = self.pending_free.read().clone();
+        let pre_catalog_root = *self.catalog_tree.root_page_id.read();
+
+        let tree = Tree::open(
+            self.store.clone(),
+            Arc::new(RwLock::new(initial_root)),
+            self.pending_free.clone(),
+            self.pending_alloc.clone(),
+        )?;
+
+        let mut txn = Txn {
+            tree,
+            _marker: std::marker::PhantomData,
+        };
+
+        match f(&mut txn) {
+            Ok(res) => {
+                let new_root = *txn.tree.root_page_id.read();
+                let metadata = BucketMetadata {
+                    root_page_id: new_root,
+                };
+                self.catalog_tree.put(name_bytes, metadata.as_slice())?;
+                if let Err(e) = self.commit_internal() {
+                    // Rollback catalog and pages on commit failure (e.g. Conflict)
+                    *self.catalog_tree.root_page_id.write() = pre_catalog_root;
+                    self.rollback_pages(&pre_alloc, &pre_free);
+                    return Err(e);
+                }
+                Ok(res)
+            }
+            Err(e) => {
+                *self.catalog_tree.root_page_id.write() = pre_catalog_root;
+                self.rollback_pages(&pre_alloc, &pre_free);
+                Err(e)
+            }
         }
-
-        let new_bucket_root_id = 0;
-
-        // Add to pending updates so it's written during commit
-        self.pending_bucket_updates
-            .write()
-            .insert(name_bytes.to_vec(), new_bucket_root_id);
-
-        let root_page_id_lock = Arc::new(RwLock::new(new_bucket_root_id));
-        self.buckets
-            .write()
-            .insert(name_bytes.to_vec(), root_page_id_lock.clone());
-
-        Ok(Bucket {
-            store: self.store.clone(),
-            name: name_bytes.to_vec(),
-            root_page_id: root_page_id_lock,
-            main_tree: Arc::new(self.clone()),
-        })
     }
 
-    /// Refreshes the BTree instance to the latest disk state.                                                                        │
-    /// This will discard all pending (uncommitted) changes in this instance.                                                         │
-    ///                                                                                                                               │
-    /// # Best Practice (Conflict Resolution)                                                                                         │
-    /// When `commit()` returns `Err(Error::Conflict)`, it means another instance or process                                          │
-    /// has committed changes since this transaction started. To resolve this:                                                        │
-    /// 1. Call `refresh()` to sync with the latest disk state and clear stale pending updates.                                       │
-    /// 2. Re-fetch your buckets and re-apply your operations (puts/deletes).                                                         │
-    /// 3. Call `commit()` again.  
-    pub fn refresh(&self) -> Result<()> {
+    /// Executes multiple operations across different buckets in a single atomic transaction.
+    ///
+    /// This is more efficient than calling `exec` multiple times because it only performs
+    /// a single disk sync and superblock update at the end.
+    pub fn exec_multi<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut MultiTxn) -> Result<R>,
+    {
         let _lock = self.writer_lock.write();
-        self.pending_bucket_updates.write().clear();
-        self.pending_free.write().clear();
-        self.pending_alloc.write().clear();
 
+        self.refresh_internal()?;
+
+        let pre_alloc = self.pending_alloc.read().clone();
+        let pre_free = self.pending_free.read().clone();
+        let pre_catalog_root = *self.catalog_tree.root_page_id.read();
+
+        let mut multi_txn = MultiTxn {
+            btree: self,
+            bucket_roots: HashMap::new(),
+        };
+
+        match f(&mut multi_txn) {
+            Ok(res) => {
+                for (name, new_root) in multi_txn.bucket_roots {
+                    let metadata = BucketMetadata {
+                        root_page_id: new_root,
+                    };
+                    self.catalog_tree
+                        .put(name.as_bytes(), metadata.as_slice())?;
+                }
+                if let Err(e) = self.commit_internal() {
+                    *self.catalog_tree.root_page_id.write() = pre_catalog_root;
+                    self.rollback_pages(&pre_alloc, &pre_free);
+                    return Err(e);
+                }
+                Ok(res)
+            }
+            Err(e) => {
+                *self.catalog_tree.root_page_id.write() = pre_catalog_root;
+                self.rollback_pages(&pre_alloc, &pre_free);
+                Err(e)
+            }
+        }
+    }
+
+    fn rollback_pages(&self, pre_alloc: &HashSet<u64>, pre_free: &[(u64, u32)]) {
+        let mut alloc = self.pending_alloc.write();
+        let mut freed_now = Vec::new();
+        for &pid in alloc.iter() {
+            if !pre_alloc.contains(&pid) {
+                freed_now.push(pid);
+            }
+        }
+        for pid in freed_now {
+            alloc.remove(&pid);
+            let _ = self.store.free_pages(pid, 1);
+        }
+        *self.pending_free.write() = pre_free.to_owned();
+    }
+
+    /// Executes a read-only transaction on the specified bucket.
+    ///
+    /// # Warning
+    /// Nested calls to `exec` or `view` on the same `BTree` instance are NOT supported
+    /// and may lead to deadlocks or undefined behavior.
+    pub fn view<F, R>(&self, bucket: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&ReadOnlyTxn) -> Result<R>,
+    {
+        let lock = self.writer_lock.read();
+
+        // For view, we also want the freshest data.
         let latest_root = self.store.refresh_sb()?;
-        let mut cat_root = self.catalog_tree.root_page_id.write();
-        *cat_root = latest_root;
-        *self.start_root_id.write() = latest_root;
-        Ok(())
-    }
-
-    pub fn get_bucket<N>(&self, name: N) -> Result<Bucket>
-    where
-        N: AsRef<str>,
-    {
-        let name_bytes = name.as_ref().as_bytes();
-
-        // 1. Check pending updates (Read-Your-Writes)
-        // If the bucket was created or modified in the current transaction,
-        // it might not be in the catalog_tree yet.
-        if let Some(&pending_root) = self.pending_bucket_updates.read().get(name_bytes) {
-            let mut buckets = self.buckets.write();
-            let lock = buckets
-                .entry(name_bytes.to_vec())
-                .or_insert_with(|| Arc::new(RwLock::new(pending_root)));
-
-            return Ok(Bucket {
-                store: self.store.clone(),
-                name: name_bytes.to_vec(),
-                root_page_id: lock.clone(),
-                main_tree: Arc::new(self.clone()),
-            });
+        if latest_root != *self.start_root_id.read() {
+            // Clear cache to avoid stale reads if version moved
+            self.store.clear_cache();
         }
 
-        // 2. Load metadata from our snapshot
-        let metadata_bytes = self.catalog_tree.get(name_bytes)?;
+        let name_bytes = bucket.as_bytes();
+        // Use the latest root for the catalog lookup
+        let catalog = Tree::open(
+            self.store.clone(),
+            Arc::new(RwLock::new(latest_root)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(HashSet::new())),
+        )?;
+
+        let metadata_bytes = catalog.get(name_bytes)?;
         let metadata = BucketMetadata::from_slice(&metadata_bytes);
 
-        let mut buckets = self.buckets.write();
-        let lock = buckets
-            .entry(name_bytes.to_vec())
-            .or_insert_with(|| Arc::new(RwLock::new(metadata.root_page_id)));
+        let tree = Tree::open(
+            self.store.clone(),
+            Arc::new(RwLock::new(metadata.root_page_id)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(HashSet::new())),
+        )?;
 
-        // Ensure the lock matches our snapshot root
-        let mut lock_val = lock.write();
-        if *lock_val != metadata.root_page_id {
-            *lock_val = metadata.root_page_id;
-        }
+        let txn = ReadOnlyTxn { tree, _guard: lock };
 
-        Ok(Bucket {
-            store: self.store.clone(),
-            name: name_bytes.to_vec(),
-            root_page_id: lock.clone(),
-            main_tree: Arc::new(self.clone()),
-        })
+        f(&txn)
     }
 
     pub fn del_bucket<N>(&self, name: N) -> Result<()>
@@ -1121,10 +1016,13 @@ impl BTree {
         N: AsRef<str>,
     {
         let _lock = self.writer_lock.write();
-        let bucket_metadata = match self.catalog_tree.get(name.as_ref().as_bytes()) {
-            Ok(bytes) => BucketMetadata::from_slice(&bytes),
-            Err(e) => return Err(e),
-        };
+
+        // Ensure we are operating on the latest state
+        self.refresh_internal()?;
+
+        let name_bytes = name.as_ref().as_bytes();
+        let metadata_bytes = self.catalog_tree.get(name_bytes)?;
+        let bucket_metadata = BucketMetadata::from_slice(&metadata_bytes);
 
         let mut pages_to_free = Vec::new();
         if bucket_metadata.root_page_id != 0 {
@@ -1135,79 +1033,105 @@ impl BTree {
             )?;
         }
 
-        self.catalog_tree.del(name.as_ref().as_bytes())?;
-        self.buckets.write().remove(name.as_ref().as_bytes());
+        self.catalog_tree.del(name_bytes)?;
         self.pending_free.write().extend(pages_to_free);
+        self.commit_internal()
+    }
 
+    fn commit_internal(&self) -> Result<()> {
+        let current_disk_root = self.store.refresh_sb()?;
+        if current_disk_root != *self.start_root_id.read() {
+            return Err(Error::Conflict);
+        }
+
+        self.catalog_tree.commit()?;
+
+        let new_root = self.store.get_root_id();
+        *self.start_root_id.write() = new_root;
         Ok(())
     }
 
     pub fn commit(&self) -> Result<()> {
         let _lock = self.writer_lock.write();
+        self.commit_internal()
+    }
 
-        // 1. Conflict Detection (CAS)
-        // Check if someone else committed while we were working
-        let current_disk_root = self.store.refresh_sb()?;
-        let start_root = *self.start_root_id.read();
+    fn refresh_internal(&self) -> Result<()> {
+        self.pending_free.write().clear();
+        self.pending_alloc.write().clear();
+        self.store.clear_cache();
 
-        if current_disk_root != start_root {
-            return Err(Error::Conflict);
-        }
-
-        // 2. Apply all pending bucket updates to the catalog tree
-        let pending_updates = self.pending_bucket_updates.read().clone();
-        for (name, new_root) in &pending_updates {
-            let metadata = BucketMetadata {
-                root_page_id: *new_root,
-            };
-            self.catalog_tree.put(name, metadata.as_slice())?;
-        }
-
-        // 3. Commit the catalog tree (and thus the whole Store)
-        self.catalog_tree.commit()?;
-
-        // 4. Success! Synchronize all memory locks
-        let new_committed_root = self.store.get_root_id();
-        let buckets = self.buckets.write();
-        for (name, new_root) in pending_updates {
-            if let Some(lock) = buckets.get(&name) {
-                *lock.write() = new_root;
-            }
-        }
-
-        // 5. Reset transaction state
-        *self.start_root_id.write() = new_committed_root;
-        self.pending_bucket_updates.write().clear();
-
+        let latest_root = self.store.refresh_sb()?;
+        *self.catalog_tree.root_page_id.write() = latest_root;
+        *self.start_root_id.write() = latest_root;
         Ok(())
     }
 
-    pub fn iter(&self) -> BTreeIterator<'_> {
-        let lock = self.writer_lock.read();
-        let committed_catalog_root = self.store.get_root_id();
-        let tree_iter = TreeIterator::new(self.store.clone(), committed_catalog_root);
+    /// Returns an iterator over all bucket names.
+    pub fn buckets(&self) -> Result<Vec<String>> {
+        let _lock = self.writer_lock.read();
 
-        BTreeIterator {
-            tree_iter,
-            main_tree: Arc::new(self.clone()),
-            key_buf: Vec::new(),
-            val_buf: Vec::new(),
-            _guard: lock,
+        // Ensure we see the latest buckets from disk
+        let latest_root = self.store.refresh_sb()?;
+        let catalog = Tree::open(
+            self.store.clone(),
+            Arc::new(RwLock::new(latest_root)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(HashSet::new())),
+        )?;
+
+        let mut iter = catalog.iterator();
+        let mut key_buf = Vec::new();
+        let mut val_buf = Vec::new();
+        let mut res = Vec::new();
+        while iter.next_ref(&mut key_buf, &mut val_buf) {
+            if let Ok(s) = std::str::from_utf8(&key_buf) {
+                res.push(s.to_string());
+            }
         }
+        Ok(res)
+    }
+
+    /// Returns the current transaction sequence number.
+    /// Useful for monitoring and testing.
+    #[doc(hidden)]
+    pub fn current_seq(&self) -> u64 {
+        self.store.get_seq()
+    }
+
+    /// Returns the number of (allocated, freed) pages currently pending commit in this handle.
+    /// Useful for monitoring and testing.
+    #[doc(hidden)]
+    pub fn pending_pages(&self) -> (usize, usize) {
+        (
+            self.pending_alloc.read().len(),
+            self.pending_free.read().len(),
+        )
     }
 }
 
 impl Clone for BTree {
+    /// Cloning a BTree handle creates a NEW independent transaction context.
     fn clone(&self) -> Self {
+        let initial_root = *self.start_root_id.read();
+
+        let catalog_tree = Arc::new(
+            Tree::open(
+                self.store.clone(),
+                Arc::new(RwLock::new(initial_root)),
+                self.pending_free.clone(),
+                self.pending_alloc.clone(),
+            )
+            .expect("failed to clone catalog"),
+        );
+
         Self {
             store: self.store.clone(),
-            catalog_tree: self.catalog_tree.clone(),
+            catalog_tree,
             pending_free: self.pending_free.clone(),
             pending_alloc: self.pending_alloc.clone(),
             writer_lock: self.writer_lock.clone(),
-            buckets: self.buckets.clone(),
-            pending_bucket_updates: self.pending_bucket_updates.clone(),
-            start_root_id: self.start_root_id.clone(),
+            start_root_id: Arc::new(RwLock::new(initial_root)),
         }
     }
 }

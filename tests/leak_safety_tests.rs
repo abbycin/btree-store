@@ -1,59 +1,42 @@
 use btree_store::BTree;
 use std::fs;
 use std::path::Path;
+use tempfile::TempDir;
 
 #[test]
 fn test_page_leak_recovery() {
-    let db_path = "test_leak.db";
-    let pending_path = "test_leak.pending";
-    if Path::new(db_path).exists() {
-        fs::remove_file(db_path).unwrap();
-    }
-    if Path::new(pending_path).exists() {
-        fs::remove_file(pending_path).unwrap();
-    }
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("leak.db");
+    let pending_path = temp_dir.path().join("leak.pending");
 
     {
-        let bt = BTree::open(db_path).unwrap();
-        let bucket = bt.new_bucket("default").unwrap();
-        bt.commit().unwrap(); // Commit bucket creation
-
-        bucket.put(b"key1", b"val1").unwrap();
-        bt.commit().unwrap(); // Seq 1 -> 2 (assuming init is 1, create bucket is some seq, put is next)
-        // Wait, init is 1 (P0).
-        // new_bucket: allocates root for catalog (if not init?), allocates root for bucket.
-        // Actually Store::open creates P0(Seq1) and P1(Seq2).
-        // new_bucket modifies catalog. Catalog root changes. SB updated.
-
-        // Let's rely on the mechanism, not exact seq numbers for the setup part.
+        let bt = BTree::open(&db_path).unwrap();
+        bt.exec("default", |_txn| Ok(())).unwrap();
+        bt.exec("default", |txn| {
+            txn.put(b"key1", b"val1").unwrap();
+            Ok(())
+        })
+        .unwrap();
     }
 
-    // 1. Manually check the current SEQ
-    let _current_seq = {
-        let _bt = BTree::open(db_path).unwrap();
-        // Just get the seq from the store via a helper or assume based on operations?
-        // Since we can't easily access store.get_seq() from here as it's private/internal to BTree structure...
-        // Let's assume a safe high number or try to read it.
-        // Or, we can just use the fact that we know we committed a few times.
-        // Init: Seq 2 (P1).
-        // new_bucket: Updates catalog. Seq 3.
-        // put: Updates bucket root -> Updates catalog. Seq 4.
-        4
+    // Determine current seq
+    let current_seq = {
+        let bt = BTree::open(&db_path).unwrap();
+        bt.current_seq()
     };
 
-    // 2. Create a "fake" pending log for the CURRENT seq
-    // This simulates: "I updated SB to Seq 4, but I haven't freed Page 100 yet"
+    // Create a "fake" pending log for the CURRENT seq (Redo-Free)
     let mut log_content = Vec::new();
-    // Header: seq (8) + nr_freed (4) + nr_alloc (4) + checksum (4) + padding (4) = 24 bytes
     let data = {
         let mut d = Vec::new();
         d.extend_from_slice(&100u64.to_le_bytes()); // PID 100
         d.extend_from_slice(&1u32.to_le_bytes()); // 1 page
+        d.extend_from_slice(&[0u8; 4]); // Padding for PendingEntry
         d
     };
     let checksum = crc32c::crc32c(&data);
 
-    log_content.extend_from_slice(&4u64.to_le_bytes()); // Seq 4
+    log_content.extend_from_slice(&current_seq.to_le_bytes());
     log_content.extend_from_slice(&1u32.to_le_bytes()); // nr_freed = 1
     log_content.extend_from_slice(&0u32.to_le_bytes()); // nr_alloc = 0
     log_content.extend_from_slice(&checksum.to_le_bytes()); // checksum
@@ -61,18 +44,46 @@ fn test_page_leak_recovery() {
 
     log_content.extend_from_slice(&data);
 
-    fs::write(pending_path, log_content).unwrap();
+    fs::write(&pending_path, log_content).unwrap();
 
-    // 3. Open the BTree. It should detect the log and call free_pages(100, 1)
+    // Open the BTree. It should detect the log and clear it
     {
-        let _bt = BTree::open(db_path).unwrap();
+        let _bt = BTree::open(&db_path).unwrap();
     }
 
-    // 4. Verification: If it worked, the log file should be gone
-    assert!(
-        !Path::new(pending_path).exists(),
-        "Pending log should be cleared after recovery"
-    );
+    if Path::new(&pending_path).exists() {
+        assert_eq!(
+            fs::metadata(&pending_path).unwrap().len(),
+            0,
+            "Pending log should be cleared after recovery"
+        );
+    }
+}
 
-    fs::remove_file(db_path).unwrap();
+#[test]
+fn test_exec_rollback_no_leak() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("rollback_leak.db");
+
+    let tree = BTree::open(&db_path).unwrap();
+
+    // 1. Initial state
+    tree.exec("data", |txn| {
+        txn.put(b"initial", b"value").unwrap();
+        Ok(())
+    })
+    .unwrap();
+
+    // 2. Execute a transaction that fails
+    let res: btree_store::Result<()> = tree.exec("data", |txn| {
+        // Allocate some pages by putting large values
+        txn.put(b"large", &vec![0xAA; 1024 * 1024]).unwrap();
+        // Return error to trigger rollback
+        Err(btree_store::Error::Internal)
+    });
+
+    assert_eq!(res, Err(btree_store::Error::Internal));
+
+    // 3. Verify that pages were NOT leaked (pending_alloc should be empty)
+    assert_eq!(tree.pending_pages().0, 0, "Pending alloc should be empty");
 }

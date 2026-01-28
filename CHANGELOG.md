@@ -2,6 +2,17 @@
 
 All notable changes to the **btree_store** project will be documented in this file.
 
+## [0.1.2] - 2026-01-28
+
+### Added
+- **Performance Benchmarking**: Integrated `criterion` benchmarks to evaluate core engine metrics, covering batch writes, random reads, and concurrent access.
+- **Detailed Performance Documentation**: Added `benchmark.md` containing baseline and optimized performance results for transparency.
+
+### Changed
+- **Lock-Free Read Path**: Removed the global file `Mutex` in `Store`, enabling true parallel reading across multiple threads by leveraging thread-safe positional I/O (`pread`/`pwrite`).
+- **Memory Optimization**: Switched from heap-allocated vectors to stack-allocated arrays for superblock refreshing, reducing allocation overhead in the transaction hot-path.
+- **Improved Multi-Core Scalability**: Achieved a ~80% reduction in concurrent read latency (from ~4.5µs to ~860ns per op with 4 threads).
+
 ## [0.1.1] - 2026-01-18
 
 ### Added

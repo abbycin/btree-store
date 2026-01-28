@@ -123,7 +123,7 @@ struct PendingEntry {
 }
 
 pub struct Store {
-    file: Arc<Mutex<File>>,
+    file: File,
     sb: Mutex<MetaNode>,
     pending_path: PathBuf,
     /// contention is concentrated at the B+ Tree's root
@@ -155,8 +155,8 @@ impl Store {
         } else {
             let file = OpenOptions::new().read(true).write(true).open(path)?;
 
-            let mut buf0 = vec![0u8; PAGE_SIZE];
-            let mut buf1 = vec![0u8; PAGE_SIZE];
+            let mut buf0 = [0u8; PAGE_SIZE];
+            let mut buf1 = [0u8; PAGE_SIZE];
 
             let r0 = file.pread_exact(&mut buf0, 0);
             let r1 = file.pread_exact(&mut buf1, PAGE_SIZE as u64);
@@ -192,7 +192,7 @@ impl Store {
 
         let pending_path = path.with_extension("pending");
         let store = Self {
-            file: Arc::new(Mutex::new(file)),
+            file,
             sb: Mutex::new(sb),
             pending_path,
             cache: NodeCache::new(4096),
@@ -354,7 +354,6 @@ impl Store {
 
     pub fn alloc_pages(&self, nr_pages: u32) -> Result<Vec<u64>> {
         let mut sb_guard = self.sb.lock();
-        let f = self.file.lock();
 
         let mut temp_sb = *sb_guard;
         let mut gathered = Vec::new();
@@ -366,13 +365,15 @@ impl Store {
             if start_id == temp_sb.free_list_head {
                 // Allocating the head page itself. Read the next pointer first.
                 let mut buf = [0u8; FREE_NODE_SIZE];
-                f.pread_exact(&mut buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
+                self.file
+                    .pread_exact(&mut buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
                 let free_node = FreeNode::from_slice(&buf);
 
                 temp_sb.free_list_head = free_node.next;
                 if temp_sb.free_list_head != 0 {
                     let mut next_buf = [0u8; FREE_NODE_SIZE];
-                    f.pread_exact(&mut next_buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
+                    self.file
+                        .pread_exact(&mut next_buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
                     let next_node = FreeNode::from_slice(&next_buf);
                     if !next_node.validate() {
                         return Err(Error::Corruption);
@@ -407,7 +408,8 @@ impl Store {
 
             if temp_sb.nr_free == 0 {
                 let mut buf = [0u8; FREE_NODE_SIZE];
-                f.pread_exact(&mut buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
+                self.file
+                    .pread_exact(&mut buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
                 let h_node = FreeNode::from_slice(&buf);
                 if !h_node.validate() {
                     return Err(Error::Corruption);
@@ -415,7 +417,8 @@ impl Store {
                 temp_sb.free_list_head = h_node.next;
                 if temp_sb.free_list_head != 0 {
                     let mut n_buf = [0u8; FREE_NODE_SIZE];
-                    f.pread_exact(&mut n_buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
+                    self.file
+                        .pread_exact(&mut n_buf, temp_sb.free_list_head * PAGE_SIZE as u64)?;
                     let n_node = FreeNode::from_slice(&n_buf);
                     if !n_node.validate() {
                         return Err(Error::Corruption);
@@ -451,7 +454,6 @@ impl Store {
         }
 
         let mut sb = self.sb.lock();
-        let f = self.file.lock();
 
         if sb.free_list_head == page_id {
             return Ok(());
@@ -460,14 +462,16 @@ impl Store {
         // Ensure cached head's state is persisted before moving head
         if sb.free_list_head != 0 {
             let mut buf = vec![0u8; FREE_NODE_SIZE];
-            if f.pread_exact(&mut buf, sb.free_list_head * PAGE_SIZE as u64)
+            if self
+                .file
+                .pread_exact(&mut buf, sb.free_list_head * PAGE_SIZE as u64)
                 .is_ok()
             {
                 let mut head_node = FreeNode::from_slice(&buf);
                 if head_node.validate() && head_node.nr_pages as u64 != sb.nr_free {
                     head_node.nr_pages = sb.nr_free as u32;
                     head_node.update_checksum();
-                    let _ = f.pwrite_all(
+                    let _ = self.file.pwrite_all(
                         unsafe {
                             std::slice::from_raw_parts(
                                 (&head_node as *const FreeNode) as *const u8,
@@ -486,7 +490,7 @@ impl Store {
             checksum: 0,
         };
         new_node.update_checksum();
-        f.pwrite_all(
+        self.file.pwrite_all(
             unsafe {
                 std::slice::from_raw_parts(
                     (&new_node as *const FreeNode) as *const u8,
@@ -503,7 +507,7 @@ impl Store {
     }
 
     pub fn sync(&self) -> Result<()> {
-        self.file.lock().psync_all().map_err(|_| Error::IoError)
+        self.file.psync_all().map_err(|_| Error::IoError)
     }
 
     pub fn load_node(&self, page_id: u64) -> Result<Arc<Node>> {
@@ -529,7 +533,6 @@ impl Store {
     }
 
     pub fn read_data(&self, pages: &[u64], buf: &mut [u8]) -> Result<()> {
-        let f = self.file.lock();
         for (i, &pid) in pages.iter().enumerate() {
             let offset = pid * PAGE_SIZE as u64;
             let start = i * PAGE_SIZE;
@@ -537,13 +540,12 @@ impl Store {
                 break;
             }
             let end = std::cmp::min(start + PAGE_SIZE, buf.len());
-            f.pread_exact(&mut buf[start..end], offset)?;
+            self.file.pread_exact(&mut buf[start..end], offset)?;
         }
         Ok(())
     }
 
     pub fn write_data(&self, pages: &[u64], data: &[u8]) -> Result<()> {
-        let f = self.file.lock();
         for (i, &pid) in pages.iter().enumerate() {
             let offset = pid * PAGE_SIZE as u64;
             let start = i * PAGE_SIZE;
@@ -551,7 +553,7 @@ impl Store {
                 break;
             }
             let end = std::cmp::min(start + PAGE_SIZE, data.len());
-            f.pwrite_all(&data[start..end], offset)?;
+            self.file.pwrite_all(&data[start..end], offset)?;
         }
         Ok(())
     }
@@ -569,13 +571,11 @@ impl Store {
     }
 
     pub fn refresh_sb(&self) -> Result<u64> {
-        let file = self.file.lock();
-        let mut buf0 = vec![0u8; PAGE_SIZE];
-        let mut buf1 = vec![0u8; PAGE_SIZE];
+        let mut buf0 = [0u8; PAGE_SIZE];
+        let mut buf1 = [0u8; PAGE_SIZE];
 
-        let r0 = file.pread_exact(&mut buf0, 0);
-        let r1 = file.pread_exact(&mut buf1, PAGE_SIZE as u64);
-        drop(file);
+        let r0 = self.file.pread_exact(&mut buf0, 0);
+        let r1 = self.file.pread_exact(&mut buf1, PAGE_SIZE as u64);
 
         let sb0 = if r0.is_ok() {
             let s = MetaNode::from_slice(&buf0);
@@ -634,9 +634,8 @@ impl Store {
             0
         };
 
-        let file = self.file.lock();
-        file.pwrite_all(&sb.as_page_slice(), write_offset)?;
-        file.psync_all()?;
+        self.file.pwrite_all(&sb.as_page_slice(), write_offset)?;
+        self.file.psync_all()?;
 
         Ok(())
     }

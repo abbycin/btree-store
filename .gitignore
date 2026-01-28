@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+*.md
+!benchmark.md
+!README.md
+!CHANGELOG.md

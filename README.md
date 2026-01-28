@@ -27,9 +27,8 @@
 
 Add this to your `Cargo.toml`:
 
-```toml
-[dependencies]
-btree-store = "0.1.1"
+```bash
+cargo add btree-store
 ```
 
 ### Basic Example
@@ -77,6 +76,8 @@ The engine is optimized for high-throughput scenarios:
 *   **Snapshot Isolation (SI):** Readers and writers operate on stable snapshots without blocking each other (non-blocking reads).
 *   **Automatic Page Reclamation:** Failed or conflicted transactions automatically trigger page reclamation to prevent database bloat.
 *   **Transmute-based lifetime extension:** Iterators return direct references to internal buffers under a read lock, achieving near-zero allocation.
+
+See [benchmark.md](benchmark.md) for detailed performance metrics.
 
 ## Testing
 

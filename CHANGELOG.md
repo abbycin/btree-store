@@ -2,6 +2,14 @@
 
 All notable changes to the **btree_store** project will be documented in this file.
 
+## [0.1.4] - 2026-02-08
+
+### Added
+- **C FFI**: Added `ffi` feature with `cdylib`/`staticlib` outputs, public C headers and example, and FFI documentation.
+
+### Changed
+- **CI Coverage**: Added FFI build and C example checks across Linux/macOS/Windows (plus FreeBSD).
+
 ## [0.1.3] - 2026-02-08
 
 ### Added

@@ -1,5 +1,9 @@
 # btree_store
 
+[![CI](https://github.com/abbycin/btree-store/actions/workflows/ci.yml/badge.svg)](https://github.com/abbycin/btree-store/actions)
+[![Crates.io](https://img.shields.io/crates/v/btree-store.svg)](https://crates.io/crates/btree-store)
+[![License](https://img.shields.io/crates/l/btree-store.svg)](./LICENSE)
+
 **btree_store** is a persistent, embedded key-value storage engine written in Rust. It implements a robust Copy-On-Write (COW) B-Tree architecture to ensure data integrity, crash safety, and efficient concurrent access.
 
 ## Features
@@ -70,6 +74,51 @@ fn main() -> Result<(), Error> {
 }
 ```
 
+## FFI (C)
+
+Enable the `ffi` feature and build shared + static libraries:
+
+Linux/macOS:
+```bash
+RUSTFLAGS="-C panic=abort" cargo build --features ffi --release
+```
+
+Windows (PowerShell):
+```powershell
+$env:RUSTFLAGS="-C panic=abort"; cargo build --features ffi --release
+```
+
+Build and run the minimal C example (`examples/ffi.c`):
+
+Linux:
+```bash
+cc -I./include examples/ffi.c -L./target/release -lbtree_store -o ffi
+LD_LIBRARY_PATH=./target/release ./ffi
+```
+
+macOS:
+```bash
+cc -I./include examples/ffi.c -L./target/release -lbtree_store -o ffi
+DYLD_LIBRARY_PATH=./target/release ./ffi
+```
+
+Windows (MSVC):
+```bat
+cl /I include examples\ffi.c /Fe:ffi.exe /link /LIBPATH:target\release btree_store.dll.lib
+copy target\release\btree_store.dll .
+ffi.exe
+```
+
+Notes:
+*   The C ABI is callback-based (`btree_exec`/`btree_view`).
+*   Do not call `exec`/`view` inside callbacks.
+*   `Txn`/`MultiTxn` handles are valid only during callbacks.
+*   `longjmp` across FFI is unsafe.
+*   Panics are not caught; use `panic=abort`.
+*   `txn_get` returns a Rust-allocated buffer that must be freed with `btree_free`.
+*   `btree_last_error` returns a pointer valid until the next FFI call on the same thread or `btree_last_error_clear`.
+*   See `ffi.md` for full FFI usage documentation.
+
 ## Maintenance
 
 You can trigger a best-effort tail compaction to reclaim space:
@@ -93,6 +142,33 @@ The engine is optimized for high-throughput scenarios:
 ## Limits
 
 *   **Max file size:** ~16 TB with 4 KB pages (32-bit page ids).
+
+## Benchmarks
+
+Environment:
+*   **Date:** 2026-02-08
+*   **OS:** openSUSE Tumbleweed (20260131), kernel 6.18.7-1-default
+*   **CPU:** AMD Ryzen 7 4800H, 8C/16T
+*   **Command:** `cargo bench`
+
+Results (lower is better):
+| Benchmark | Mean | 95% CI |
+| --- | --- | --- |
+| bucket_ops/create_drop_empty_bucket | 53.737 us | [53.484, 54.001] us |
+| bucket_ops/drop_large_bucket_100k | 37.526 ms | [36.650, 38.906] ms |
+| concurrent_get/4_threads_random_get | 438.833 ns | [428.752, 448.772] ns |
+| delete/delete_insert_cycle_1k | 71.924 ms | [71.699, 72.222] ms |
+| get/random_get_100k | 959.259 ns | [948.173, 971.986] ns |
+| insert/insert_1k_tx | 67.990 ms | [67.707, 68.283] ms |
+
+Interpretation:
+*   **get**: ~0.96 us/op (random get on 100k keys).
+*   **get (4 threads)**: ~0.44 us/op (per get, concurrent reads).
+*   **put**: ~68 us/op (**single-op transactions**; `insert_1k_tx` runs 1000 separate `exec` calls).
+*   **del**: ~72 us/op (**single-op transactions** after a prefill).
+*   **bucket ops**: empty bucket create+drop ~54 us; drop 100k-key bucket ~37.5 ms.
+*   These numbers are machine- and load-dependent; rerun on your hardware for comparable results.
+*   No cross-DB comparison is provided here because different engines and configurations are not directly comparable.
 
 ## Testing
 

@@ -11,6 +11,12 @@ license = "MIT"
 keywords = ["database", "kv", "btree", "storage", "embedded"]
 categories = ["database-implementations", "data-structures"]
 
+[features]
+ffi = []
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
 [dependencies]
 crc32c = "0.6.8"
 parking_lot = "0.12.5"

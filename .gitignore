@@ -1,6 +1,8 @@
 /target
 Cargo.lock
 *.md
+!ffi.md
+!docs/design.md
 !benchmark.md
 !README.md
 !CHANGELOG.md

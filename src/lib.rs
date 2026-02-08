@@ -2,6 +2,8 @@ use std::{collections::HashMap, collections::HashSet, fmt, io, path::Path, sync:
 
 use parking_lot::{RwLock, RwLockReadGuard};
 
+#[cfg(feature = "ffi")]
+mod ffi;
 pub(crate) mod node;
 pub(crate) mod page_store;
 pub(crate) mod store;

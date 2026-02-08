@@ -2,7 +2,7 @@ name: Cross-platform CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, task-5 ]
   pull_request:
     branches: [ master ]
 
@@ -39,6 +39,42 @@ jobs:
 
       - name: Run Tests
         run: cargo test --verbose -- --nocapture
+      
+      - name: Build FFI (release)
+        run: cargo build --features ffi --release
+        env:
+          RUSTFLAGS: "-C panic=abort"
+
+      - name: Setup MSVC
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build C example (unix)
+        if: matrix.os != 'windows-latest'
+        run: cc -I./include examples/ffi.c -L./target/release -lbtree_store -o ffi
+
+      - name: Run C example (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: LD_LIBRARY_PATH=./target/release ./ffi
+
+      - name: Run C example (macos)
+        if: startsWith(matrix.os, 'macos')
+        run: DYLD_LIBRARY_PATH=./target/release ./ffi
+
+      - name: Build C example (windows)
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          set BTREE_LIB=btree_store.lib
+          if exist target\release\btree_store.dll.lib set BTREE_LIB=btree_store.dll.lib
+          cl /I include examples\ffi.c /Fe:ffi.exe /link /LIBPATH:target\release %BTREE_LIB%
+
+      - name: Run C example (windows)
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: |
+          if exist target\release\btree_store.dll copy target\release\btree_store.dll .
+          ffi.exe
 
   # Job 2: FreeBSD (Runs in a VM on top of Linux)
   test-freebsd:
@@ -55,6 +91,9 @@ jobs:
             pkg install -y rust
           run: |
             cargo test --verbose -- --nocapture
+            RUSTFLAGS="-C panic=abort" cargo build --features ffi --release
+            cc -I./include examples/ffi.c -L./target/release -lbtree_store -o ffi
+            LD_LIBRARY_PATH=./target/release ./ffi
 
   # Job 3: Linux ARM64 (Cross-compile check)
   # This verifies that the code compiles for Linux on ARM.
@@ -74,9 +113,9 @@ jobs:
         run: cargo install cross
 
       - name: Build for ARM64
-        run: cross build --target aarch64-unknown-linux-gnu --verbose
+        run: cross build --target aarch64-unknown-linux-gnu --features ffi --verbose
       
       # Note: Running tests for ARM64 on x86_64 requires QEMU via cross.
       # If you want to actually run the tests:
       - name: Run tests for ARM64
-        run: cross test --target aarch64-unknown-linux-gnu --verbose -- --nocapture
+        run: cross test --target aarch64-unknown-linux-gnu --features ffi --verbose -- --nocapture

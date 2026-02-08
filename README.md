@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/btree-store.svg)](https://crates.io/crates/btree-store)
 [![License](https://img.shields.io/crates/l/btree-store.svg)](./LICENSE)
 
-**btree_store** is a persistent, embedded key-value storage engine written in Rust. It implements a robust Copy-On-Write (COW) B-Tree architecture to ensure data integrity, crash safety, and efficient concurrent access.
+**btree_store** is a persistent, embedded key-value storage engine written in Rust. It implements a robust Copy-On-Write (COW) B+ Tree architecture to ensure data integrity, crash safety, and efficient concurrent access.
 
 ## Features
 
@@ -13,7 +13,7 @@
 *   **Auto-Refresh:** Every transaction automatically starts from the freshest disk state. No manual snapshot management required.
 *   **Conflict Detection:** Built-in "First-Committer-Wins" strategy for concurrent handles.
 *   **Batch Operations:** `exec_multi` for atomic updates across multiple buckets with a single disk sync, significantly reducing I/O overhead.
-*   **Crash Safety:** Double-write superblock updates and a `.pending` log recovery mechanism ensure zero-leak recovery even from torn writes.
+*   **Crash Safety:** Double-buffered superblock with CRC32C checksums and ordered metadata writes; recovery selects the newest valid meta page.
 *   **Logical Namespaces:** Direct support for multiple buckets within a single database file.
 *   **Zero-Copy Access:** 8-byte aligned memory layouts allow direct pointer-to-reference conversion for maximum performance.
 *   **Robust Data Integrity:** Strengthened physical invariant checks and CRC32C checksum validation for every node and metadata page.
@@ -24,7 +24,7 @@
 
 ## Architecture
 
-*   **Store (`src/store.rs`):** Low-level page management, sharded LRU caching with mandatory invalidation on sync, and positional I/O.
+*   **Store (`src/store.rs`):** Low-level page management, sharded clock cache with explicit invalidation, and positional I/O.
 *   **Node (`src/node.rs`):** 8-byte aligned memory management (`AlignedPage`), zero-copy serialization, and checksumming.
 *   **Tree Logic (`src/lib.rs`):** Core B+ Tree algorithms and Transactional Snapshot Isolation logic.
 
@@ -135,9 +135,9 @@ db.compact(64 * 1024 * 1024)?;
 
 The engine is optimized for high-throughput scenarios:
 *   **8-Byte Alignment:** Every page is allocated with 8-byte alignment, allowing direct casting of raw bytes to internal structures without memory copies.
-*   **Snapshot Isolation (SI):** Readers and writers operate on stable snapshots without blocking each other (non-blocking reads).
+*   **Snapshot Isolation (SI):** Readers use a stable root per transaction; each handle enforces single-writer/multi-reader via an RwLock.
 *   **Automatic Page Reclamation:** Failed or conflicted transactions automatically trigger page reclamation to prevent database bloat.
-*   **Transmute-based lifetime extension:** Iterators return direct references to internal buffers under a read lock, achieving near-zero allocation.
+*   **Lock-Free File I/O:** Positional reads (`pread`/`seek_read`) avoid a global file mutex for concurrent access.
 
 ## Limits
 

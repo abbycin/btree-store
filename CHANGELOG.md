@@ -2,6 +2,22 @@
 
 All notable changes to the **btree_store** project will be documented in this file.
 
+## [0.1.3] - 2026-02-08
+
+### Added
+- **Tail-Window Compaction**: Added `BTree::compact(target_bytes)` with `CompactStats`, best-effort tail relocation/truncation, and new compaction tests.
+- **Logical Page Mapping**: Introduced `PageStore`/`LogicalStore` with mapping + reverse indexes to relocate pages during compaction.
+- **Read-Path Caches**: Added shared meta snapshots plus bucket root/tree and LID->PID caches to reduce refresh and lookup overhead.
+
+### Changed
+- **On-Disk Format v3**: 32-bit page ids and new catalog/mapping/reverse roots (max ~16 TB with 4 KB pages); v1/v2 files now rejected with `Error::Invalid`.
+- **Freelist & Commit Pipeline**: Free space is persisted as merged extents in freelist pages; commits stage freelist + superblock then sync (no `.pending` log).
+- **Sync Strategy**: Uses `sync_data` unless the file grows, falling back to `sync_all` only on extension.
+- **Overflow Layout**: Slots inline up to 5 page ids before spilling to index pages, reducing indirect page traffic.
+
+### Removed
+- **Benchmark Report**: Removed `benchmark.md` and its README reference.
+
 ## [0.1.2] - 2026-01-28
 
 ### Added

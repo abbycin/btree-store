@@ -1,5 +1,5 @@
 use btree_store::BTree;
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::Rng;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -14,16 +14,13 @@ fn bench_insert(c: &mut Criterion) {
         let btree = BTree::open(&db_path).unwrap();
 
         b.iter(|| {
-            btree
-                .exec("bench", |txn| {
-                    for i in 0..1000 {
-                        let k = format!("key_{}", i);
-                        let v = format!("val_{}", i);
-                        txn.put(k.as_bytes(), v.as_bytes())?;
-                    }
-                    Ok(())
-                })
-                .unwrap();
+            for i in 0..1000 {
+                let k = format!("key_{}", i);
+                let v = format!("val_{}", i);
+                btree
+                    .exec("bench", |txn| txn.put(k.as_bytes(), v.as_bytes()))
+                    .unwrap();
+            }
         });
     });
 
@@ -37,7 +34,7 @@ fn bench_get(c: &mut Criterion) {
     let btree = BTree::open(&db_path).unwrap();
 
     // Pre-fill 100k items
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let keys: Vec<String> = (0..100_000).map(|i| format!("key_{:06}", i)).collect();
 
     // Batch insert to speed up setup
@@ -54,7 +51,7 @@ fn bench_get(c: &mut Criterion) {
 
     group.bench_function("random_get_100k", |b| {
         b.iter(|| {
-            let k = &keys[rng.gen_range(0..100_000)];
+            let k = &keys[rng.random_range(0..100_000)];
             btree.view("bench", |txn| txn.get(k.as_bytes())).unwrap();
         });
     });
@@ -96,11 +93,11 @@ fn bench_concurrent_get(c: &mut Criterion) {
                 let barrier_clone = barrier.clone();
 
                 threads.push(thread::spawn(move || {
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
                     barrier_clone.wait(); // Sync start
                     for _ in 0..(iters / 4) {
                         // Distribute load
-                        let k = &keys_clone[rng.gen_range(0..100_000)];
+                        let k = &keys_clone[rng.random_range(0..100_000)];
                         btree_clone
                             .view("bench", |txn| {
                                 txn.get(k.as_bytes()).unwrap();
@@ -125,33 +122,32 @@ fn bench_delete(c: &mut Criterion) {
     let mut group = c.benchmark_group("delete");
 
     group.bench_function("delete_insert_cycle_1k", |b| {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("bench_del.db");
-        let btree = BTree::open(&db_path).unwrap();
+        b.iter_batched(
+            || {
+                let temp_dir = TempDir::new().unwrap();
+                let db_path = temp_dir.path().join("bench_del.db");
+                let btree = BTree::open(&db_path).unwrap();
 
-        b.iter(|| {
-            // Setup
-            btree
-                .exec("bench", |txn| {
-                    for i in 0..1000 {
-                        let k = format!("k{}", i);
-                        txn.put(k.as_bytes(), b"val")?;
-                    }
-                    Ok(())
-                })
-                .unwrap();
+                btree
+                    .exec("bench", |txn| {
+                        for i in 0..1000 {
+                            let k = format!("k{}", i);
+                            txn.put(k.as_bytes(), b"val")?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
 
-            // Measure delete
-            btree
-                .exec("bench", |txn| {
-                    for i in 0..1000 {
-                        let k = format!("k{}", i);
-                        txn.del(k.as_bytes())?;
-                    }
-                    Ok(())
-                })
-                .unwrap();
-        });
+                (temp_dir, btree)
+            },
+            |(_temp_dir, btree)| {
+                for i in 0..1000 {
+                    let k = format!("k{}", i);
+                    btree.exec("bench", |txn| txn.del(k.as_bytes())).unwrap();
+                }
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();

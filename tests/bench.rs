@@ -5,7 +5,7 @@ use tempfile::TempDir;
 #[test]
 fn bench() {
     let mut temp_dir = TempDir::new().unwrap();
-    temp_dir.disable_cleanup(true);
+    temp_dir.disable_cleanup(false);
     let db_path = temp_dir.path().join("bench.db");
     let btree = BTree::open(&db_path).unwrap();
 

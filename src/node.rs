@@ -1,15 +1,17 @@
-use crate::{Error, Result, store::Store};
+use crate::page_store::PageStore;
+use crate::{Error, PageId, Result};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::ptr;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_INLINE_LEN: usize = 64;
 pub const MAX_KEY_LEN: usize = 32;
 
-const OFFSET_CHECKSUM: usize = PAGE_SIZE - 8;
-const OFFSET_NEXT_INDIRECT: usize = PAGE_SIZE - 16;
-const IDS_PER_INDIRECT_PAGE: usize = OFFSET_NEXT_INDIRECT / std::mem::size_of::<u64>();
+const OFFSET_CHECKSUM: usize = PAGE_SIZE - 4;
+const OFFSET_NEXT_INDIRECT: usize = PAGE_SIZE - 8;
+const IDS_PER_INDIRECT_PAGE: usize = OFFSET_NEXT_INDIRECT / std::mem::size_of::<PageId>();
 
 pub struct AlignedPage {
     ptr: *mut u8,
@@ -85,7 +87,7 @@ pub struct NodeHeader {
 
 const HEADER_SIZE: usize = std::mem::size_of::<NodeHeader>();
 const SLOT_SIZE: usize = std::mem::size_of::<Slot>();
-const NR_INLINE_PAGE: usize = 3;
+const NR_INLINE_PAGE: usize = 5;
 
 pub const fn size_to_pages(size: usize) -> usize {
     size.div_ceil(PAGE_SIZE)
@@ -97,8 +99,7 @@ pub struct Slot {
     pub pos: u32,
     pub klen: u32,
     pub vlen: u32,
-    pub _padding: u32,
-    pub page_id: [u64; NR_INLINE_PAGE],
+    pub page_id: [PageId; NR_INLINE_PAGE],
 }
 
 impl Slot {
@@ -201,7 +202,11 @@ impl Node {
         self.dirty = true;
     }
 
-    pub(crate) fn collect_page_ids(&self, store: &Store, slot: &Slot) -> Result<Vec<u64>> {
+    pub(crate) fn collect_page_ids(
+        &self,
+        store: &dyn PageStore,
+        slot: &Slot,
+    ) -> Result<Vec<PageId>> {
         let nr_pages = slot.nr_pages() as usize;
         if nr_pages <= NR_INLINE_PAGE {
             return Ok(slot.page_id[0..nr_pages].to_vec());
@@ -213,8 +218,8 @@ impl Node {
         while pages.len() < nr_pages {
             let data = store.load_page(curr_index_page)?;
             let stored_checksum =
-                u64::from_le_bytes(data[OFFSET_CHECKSUM..PAGE_SIZE].try_into().unwrap());
-            let computed_checksum = crc32c::crc32c(&data[..OFFSET_CHECKSUM]) as u64;
+                u32::from_le_bytes(data[OFFSET_CHECKSUM..PAGE_SIZE].try_into().unwrap());
+            let computed_checksum = crc32c::crc32c(&data[..OFFSET_CHECKSUM]);
             if stored_checksum != computed_checksum {
                 eprintln!("VALIDATION FAILED: index page checksum mismatch");
                 return Err(Error::Corruption);
@@ -222,13 +227,13 @@ impl Node {
 
             let to_read = std::cmp::min(nr_pages - pages.len(), IDS_PER_INDIRECT_PAGE);
             for i in 0..to_read {
-                let start = i * 8;
-                pages.push(u64::from_le_bytes(
-                    data[start..start + 8].try_into().unwrap(),
+                let start = i * 4;
+                pages.push(u32::from_le_bytes(
+                    data[start..start + 4].try_into().unwrap(),
                 ));
             }
             if pages.len() < nr_pages {
-                curr_index_page = u64::from_le_bytes(
+                curr_index_page = u32::from_le_bytes(
                     data[OFFSET_NEXT_INDIRECT..OFFSET_CHECKSUM]
                         .try_into()
                         .unwrap(),
@@ -238,9 +243,14 @@ impl Node {
         Ok(pages)
     }
 
-    fn write_index_chain(&self, store: &Store, pages: &[u64]) -> Result<u64> {
+    fn write_index_chain(
+        &self,
+        store: &dyn PageStore,
+        pages: &[PageId],
+        alloc: &mut HashSet<PageId>,
+    ) -> Result<PageId> {
         let nr_index_pages = pages.len().div_ceil(IDS_PER_INDIRECT_PAGE);
-        let index_page_ids = store.alloc_pages(nr_index_pages as u32)?;
+        let index_page_ids = store.alloc_pages(nr_index_pages as u32, alloc)?;
 
         for i in 0..nr_index_pages {
             let mut index_data = vec![0u8; PAGE_SIZE];
@@ -248,8 +258,8 @@ impl Node {
             let end_idx = std::cmp::min(start_idx + IDS_PER_INDIRECT_PAGE, pages.len());
 
             for (j, &pid) in pages[start_idx..end_idx].iter().enumerate() {
-                let off = j * 8;
-                index_data[off..off + 8].copy_from_slice(&pid.to_le_bytes());
+                let off = j * 4;
+                index_data[off..off + 4].copy_from_slice(&pid.to_le_bytes());
             }
 
             if i + 1 < nr_index_pages {
@@ -258,7 +268,7 @@ impl Node {
                     .copy_from_slice(&next_pid.to_le_bytes());
             }
 
-            let checksum = crc32c::crc32c(&index_data[..OFFSET_CHECKSUM]) as u64;
+            let checksum = crc32c::crc32c(&index_data[..OFFSET_CHECKSUM]);
             index_data[OFFSET_CHECKSUM..PAGE_SIZE].copy_from_slice(&checksum.to_le_bytes());
 
             store.write_page(index_page_ids[i], &index_data)?;
@@ -269,16 +279,17 @@ impl Node {
 
     fn update_at(
         &mut self,
-        store: &Store,
+        store: &dyn PageStore,
         pos: usize,
         value: &[u8],
-        freed: &mut Vec<(u64, u32)>,
+        freed: &mut Vec<(PageId, u32)>,
+        alloc: &mut HashSet<PageId>,
     ) -> Result<()> {
         if !self.is_leaf() {
-            if value.len() != 8 {
+            if value.len() != 4 {
                 return Err(Error::Corruption);
             }
-            let page_id = u64::from_le_bytes(value.try_into().unwrap());
+            let page_id = u32::from_le_bytes(value.try_into().unwrap());
             let slot = self.slot_at_mut(pos);
             slot.page_id[0] = page_id;
             self.dirty = true;
@@ -297,7 +308,7 @@ impl Node {
             slot.update_vlen(value.len() as u32);
         } else {
             let nr_blocks = size_to_pages(value.len());
-            let pages = store.alloc_pages(nr_blocks as u32)?;
+            let pages = store.alloc_pages(nr_blocks as u32, alloc)?;
 
             if nr_blocks <= NR_INLINE_PAGE {
                 store.write_data(&pages, value)?;
@@ -313,7 +324,7 @@ impl Node {
                     slot.page_id[i] = 0;
                 }
             } else {
-                let first_index_pid = self.write_index_chain(store, &pages)?;
+                let first_index_pid = self.write_index_chain(store, &pages, alloc)?;
                 store.write_data(&pages, value)?;
 
                 if !is_inline {
@@ -335,9 +346,9 @@ impl Node {
 
     pub(crate) fn free_slot_pages(
         &self,
-        store: &Store,
+        store: &dyn PageStore,
         slot: &Slot,
-        freed: &mut Vec<(u64, u32)>,
+        freed: &mut Vec<(PageId, u32)>,
     ) -> Result<()> {
         let nr_pages = slot.nr_pages() as usize;
         if nr_pages == 0 {
@@ -346,7 +357,7 @@ impl Node {
 
         if nr_pages <= NR_INLINE_PAGE {
             for i in 0..nr_pages {
-                freed.push((slot.page_id[i], 1));
+                store.schedule_free(slot.page_id[i], freed)?;
             }
         } else {
             let mut curr_index_page = slot.page_id[0];
@@ -355,8 +366,8 @@ impl Node {
             while collected_data_pages < nr_pages {
                 let data = store.load_page(curr_index_page)?;
                 let stored_checksum =
-                    u64::from_le_bytes(data[OFFSET_CHECKSUM..PAGE_SIZE].try_into().unwrap());
-                let computed_checksum = crc32c::crc32c(&data[..OFFSET_CHECKSUM]) as u64;
+                    u32::from_le_bytes(data[OFFSET_CHECKSUM..PAGE_SIZE].try_into().unwrap());
+                let computed_checksum = crc32c::crc32c(&data[..OFFSET_CHECKSUM]);
                 if stored_checksum != computed_checksum {
                     return Err(Error::Corruption);
                 }
@@ -364,13 +375,14 @@ impl Node {
                 let to_free = std::cmp::min(nr_pages - collected_data_pages, IDS_PER_INDIRECT_PAGE);
 
                 for i in 0..to_free {
-                    let pid = u64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
-                    freed.push((pid, 1));
+                    let start = i * 4;
+                    let pid = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
+                    store.schedule_free(pid, freed)?;
                 }
                 collected_data_pages += to_free;
 
                 let next_index_page = if collected_data_pages < nr_pages {
-                    u64::from_le_bytes(
+                    u32::from_le_bytes(
                         data[OFFSET_NEXT_INDIRECT..OFFSET_CHECKSUM]
                             .try_into()
                             .unwrap(),
@@ -379,7 +391,7 @@ impl Node {
                     0
                 };
 
-                freed.push((curr_index_page, 1));
+                store.schedule_free(curr_index_page, freed)?;
                 curr_index_page = next_index_page;
             }
         }
@@ -420,15 +432,22 @@ impl Node {
         slot
     }
 
-    fn insert_at(&mut self, store: &Store, pos: usize, key: &[u8], value: &[u8]) -> Result<()> {
+    fn insert_at(
+        &mut self,
+        store: &dyn PageStore,
+        pos: usize,
+        key: &[u8],
+        value: &[u8],
+        alloc: &mut HashSet<PageId>,
+    ) -> Result<()> {
         let is_leaf = self.is_leaf();
         let mut cur_off = self.header().offset;
 
         if !is_leaf {
-            if value.len() != 8 {
+            if value.len() != 4 {
                 return Err(Error::Corruption);
             }
-            let page_id = u64::from_le_bytes(value.try_into().unwrap());
+            let page_id = u32::from_le_bytes(value.try_into().unwrap());
 
             cur_off -= key.len() as u64;
             self.header_mut().offset = cur_off;
@@ -447,7 +466,6 @@ impl Node {
             pos: 0,
             klen: key.len() as u32,
             vlen: value.len() as u32,
-            _padding: 0,
             page_id: [0; NR_INLINE_PAGE],
         };
 
@@ -458,7 +476,7 @@ impl Node {
             cur_off -= key.len() as u64;
             slot_copy.pos = cur_off as u32;
             let nr_blocks = size_to_pages(value.len());
-            let pages = store.alloc_pages(nr_blocks as u32)?;
+            let pages = store.alloc_pages(nr_blocks as u32, alloc)?;
 
             if nr_blocks <= NR_INLINE_PAGE {
                 store.write_data(&pages, value)?;
@@ -466,7 +484,7 @@ impl Node {
                     slot_copy.page_id[i] = pid;
                 }
             } else {
-                let first_index_pid = self.write_index_chain(store, &pages)?;
+                let first_index_pid = self.write_index_chain(store, &pages, alloc)?;
                 store.write_data(&pages, value)?;
                 slot_copy.page_id[0] = first_index_pid;
             }
@@ -553,7 +571,7 @@ impl Node {
             return Err(Error::Corruption);
         }
 
-        // 2. Cryptographic integrity check
+        // 2. Checksum integrity check (CRC32C)
         let stored_checksum = hdr.checksum;
         let computed = self.calc_checksum() as u64;
         if stored_checksum != computed {
@@ -612,10 +630,11 @@ impl Node {
 
     pub fn put(
         &mut self,
-        store: &Store,
+        store: &dyn PageStore,
         key: &[u8],
         value: &[u8],
-        freed: &mut Vec<(u64, u32)>,
+        freed: &mut Vec<(PageId, u32)>,
+        alloc: &mut HashSet<PageId>,
     ) -> Result<()> {
         if key.len() > MAX_KEY_LEN {
             return Err(Error::TooLarge);
@@ -639,15 +658,15 @@ impl Node {
 
         match self.search(key) {
             Ok(pos) => {
-                self.update_at(store, pos, value, freed)?;
+                self.update_at(store, pos, value, freed, alloc)?;
             }
-            Err(pos) => self.insert_at(store, pos, key, value)?,
+            Err(pos) => self.insert_at(store, pos, key, value, alloc)?,
         }
         self.dirty = true;
         Ok(())
     }
 
-    pub fn get(&self, store: &Store, key: &[u8]) -> Result<Vec<u8>> {
+    pub fn get(&self, store: &dyn PageStore, key: &[u8]) -> Result<Vec<u8>> {
         match self.search(key) {
             Ok(pos) => {
                 let slot = self.slot_at(pos);
@@ -683,7 +702,12 @@ impl Node {
         }
     }
 
-    pub fn del(&mut self, store: &Store, key: &[u8], freed: &mut Vec<(u64, u32)>) -> Result<()> {
+    pub fn del(
+        &mut self,
+        store: &dyn PageStore,
+        key: &[u8],
+        freed: &mut Vec<(PageId, u32)>,
+    ) -> Result<()> {
         match self.search(key) {
             Ok(pos) => {
                 let slot = self.shrink_slot(pos);
@@ -742,12 +766,12 @@ impl Node {
         &self.page.as_slice()[off..off + len]
     }
 
-    pub fn child_at(&self, pos: usize) -> u64 {
+    pub fn child_at(&self, pos: usize) -> PageId {
         debug_assert!(!self.is_leaf());
         self.slot_at(pos).page_id[0]
     }
 
-    pub fn update_child_page(&mut self, pos: usize, page_id: u64) {
+    pub fn update_child_page(&mut self, pos: usize, page_id: PageId) {
         debug_assert!(!self.is_leaf());
         let slot = self.slot_at_mut(pos);
         slot.page_id[0] = page_id;

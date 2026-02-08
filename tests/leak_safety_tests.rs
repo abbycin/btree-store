@@ -1,63 +1,42 @@
 use btree_store::BTree;
 use std::fs;
-use std::path::Path;
 use tempfile::TempDir;
 
 #[test]
-fn test_page_leak_recovery() {
+fn test_freelist_persist_and_reuse() {
     let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("leak.db");
-    let pending_path = temp_dir.path().join("leak.pending");
+    let db_path = temp_dir.path().join("freelist.db");
 
+    let size_after_insert;
     {
         let bt = BTree::open(&db_path).unwrap();
-        bt.exec("default", |_txn| Ok(())).unwrap();
         bt.exec("default", |txn| {
-            txn.put(b"key1", b"val1").unwrap();
+            txn.put(b"key1", &vec![0xAA; 20000]).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        size_after_insert = fs::metadata(&db_path).unwrap().len();
+        bt.exec("default", |txn| {
+            txn.del(b"key1").unwrap();
             Ok(())
         })
         .unwrap();
     }
 
-    // Determine current seq
-    let current_seq = {
-        let bt = BTree::open(&db_path).unwrap();
-        bt.current_seq()
-    };
+    let size_after_delete = fs::metadata(&db_path).unwrap().len();
 
-    // Create a "fake" pending log for the CURRENT seq (Redo-Free)
-    let mut log_content = Vec::new();
-    let data = {
-        let mut d = Vec::new();
-        d.extend_from_slice(&100u64.to_le_bytes()); // PID 100
-        d.extend_from_slice(&1u32.to_le_bytes()); // 1 page
-        d.extend_from_slice(&[0u8; 4]); // Padding for PendingEntry
-        d
-    };
-    let checksum = crc32c::crc32c(&data);
-
-    log_content.extend_from_slice(&current_seq.to_le_bytes());
-    log_content.extend_from_slice(&1u32.to_le_bytes()); // nr_freed = 1
-    log_content.extend_from_slice(&0u32.to_le_bytes()); // nr_alloc = 0
-    log_content.extend_from_slice(&checksum.to_le_bytes()); // checksum
-    log_content.extend_from_slice(&[0u8; 4]); // padding
-
-    log_content.extend_from_slice(&data);
-
-    fs::write(&pending_path, log_content).unwrap();
-
-    // Open the BTree. It should detect the log and clear it
     {
-        let _bt = BTree::open(&db_path).unwrap();
+        let bt = BTree::open(&db_path).unwrap();
+        bt.exec("default", |txn| {
+            txn.put(b"key2", &vec![0xBB; 20000]).unwrap();
+            Ok(())
+        })
+        .unwrap();
     }
 
-    if Path::new(&pending_path).exists() {
-        assert_eq!(
-            fs::metadata(&pending_path).unwrap().len(),
-            0,
-            "Pending log should be cleared after recovery"
-        );
-    }
+    let size_after_reuse = fs::metadata(&db_path).unwrap().len();
+    assert!(size_after_delete >= size_after_insert);
+    assert!(size_after_reuse >= size_after_delete);
 }
 
 #[test]

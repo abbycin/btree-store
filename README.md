@@ -14,6 +14,7 @@
 *   **Zero-Copy Access:** 8-byte aligned memory layouts allow direct pointer-to-reference conversion for maximum performance.
 *   **Robust Data Integrity:** Strengthened physical invariant checks and CRC32C checksum validation for every node and metadata page.
 *   **Shared Transaction State:** `clone()` creates a new handle that shares the same transaction context, optimized for multi-threaded components.
+*   **Manual Compaction:** Best-effort tail compaction to reclaim space when requested.
 
 > **Warning:** Multi-process concurrent access is NOT supported. Only one process should access the database file at a time.
 
@@ -69,6 +70,18 @@ fn main() -> Result<(), Error> {
 }
 ```
 
+## Maintenance
+
+You can trigger a best-effort tail compaction to reclaim space:
+
+```rust
+// compact using the default internal ratio
+db.compact(0)?;
+
+// compact targeting about 64 MB of tail space
+db.compact(64 * 1024 * 1024)?;
+```
+
 ## Performance Design
 
 The engine is optimized for high-throughput scenarios:
@@ -77,7 +90,9 @@ The engine is optimized for high-throughput scenarios:
 *   **Automatic Page Reclamation:** Failed or conflicted transactions automatically trigger page reclamation to prevent database bloat.
 *   **Transmute-based lifetime extension:** Iterators return direct references to internal buffers under a read lock, achieving near-zero allocation.
 
-See [benchmark.md](benchmark.md) for detailed performance metrics.
+## Limits
+
+*   **Max file size:** ~16 TB with 4 KB pages (32-bit page ids).
 
 ## Testing
 

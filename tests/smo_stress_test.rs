@@ -11,7 +11,7 @@ fn test_smo_stress() {
     let btree = BTree::open(&db_path).expect("failed to open btree");
 
     let mut expected = HashMap::new();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let num_ops = 5000;
     let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -20,7 +20,7 @@ fn test_smo_stress() {
     btree
         .exec("stress", |txn| {
             for i in 0..num_ops {
-                let key = format!("key_{:08}_{}", i, rng.r#gen::<u32>()).into_bytes();
+                let key = format!("key_{:08}_{}", i, rng.random::<u32>()).into_bytes();
                 let val = format!("val_{}", i).into_bytes();
 
                 txn.put(&key, &val).expect("put failed");

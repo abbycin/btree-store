@@ -1,4 +1,4 @@
-use btree_store::{BTree, Error};
+use btree_store::{BTree, Error, MetaNode};
 use std::fs;
 use std::io;
 use tempfile::TempDir;
@@ -141,13 +141,8 @@ fn test_torn_superblock_recovery() {
         file.tread_exact(&mut buf0, 0).unwrap();
         file.tread_exact(&mut buf1, 4096).unwrap();
 
-        let get_seq = |buf: &[u8]| -> u64 {
-            let seq_bytes = &buf[64..72];
-            u64::from_le_bytes(seq_bytes.try_into().unwrap())
-        };
-
-        let seq0 = get_seq(&buf0);
-        let seq1 = get_seq(&buf1);
+        let seq0 = MetaNode::from_slice(&buf0).seq;
+        let seq1 = MetaNode::from_slice(&buf1).seq;
         let offset_to_corrupt = if seq0 >= seq1 { 0 } else { 4096 };
 
         file.twrite_all(&[0u8; 100], offset_to_corrupt).unwrap();

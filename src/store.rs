@@ -33,6 +33,59 @@ pub(crate) trait FileIO {
     fn psync_data(&self) -> io::Result<()>;
 }
 
+fn parent_dir_for_sync(path: &Path) -> Option<&Path> {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+        Some(parent) => Some(parent),
+        None => None,
+    }
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_dir(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_INVALID_HANDLE: i32 = 6;
+    const ERROR_INVALID_FUNCTION: i32 = 1;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.raw_os_error(),
+                Some(
+                    ERROR_ACCESS_DENIED
+                        | ERROR_INVALID_HANDLE
+                        | ERROR_INVALID_FUNCTION
+                        | ERROR_NOT_SUPPORTED
+                )
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(parent) = parent_dir_for_sync(path) {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
 impl FileIO for File {
     #[cfg(unix)]
     fn pread_exact(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -335,6 +388,7 @@ impl Store {
             file.pwrite_all(&sb.as_page_slice(), PAGE_SIZE as u64)?;
 
             file.psync_all()?;
+            sync_parent_dir(path)?;
             (file, sb, None)
         } else {
             let file = OpenOptions::new().read(true).write(true).open(path)?;

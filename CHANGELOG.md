@@ -2,6 +2,11 @@
 
 All notable changes to the **btree_store** project will be documented in this file.
 
+## [0.1.5] - 2026-04-27
+
+### Fixed
+- **Fresh Store Creation Durability**: Sync the parent directory after writing and syncing the initial store file so a newly created database file is not lost across a power failure before the directory entry is persisted.
+
 ## [0.1.4] - 2026-02-08
 
 ### Added

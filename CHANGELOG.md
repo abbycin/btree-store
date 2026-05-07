@@ -2,6 +2,16 @@
 
 All notable changes to the **btree_store** project will be documented in this file.
 
+## [0.1.6] - 2026-05-07
+
+### Changed
+- **Open Reuse Semantics**: `BTree::open(path)` reuses an existing in-process instance for the same normalized path and returns a refreshed clone.
+- **Read-Path Performance**: Added `lid -> pid` hot cache, optimized branch child-position lookup, and reduced `view` setup overhead with earlier bucket-tree cache hits and root-node fast path.
+- **Compaction Default Policy**: Default compaction (`target_bytes == 0`) now uses strict no-growth planning when low-address free pages are insufficient.
+
+### Fixed
+- **Reopen Snapshot Freshness**: Reused handles sync to latest in-memory snapshot state, avoiding stale-sequence no-op commit conflicts.
+
 ## [0.1.5] - 2026-04-27
 
 ### Fixed

@@ -23,6 +23,7 @@ pub(crate) fn decode_u32_key(bytes: &[u8]) -> Result<u32> {
 
 const LID_PID_CACHE_SHARDS: usize = 64;
 const LID_PID_CACHE_CAPACITY: usize = 8192;
+const LID_PID_HOT_CACHE_CAPACITY: usize = 32 * 1024;
 
 struct LidPidCacheEntry {
     lid: Lid,
@@ -148,6 +149,61 @@ impl LidPidCache {
     }
 }
 
+struct LidPidHotCache {
+    slots: Box<[AtomicU64]>,
+}
+
+impl LidPidHotCache {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity.is_power_of_two());
+        let slots = (0..capacity)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { slots }
+    }
+
+    #[inline]
+    fn idx(&self, lid: Lid) -> usize {
+        (lid as usize) & (self.slots.len() - 1)
+    }
+
+    #[inline]
+    fn encode(lid: Lid, pid: Pid) -> u64 {
+        ((lid as u64) << 32) | (pid as u64)
+    }
+
+    #[inline]
+    fn decode(entry: u64) -> (Lid, Pid) {
+        ((entry >> 32) as Lid, entry as Pid)
+    }
+
+    fn get(&self, lid: Lid) -> Option<Pid> {
+        let entry = self.slots[self.idx(lid)].load(Ordering::Relaxed);
+        let (cached_lid, pid) = Self::decode(entry);
+        if cached_lid == lid { Some(pid) } else { None }
+    }
+
+    fn put(&self, lid: Lid, pid: Pid) {
+        self.slots[self.idx(lid)].store(Self::encode(lid, pid), Ordering::Relaxed);
+    }
+
+    fn invalidate(&self, lid: Lid) {
+        let slot = &self.slots[self.idx(lid)];
+        let entry = slot.load(Ordering::Relaxed);
+        let (cached_lid, _) = Self::decode(entry);
+        if cached_lid == lid {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn clear(&self) {
+        for slot in self.slots.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 pub trait PageStore: Send + Sync {
     fn alloc_pages(&self, nr_pages: u32, alloc: &mut HashSet<u32>) -> Result<Vec<Lid>>;
 
@@ -172,45 +228,38 @@ pub struct LogicalStore {
     mapping_tree: Arc<Tree>,
     reverse_tree: Arc<Tree>,
     lid_cache: LidPidCache,
-    lid_cache_seq: AtomicU64,
+    hot_lid_cache: LidPidHotCache,
 }
 
 impl LogicalStore {
     pub fn new(store: Arc<Store>, mapping_tree: Arc<Tree>, reverse_tree: Arc<Tree>) -> Self {
-        let (seq, _) = store.shared_snapshot();
         Self {
             store,
             mapping_tree,
             reverse_tree,
             lid_cache: LidPidCache::new(LID_PID_CACHE_CAPACITY),
-            lid_cache_seq: AtomicU64::new(seq),
+            hot_lid_cache: LidPidHotCache::new(LID_PID_HOT_CACHE_CAPACITY),
         }
     }
 
     pub(crate) fn clear_lid_cache(&self) {
-        let (seq, _) = self.store.shared_snapshot();
         self.lid_cache.clear();
-        self.lid_cache_seq.store(seq, Ordering::Release);
-    }
-
-    fn refresh_lid_cache(&self) {
-        let (seq, _) = self.store.shared_snapshot();
-        let cached = self.lid_cache_seq.load(Ordering::Acquire);
-        if cached != seq {
-            self.lid_cache.clear();
-            self.lid_cache_seq.store(seq, Ordering::Release);
-        }
+        self.hot_lid_cache.clear();
     }
 
     fn resolve_pid(&self, lid: Lid) -> Result<Pid> {
-        self.refresh_lid_cache();
+        if let Some(pid) = self.hot_lid_cache.get(lid) {
+            return Ok(pid);
+        }
         if let Some(pid) = self.lid_cache.get(lid) {
+            self.hot_lid_cache.put(lid, pid);
             return Ok(pid);
         }
         let key = encode_u32_key(lid);
         let value = self.mapping_tree.get(&key)?;
         let pid = decode_u32_key(&value)?;
         self.lid_cache.put(lid, pid);
+        self.hot_lid_cache.put(lid, pid);
         Ok(pid)
     }
 
@@ -294,6 +343,7 @@ impl PageStore for LogicalStore {
             self.mapping_tree.put(&lid_key, &pid_value)?;
             self.reverse_tree.put(&pid_key, &lid_value)?;
             self.lid_cache.put(*lid, *pid);
+            self.hot_lid_cache.put(*lid, *pid);
         }
 
         Ok(lids)
@@ -309,6 +359,7 @@ impl PageStore for LogicalStore {
         self.mapping_tree.del(&lid_key)?;
         self.reverse_tree.del(&pid_key)?;
         self.lid_cache.invalidate(lid);
+        self.hot_lid_cache.invalidate(lid);
         freed.push((pid, 1));
         Ok(())
     }

@@ -18,10 +18,11 @@
     - **`exec<F, R>(bucket, f)`**: Starts a read-write transaction on a single bucket. It acquires a process-level write lock, refreshes to the latest disk state, and executes the closure.
     - **`exec_multi<F, R>(f)`**: Executes multiple operations across different buckets in a single atomic transaction. It caches root updates in memory and performs a single `commit_internal()` at the end, minimizing disk I/O.
     - **`view<F, R>(bucket, f)`**: Starts a read-only transaction. It acquires a process-level read lock.
-- **`MultiTxn`**: A specialized handle for `exec_multi`. Its `execute` method allows switching between different buckets within the same transaction context.
-- **`Clone` Behavior**: Cloned handles share the same `pending_free` and `pending_alloc` containers. This ensures that multiple threads within the same process operate on a unified transaction view, preventing premature page reclamation.
+- **`MultiTxn`**: A specialized handle for `exec_multi`. Its `exec` method allows switching between different buckets within the same transaction context.
+- **`Clone` Behavior**: Cloned handles share the same underlying store, writer lock, pending alloc/free trackers, and read caches, while keeping per-handle local snapshot markers (`start_seq`, `start_root_id`).
+- **Same-Path Open Reuse**: Within one process, `BTree::open(path)` reuses an already-open instance for the same normalized path and returns a refreshed clone of that live instance, rather than creating an independent second opener.
 
-> **Note:** Concurrent access from multiple processes is not supported.
+> **Note:** Concurrent access from multiple processes is not supported. Within a single process, the supported model is one live instance per database path, shared via cloning/open reuse.
 
 ### 2.2. Tree Logic Layer (`Tree` struct in `src/lib.rs`)
 Implements core B+ Tree algorithms:
@@ -50,7 +51,7 @@ Defines binary layout with strict 8-byte alignment and reinforced validation:
 The engine implements **Snapshot Isolation (SI)** with an focus on usability:
 1.  **Start-Time Sync:** `exec` calls `refresh_internal()` (refreshes `root_current` from the Superblock and clears the `NodeCache`). `view` reads a process-wide shared snapshot `(seq, root)` and clears the cache when `seq` changes.
 2.  **Snapshot Stability:** Once a closure starts, its root ID is fixed. Even if another process commits, the current closure's view remains stable.
-3.  **Conflict Detection:** If two handles overlap their `exec` calls, the first to commit wins. The second will detect that the disk's version has moved and return `Error::Conflict`. (Applies to concurrent handles within the same process).
+3.  **Conflict Detection:** `commit_internal()` rejects commits when the caller's `start_seq` is stale and returns `Error::Conflict`. Under the supported single-process model, same-path handles share one writer lock and are normally refreshed before `exec`, so ordinary same-process writers serialize instead of racing to conflict. The conflict path remains the guardrail for stale local snapshots.
 
 ### 3.2. Automatic Rollback Logic
 When an `exec` closure returns `Err`, the following occurs:
@@ -125,8 +126,9 @@ Ensures crash-safe metadata updates:
    - `tail_start = total_pages - target_pages` (clamped to `>= 2`)
 2. **Move tail pages by reverse index:**  
    - Iterate `reverse_tree` (pid -> lid) from `tail_start` to `total_pages`.  
-   - If `free_pages_below(tail_start) >= 1024`, pre-allocate low pages and move tail pages into them.
-   - Otherwise, use the normal allocator for new pages.
+   - If low-address free pages below `tail_start` are available, compaction pre-allocates them with `alloc_pages_below`.
+   - For default compaction (`target_bytes == 0`), relocation is strict no-growth: if enough low pages are not available for all planned moves, the run returns without moving pages.
+   - For explicit `target_bytes`, compaction can still fall back to the normal allocator when low preallocation is unavailable or only partially available.
    - Update mapping (`lid -> new_pid`) and reverse (`new_pid -> lid`), and add old pid to `pending_free`.
 3. **Commit:**  
    - `commit_internal()` persists mapping/reverse roots and merges `pending_free` into the freelist.
@@ -139,7 +141,7 @@ Ensures crash-safe metadata updates:
 
 **Notes**
 - Low-address relocation improves the chance of freeing a contiguous tail, but truncation is still best-effort because metadata roots and freelist pages can keep the floor above `tail_start`.  
-- Without enough low free pages, compaction falls back to the standard allocator and may not shrink the file.
+- Default compaction (`target_bytes == 0`) prefers "do not grow the file during compaction" over partial relocation, so it may return `moved_pages = 0` when low free space is insufficient.
 
 ---
 
@@ -158,10 +160,12 @@ Ensures crash-safe metadata updates:
 
 **B3: Bucket Read-Only Tree Cache**
 - `bucket_tree_cache` caches `ReadOnlyTree` instances per bucket, avoiding per-`view` tree construction.
+- `view` checks this cache before re-reading bucket metadata; a matching `(bucket, seq)` entry can satisfy the read-only setup path directly.
+- `ReadOnlyTree` preloads its root node once, avoiding a repeated root-page load on every lookup.
 - Cache entries are invalidated on `seq` changes to prevent stale reads.
 
 **B4: LID->PID Cache**
-- `LogicalStore` maintains a sharded cache for `lid -> pid` lookups to reduce mapping tree reads on hot paths.
+- `LogicalStore` maintains a two-level cache for `lid -> pid` lookups: a lock-free direct-mapped hot cache in front of the existing sharded cache, reducing mapping tree reads and lock traffic on hot paths.
 - The cache is invalidated when the shared `seq` changes or after compaction.
 
 **Consistency Note**

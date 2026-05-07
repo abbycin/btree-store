@@ -2,9 +2,7 @@ use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     collections::HashSet,
-    collections::hash_map::DefaultHasher,
     fs::{File, OpenOptions},
-    hash::{Hash, Hasher},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -354,6 +352,23 @@ fn is_valid_v2_meta(buf: &[u8]) -> bool {
     v2.validate()
 }
 
+fn parse_current_meta(buf: &[u8]) -> Result<Option<MetaNode>> {
+    let s = MetaNode::from_slice(buf);
+    if s.validate().is_ok() {
+        if s.format_version == FORMAT_VERSION {
+            return Ok(Some(s));
+        }
+        if is_valid_v1_meta(buf) || is_valid_v2_meta(buf) {
+            return Err(Error::Invalid);
+        }
+        return Ok(None);
+    }
+    if is_valid_v1_meta(buf) || is_valid_v2_meta(buf) {
+        return Err(Error::Invalid);
+    }
+    Ok(None)
+}
+
 pub struct Store {
     file: File,
     sb: Mutex<MetaNode>,
@@ -400,39 +415,13 @@ impl Store {
             let r1 = file.pread_exact(&mut buf1, PAGE_SIZE as u64);
 
             let sb0 = if r0.is_ok() {
-                let s = MetaNode::from_slice(&buf0);
-                if s.validate().is_ok() {
-                    if s.format_version == FORMAT_VERSION {
-                        Some(s)
-                    } else if is_valid_v1_meta(&buf0) || is_valid_v2_meta(&buf0) {
-                        return Err(Error::Invalid);
-                    } else {
-                        None
-                    }
-                } else if is_valid_v1_meta(&buf0) || is_valid_v2_meta(&buf0) {
-                    return Err(Error::Invalid);
-                } else {
-                    None
-                }
+                parse_current_meta(&buf0)?
             } else {
                 None
             };
 
             let sb1 = if r1.is_ok() {
-                let s = MetaNode::from_slice(&buf1);
-                if s.validate().is_ok() {
-                    if s.format_version == FORMAT_VERSION {
-                        Some(s)
-                    } else if is_valid_v1_meta(&buf1) || is_valid_v2_meta(&buf1) {
-                        return Err(Error::Invalid);
-                    } else {
-                        None
-                    }
-                } else if is_valid_v1_meta(&buf1) || is_valid_v2_meta(&buf1) {
-                    return Err(Error::Invalid);
-                } else {
-                    None
-                }
+                parse_current_meta(&buf1)?
             } else {
                 None
             };
@@ -1144,6 +1133,16 @@ impl Store {
         self.sb.lock().reverse_root
     }
 
+    pub fn cached_snapshot(&self) -> MetaSnapshot {
+        let sb = self.sb.lock();
+        MetaSnapshot {
+            catalog_root: sb.catalog_root,
+            mapping_root: sb.mapping_root,
+            reverse_root: sb.reverse_root,
+            seq: sb.seq,
+        }
+    }
+
     pub fn max_freelist_page_id(&self) -> PageId {
         self.freelist_pages
             .lock()
@@ -1161,39 +1160,13 @@ impl Store {
         let r1 = self.file.pread_exact(&mut buf1, PAGE_SIZE as u64);
 
         let sb0 = if r0.is_ok() {
-            let s = MetaNode::from_slice(&buf0);
-            if s.validate().is_ok() {
-                if s.format_version == FORMAT_VERSION {
-                    Some(s)
-                } else if is_valid_v1_meta(&buf0) || is_valid_v2_meta(&buf0) {
-                    return Err(Error::Invalid);
-                } else {
-                    None
-                }
-            } else if is_valid_v1_meta(&buf0) || is_valid_v2_meta(&buf0) {
-                return Err(Error::Invalid);
-            } else {
-                None
-            }
+            parse_current_meta(&buf0)?
         } else {
             None
         };
 
         let sb1 = if r1.is_ok() {
-            let s = MetaNode::from_slice(&buf1);
-            if s.validate().is_ok() {
-                if s.format_version == FORMAT_VERSION {
-                    Some(s)
-                } else if is_valid_v1_meta(&buf1) || is_valid_v2_meta(&buf1) {
-                    return Err(Error::Invalid);
-                } else {
-                    None
-                }
-            } else if is_valid_v1_meta(&buf1) || is_valid_v2_meta(&buf1) {
-                return Err(Error::Invalid);
-            } else {
-                None
-            }
+            parse_current_meta(&buf1)?
         } else {
             None
         };
@@ -1248,7 +1221,7 @@ impl Store {
         for shard in &self.cache.shards {
             let mut guard = shard.lock();
             guard.entries.iter_mut().for_each(|e| *e = None);
-            guard.map.clear();
+            guard.positions.clear();
         }
     }
 }
@@ -1261,7 +1234,7 @@ struct CacheEntry {
 
 struct NodeCacheShard {
     entries: Vec<Option<CacheEntry>>,
-    map: HashMap<PageId, usize>,
+    positions: Vec<(PageId, usize)>,
     hand: usize,
     capacity: usize,
 }
@@ -1270,14 +1243,41 @@ impl NodeCacheShard {
     fn new(capacity: usize) -> Self {
         Self {
             entries: (0..capacity).map(|_| None).collect(),
-            map: HashMap::with_capacity(capacity),
+            positions: Vec::with_capacity(capacity),
             hand: 0,
             capacity,
         }
     }
 
+    #[inline]
+    fn find_position_idx(&self, page_id: PageId) -> Option<usize> {
+        self.positions.iter().position(|(pid, _)| *pid == page_id)
+    }
+
+    #[inline]
+    fn find_entry_idx(&self, page_id: PageId) -> Option<usize> {
+        self.find_position_idx(page_id)
+            .map(|pos_idx| self.positions[pos_idx].1)
+    }
+
+    #[inline]
+    fn upsert_position(&mut self, page_id: PageId, entry_idx: usize) {
+        if let Some(pos_idx) = self.find_position_idx(page_id) {
+            self.positions[pos_idx].1 = entry_idx;
+        } else {
+            self.positions.push((page_id, entry_idx));
+        }
+    }
+
+    #[inline]
+    fn remove_position(&mut self, page_id: PageId) {
+        if let Some(pos_idx) = self.find_position_idx(page_id) {
+            self.positions.swap_remove(pos_idx);
+        }
+    }
+
     fn get(&mut self, page_id: PageId) -> Option<Arc<Node>> {
-        if let Some(&idx) = self.map.get(&page_id)
+        if let Some(idx) = self.find_entry_idx(page_id)
             && let Some(entry) = &mut self.entries[idx]
         {
             entry.usage = true;
@@ -1287,7 +1287,7 @@ impl NodeCacheShard {
     }
 
     fn put(&mut self, page_id: PageId, node: Arc<Node>) {
-        if let Some(&idx) = self.map.get(&page_id)
+        if let Some(idx) = self.find_entry_idx(page_id)
             && let Some(entry) = &mut self.entries[idx]
         {
             entry.usage = true;
@@ -1296,6 +1296,7 @@ impl NodeCacheShard {
         }
 
         loop {
+            let mut evicted_page = None;
             let evict = match &mut self.entries[self.hand] {
                 None => true,
                 Some(entry) => {
@@ -1303,11 +1304,14 @@ impl NodeCacheShard {
                         entry.usage = false;
                         false
                     } else {
-                        self.map.remove(&entry.page_id);
+                        evicted_page = Some(entry.page_id);
                         true
                     }
                 }
             };
+            if let Some(pid) = evicted_page {
+                self.remove_position(pid);
+            }
 
             if evict {
                 self.entries[self.hand] = Some(CacheEntry {
@@ -1315,7 +1319,7 @@ impl NodeCacheShard {
                     node,
                     usage: true,
                 });
-                self.map.insert(page_id, self.hand);
+                self.upsert_position(page_id, self.hand);
                 self.hand = (self.hand + 1) % self.capacity;
                 return;
             }
@@ -1324,9 +1328,9 @@ impl NodeCacheShard {
     }
 
     fn invalidate(&mut self, page_id: PageId) {
-        if let Some(&idx) = self.map.get(&page_id) {
+        if let Some(idx) = self.find_entry_idx(page_id) {
             self.entries[idx] = None;
-            self.map.remove(&page_id);
+            self.remove_position(page_id);
         }
     }
 }
@@ -1348,10 +1352,12 @@ impl NodeCache {
     }
 
     fn get_shard(&self, page_id: PageId) -> &Mutex<NodeCacheShard> {
-        let mut hasher = DefaultHasher::new();
-        page_id.hash(&mut hasher);
-        let hash = hasher.finish();
-        &self.shards[(hash as usize) % NUM_SHARDS]
+        let idx = if NUM_SHARDS.is_power_of_two() {
+            (page_id as usize) & (NUM_SHARDS - 1)
+        } else {
+            (page_id as usize) % NUM_SHARDS
+        };
+        &self.shards[idx]
     }
 
     pub fn get(&self, page_id: PageId) -> Option<Arc<Node>> {

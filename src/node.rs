@@ -561,7 +561,8 @@ impl Node {
         let hdr = self.header();
 
         // 1. Physical invariants check (Type and boundaries)
-        if hdr.is_leaf > 1 || hdr.elems > 127 {
+        let max_elems = (PAGE_SIZE - HEADER_SIZE) / SLOT_SIZE;
+        if hdr.is_leaf > 1 || hdr.elems > max_elems as u64 {
             return Err(Error::Corruption);
         }
 
@@ -702,6 +703,21 @@ impl Node {
         }
     }
 
+    pub fn child_pos_for_key(&self, key: &[u8]) -> usize {
+        debug_assert!(!self.is_leaf());
+
+        let mut lo = 0usize;
+        let mut hi = self.header().elems as usize;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.key_at(mid).cmp(key) {
+                Ordering::Greater => hi = mid,
+                _ => lo = mid + 1,
+            }
+        }
+        lo.saturating_sub(1)
+    }
+
     pub fn del(
         &mut self,
         store: &dyn PageStore,
@@ -747,12 +763,10 @@ impl Node {
     }
 
     fn calc_checksum(&self) -> u32 {
-        let mut data_copy = self.page.as_slice().to_vec();
-        unsafe {
-            let hdr = &mut *data_copy.as_mut_ptr().cast::<NodeHeader>();
-            hdr.checksum = 0;
-        }
-        crc32c::crc32c(&data_copy)
+        let data = self.page.as_slice();
+        let mut crc = crc32c::crc32c_append(0, &[0u8; std::mem::size_of::<u64>()]);
+        crc = crc32c::crc32c_append(crc, &data[std::mem::size_of::<u64>()..]);
+        crc
     }
 
     pub fn data_at(&self, pos: usize) -> &[u8] {

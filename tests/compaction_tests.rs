@@ -182,3 +182,29 @@ fn test_compaction_relocates_tail_and_shrinks_file() {
     })
     .expect("verify tail after compact failed");
 }
+
+#[test]
+fn test_default_compaction_skips_when_low_address_budget_is_insufficient() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_compaction_default_guard.db");
+
+    let tree = BTree::open(&db_path).expect("open btree failed");
+    let value = vec![0xABu8; 8 * 1024];
+
+    tree.exec("default", |txn| {
+        for i in 0..1500u32 {
+            let key = format!("k{:05}", i);
+            txn.put(key.as_bytes(), &value)?;
+        }
+        Ok(())
+    })
+    .expect("commit failed");
+
+    let size_before = fs::metadata(&db_path).unwrap().len();
+    let stats = tree.compact(0).expect("compact failed");
+    let size_after = fs::metadata(&db_path).unwrap().len();
+
+    assert_eq!(stats.moved_pages, 0);
+    assert!(stats.remaining_candidates > 0);
+    assert_eq!(size_after, size_before);
+}

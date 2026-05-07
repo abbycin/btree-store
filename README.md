@@ -21,6 +21,8 @@
 *   **Manual Compaction:** Best-effort tail compaction to reclaim space when requested.
 
 > **Warning:** Multi-process concurrent access is NOT supported. Only one process should access the database file at a time.
+>
+> Within a single process, opening the same database path multiple times will return a clone of the already-opened `BTree` instance. Use `BTree::clone()` to share handles explicitly across threads/components.
 
 ## Architecture
 
@@ -61,10 +63,10 @@ fn main() -> Result<(), Error> {
 
     // Multi-Bucket Atomic Transaction
     db.exec_multi(|multi| {
-        multi.execute("users", |txn| {
+        multi.exec("users", |txn| {
             txn.put(b"id:101", b"Bob")
         })?;
-        multi.execute("stats", |txn| {
+        multi.exec("stats", |txn| {
             txn.put(b"total_users", b"2")
         })?;
         Ok(())

@@ -19,11 +19,11 @@ fn reproduce_mace_corruption() -> Result<()> {
 
     let mut handles = vec![];
 
-    // 线程 1: 只负责 Put (模拟 Flusher)
+    // Thread 1: only performs Put (simulating Flusher)
     let bt1 = btree.clone();
     handles.push(thread::spawn(move || {
         for i in 0..10000 {
-            // 增加循环次数以加强压力测试
+            // Increase loop count to intensify stress testing
             let key = format!("put_only_key_{}", i);
             let val = vec![1u8; 100];
             if let Err(e) = bt1.exec(bucket, |txn| txn.put(key.as_bytes(), &val)) {
@@ -34,18 +34,18 @@ fn reproduce_mace_corruption() -> Result<()> {
         }
     }));
 
-    // 线程 2: Put + Del (模拟 GC)
+    // Thread 2: Put + Del (simulating GC)
     let bt2 = btree.clone();
     handles.push(thread::spawn(move || {
         for i in 0..10000 {
-            // 增加循环次数以加强压力测试
+            // Increase loop count to intensify stress testing
             let key = format!("mixed_key_{}", i);
             let val = vec![2u8; 100];
 
             // Put
             let _ = bt2.exec(bucket, |txn| txn.put(key.as_bytes(), &val));
 
-            // Del (触发 shrink_slot)
+            // Del (triggers shrink_slot)
             if let Err(e) = bt2.exec(bucket, |txn| txn.del(key.as_bytes())) {
                 if e.to_string().contains("Corruption") {
                     panic!("THREAD 2 REPRODUCED CORRUPTION at iteration {}: {:?}", i, e);

@@ -1,6 +1,15 @@
-use std::{collections::HashMap, collections::HashSet, fmt, io, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    collections::HashSet,
+    fmt, io,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, OnceLock, Weak,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+};
 
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
 #[cfg(feature = "ffi")]
 mod ffi;
@@ -41,6 +50,40 @@ pub type PageId = u32;
 
 pub const MAGIC: u64 = 0x636f776274726565;
 pub const FORMAT_VERSION: u32 = 3;
+
+static BTREE_INSTANCE_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<BTree>>>> = OnceLock::new();
+
+fn btree_instance_registry() -> &'static Mutex<HashMap<PathBuf, Weak<BTree>>> {
+    BTREE_INSTANCE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sweep_dead_btree_instances(reg: &mut HashMap<PathBuf, Weak<BTree>>) {
+    reg.retain(|_, weak| weak.strong_count() > 0);
+}
+
+fn normalize_db_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    let parent_canonical = absolute
+        .parent()
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    if let Some(parent) = parent_canonical
+        && let Some(name) = absolute.file_name()
+    {
+        return parent.join(name);
+    }
+    absolute
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -417,7 +460,7 @@ impl Tree {
             if current.is_leaf() {
                 return current.get(self.store.as_ref(), key);
             }
-            let pos = current.search(key).unwrap_or_else(|x| x.saturating_sub(1));
+            let pos = current.child_pos_for_key(key);
             current = self.store.load_node(current.child_at(pos))?;
         }
     }
@@ -723,14 +766,21 @@ impl<'a> Txn<'a> {
 pub struct ReadOnlyTree {
     store: Arc<dyn PageStore>,
     root_page_id: PageId,
+    root_node: Option<Arc<Node>>,
 }
 
 impl ReadOnlyTree {
-    fn new(store: Arc<dyn PageStore>, root_page_id: PageId) -> Self {
-        Self {
+    fn new(store: Arc<dyn PageStore>, root_page_id: PageId) -> Result<Self> {
+        let root_node = if root_page_id == 0 {
+            None
+        } else {
+            Some(store.load_node(root_page_id)?)
+        };
+        Ok(Self {
             store,
             root_page_id,
-        }
+            root_node,
+        })
     }
 
     fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
@@ -738,12 +788,12 @@ impl ReadOnlyTree {
             return Err(Error::NotFound);
         }
 
-        let mut current = self.store.load_node(self.root_page_id)?;
+        let mut current = self.root_node.clone().ok_or(Error::NotFound)?;
         loop {
             if current.is_leaf() {
                 return current.get(self.store.as_ref(), key);
             }
-            let pos = current.search(key).unwrap_or_else(|x| x.saturating_sub(1));
+            let pos = current.child_pos_for_key(key);
             current = self.store.load_node(current.child_at(pos))?;
         }
     }
@@ -777,7 +827,7 @@ pub struct MultiTxn<'a> {
 }
 
 impl<'a> MultiTxn<'a> {
-    pub fn execute<F, R>(&mut self, bucket: &str, f: F) -> Result<R>
+    pub fn exec<F, R>(&mut self, bucket: &str, f: F) -> Result<R>
     where
         F: FnOnce(&mut Txn) -> Result<R>,
     {
@@ -844,17 +894,16 @@ pub struct BTree {
     pub(crate) pending_free: Arc<RwLock<Vec<(PageId, u32)>>>,
     pub(crate) pending_alloc: Arc<RwLock<HashSet<PageId>>>,
     pub(crate) writer_lock: Arc<RwLock<()>>,
-    pub(crate) start_root_id: Arc<RwLock<PageId>>,
-    pub(crate) start_seq: Arc<RwLock<u64>>,
+    pub(crate) start_root_id: Arc<AtomicU32>,
+    pub(crate) start_seq: Arc<AtomicU64>,
     pub(crate) bucket_root_cache: Arc<RwLock<BucketRootCache>>,
     pub(crate) bucket_tree_cache: Arc<RwLock<BucketTreeCache>>,
+    instance_anchor: Option<Arc<BTree>>,
 }
 
 type BucketRootCache = HashMap<Vec<u8>, (PageId, u64)>;
 type BucketTreeCache = HashMap<Vec<u8>, (PageId, u64, Arc<ReadOnlyTree>)>;
 
-/// minimum free pages below tail to enable low address relocation
-const COMPACT_FREE_THRESHOLD_PAGES: u64 = 1024;
 /// compact all pages when total data pages are at or below this threshold
 const COMPACT_SMALL_DATA_THRESHOLD_PAGES: u64 = 1024;
 /// default tail ratio when target_bytes is zero
@@ -867,8 +916,36 @@ pub struct CompactStats {
 }
 
 impl BTree {
+    fn sync_local_snapshot_from_store(&self) {
+        let snapshot = self.store.cached_snapshot();
+        *self.catalog_tree.root_page_id.write() = snapshot.catalog_root;
+        *self.mapping_tree.root_page_id.write() = snapshot.mapping_root;
+        *self.reverse_tree.root_page_id.write() = snapshot.reverse_root;
+        self.start_root_id
+            .store(snapshot.catalog_root, Ordering::Release);
+        self.start_seq.store(snapshot.seq, Ordering::Release);
+    }
+
     /// Open or create a btree database at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let key = normalize_db_path(path);
+
+        if let Some(existing) = {
+            let mut reg = btree_instance_registry().lock();
+            sweep_dead_btree_instances(&mut reg);
+            let upgraded = reg.get(&key).and_then(|w| w.upgrade());
+            if upgraded.is_none() {
+                reg.remove(&key);
+            }
+            upgraded
+        } {
+            let mut handle = existing.as_ref().clone();
+            handle.instance_anchor = Some(existing);
+            handle.sync_local_snapshot_from_store();
+            return Ok(handle);
+        }
+
         let store = Arc::new(Store::open(path)?);
         let catalog_root = store.get_catalog_root();
         let mapping_root = store.get_mapping_root();
@@ -907,7 +984,7 @@ impl BTree {
             pending_alloc.clone(),
         )?);
 
-        Ok(Self {
+        let instance = Self {
             store: store.clone(),
             catalog_tree,
             mapping_tree,
@@ -916,11 +993,28 @@ impl BTree {
             pending_free,
             pending_alloc,
             writer_lock: Arc::new(RwLock::new(())),
-            start_root_id: Arc::new(RwLock::new(catalog_root)),
-            start_seq: Arc::new(RwLock::new(initial_seq)),
+            start_root_id: Arc::new(AtomicU32::new(catalog_root)),
+            start_seq: Arc::new(AtomicU64::new(initial_seq)),
             bucket_root_cache: Arc::new(RwLock::new(HashMap::new())),
             bucket_tree_cache: Arc::new(RwLock::new(HashMap::new())),
-        })
+            instance_anchor: None,
+        };
+        let instance_arc = Arc::new(instance);
+        {
+            let mut reg = btree_instance_registry().lock();
+            sweep_dead_btree_instances(&mut reg);
+            if let Some(existing) = reg.get(&key).and_then(|w| w.upgrade()) {
+                let mut handle = existing.as_ref().clone();
+                handle.instance_anchor = Some(existing);
+                handle.sync_local_snapshot_from_store();
+                return Ok(handle);
+            }
+            reg.insert(key, Arc::downgrade(&instance_arc));
+        }
+
+        let mut handle = instance_arc.as_ref().clone();
+        handle.instance_anchor = Some(instance_arc);
+        Ok(handle)
     }
 
     /// Executes a read-write transaction on the specified bucket.
@@ -1178,7 +1272,7 @@ impl BTree {
 
         // For view, we also want the freshest data.
         let (mut latest_seq, mut latest_root) = self.store.shared_snapshot();
-        let seq_changed = latest_seq != *self.start_seq.read();
+        let seq_changed = latest_seq != self.start_seq.load(Ordering::Acquire);
         if seq_changed {
             let snapshot = self.store.refresh_sb()?;
             // Clear cache to avoid stale reads if version moved
@@ -1187,8 +1281,9 @@ impl BTree {
             *self.catalog_tree.root_page_id.write() = snapshot.catalog_root;
             *self.mapping_tree.root_page_id.write() = snapshot.mapping_root;
             *self.reverse_tree.root_page_id.write() = snapshot.reverse_root;
-            *self.start_root_id.write() = snapshot.catalog_root;
-            *self.start_seq.write() = snapshot.seq;
+            self.start_root_id
+                .store(snapshot.catalog_root, Ordering::Release);
+            self.start_seq.store(snapshot.seq, Ordering::Release);
             self.bucket_root_cache.write().clear();
             self.bucket_tree_cache.write().clear();
             latest_seq = snapshot.seq;
@@ -1196,6 +1291,22 @@ impl BTree {
         }
 
         let name_bytes = bucket.as_bytes();
+        let cached_tree =
+            self.bucket_tree_cache
+                .read()
+                .get(name_bytes)
+                .and_then(|(_root, seq, tree)| {
+                    if *seq == latest_seq {
+                        Some(tree.clone())
+                    } else {
+                        None
+                    }
+                });
+        if let Some(tree) = cached_tree {
+            let txn = ReadOnlyTxn { tree, _guard: lock };
+            return f(&txn);
+        }
+
         let cached_root = self
             .bucket_root_cache
             .read()
@@ -1229,28 +1340,11 @@ impl BTree {
             root
         };
 
-        let cached_tree =
-            self.bucket_tree_cache
-                .read()
-                .get(name_bytes)
-                .and_then(|(root, seq, tree)| {
-                    if *seq == latest_seq && *root == bucket_root {
-                        Some(tree.clone())
-                    } else {
-                        None
-                    }
-                });
-
-        let tree = if let Some(tree) = cached_tree {
-            tree
-        } else {
-            let logical_store_obj: Arc<dyn PageStore> = self.logical_store.clone();
-            let tree = Arc::new(ReadOnlyTree::new(logical_store_obj, bucket_root));
-            self.bucket_tree_cache
-                .write()
-                .insert(name_bytes.to_vec(), (bucket_root, latest_seq, tree.clone()));
-            tree
-        };
+        let logical_store_obj: Arc<dyn PageStore> = self.logical_store.clone();
+        let tree = Arc::new(ReadOnlyTree::new(logical_store_obj, bucket_root)?);
+        self.bucket_tree_cache
+            .write()
+            .insert(name_bytes.to_vec(), (bucket_root, latest_seq, tree.clone()));
 
         let txn = ReadOnlyTxn { tree, _guard: lock };
 
@@ -1286,10 +1380,12 @@ impl BTree {
     }
 
     fn commit_internal(&self) -> Result<()> {
-        let snapshot = self.store.refresh_sb()?;
-        if snapshot.seq != *self.start_seq.read() {
+        let start_seq = self.start_seq.load(Ordering::Acquire);
+        let (latest_seq, _) = self.store.shared_snapshot();
+        if latest_seq != start_seq {
             return Err(Error::Conflict);
         }
+        let snapshot = self.store.cached_snapshot();
 
         let catalog_root = *self.catalog_tree.root_page_id.read();
         let mapping_root = *self.mapping_tree.root_page_id.read();
@@ -1313,8 +1409,9 @@ impl BTree {
 
         freed_lock.clear();
         alloc_lock.clear();
-        *self.start_root_id.write() = catalog_root;
-        *self.start_seq.write() = self.store.get_seq();
+        self.start_root_id.store(catalog_root, Ordering::Release);
+        self.start_seq
+            .store(self.store.get_seq(), Ordering::Release);
         Ok(())
     }
 
@@ -1416,6 +1513,26 @@ impl BTree {
         Ok((moved, total_candidates, prealloc_idx))
     }
 
+    fn compact_tail_live_pages(&self, total_pages: PageId, tail_start: PageId) -> Result<u64> {
+        let mut total_candidates = 0u64;
+        let mut iter = self.reverse_tree.iterator_from(&encode_u32_key(tail_start));
+        let mut key_buf = Vec::new();
+        let mut val_buf = Vec::new();
+
+        while iter.next_ref(&mut key_buf, &mut val_buf) {
+            let pid = decode_u32_key(&key_buf)?;
+            if pid < tail_start {
+                continue;
+            }
+            if pid >= total_pages {
+                break;
+            }
+            total_candidates += 1;
+        }
+
+        Ok(total_candidates)
+    }
+
     fn compact_release_unused_prealloc(&self, prealloc: &[PageId], used: usize) -> Result<()> {
         if used >= prealloc.len() {
             return Ok(());
@@ -1447,7 +1564,7 @@ impl BTree {
         self.refresh_internal()?;
 
         let total_pages = self.store.get_next_page_id();
-        let (tail_start, target_pages, target_pages_u64) =
+        let (tail_start, _target_pages, target_pages_u64) =
             if let Some(params) = Self::compact_tail_window(total_pages, target_bytes) {
                 params
             } else {
@@ -1462,6 +1579,17 @@ impl BTree {
                 remaining_candidates: 0,
             });
         }
+        let total_candidates = self.compact_tail_live_pages(total_pages, tail_start)?;
+        if total_candidates == 0 {
+            return Ok(CompactStats {
+                moved_pages: 0,
+                remaining_candidates: 0,
+            });
+        }
+        let planned_moves = total_candidates.min(target_pages_u64);
+        // For default compaction, avoid file growth by requiring all relocated pages
+        // to be preallocated from low addresses below the compaction tail.
+        let strict_no_growth = target_bytes == 0;
 
         let pre_alloc = self.pending_alloc.read().clone();
         let pre_free = self.pending_free.read().clone();
@@ -1470,8 +1598,15 @@ impl BTree {
         let pre_reverse_root = *self.reverse_tree.root_page_id.read();
 
         let mut prealloc = None;
-        if self.store.free_pages_below(tail_start) >= COMPACT_FREE_THRESHOLD_PAGES
-            && let Some(pids) = self.store.alloc_pages_below(tail_start, target_pages)?
+        if strict_no_growth && self.store.free_pages_below(tail_start) < planned_moves {
+            return Ok(CompactStats {
+                moved_pages: 0,
+                remaining_candidates: total_candidates,
+            });
+        }
+        if let Some(pids) = self
+            .store
+            .alloc_pages_below(tail_start, planned_moves as PageId)?
         {
             let mut alloc = self.pending_alloc.write();
             for pid in &pids {
@@ -1479,15 +1614,22 @@ impl BTree {
             }
             prealloc = Some(pids);
         }
+        if strict_no_growth && prealloc.is_none() {
+            return Ok(CompactStats {
+                moved_pages: 0,
+                remaining_candidates: total_candidates,
+            });
+        }
+        let move_budget = if strict_no_growth {
+            planned_moves
+        } else {
+            target_pages_u64
+        };
 
-        let move_result = self.compact_move_tail(
-            total_pages,
-            tail_start,
-            target_pages_u64,
-            prealloc.as_deref(),
-        );
+        let move_result =
+            self.compact_move_tail(total_pages, tail_start, move_budget, prealloc.as_deref());
 
-        let (moved, total_candidates, used_prealloc) = match move_result {
+        let (moved, _scanned_candidates, used_prealloc) = match move_result {
             Ok(res) => res,
             Err(e) => {
                 *self.catalog_tree.root_page_id.write() = pre_catalog_root;
@@ -1544,7 +1686,8 @@ impl BTree {
         }
 
         let _ = self.store.try_truncate_tail_with_floor(min_end)?;
-        *self.start_seq.write() = self.store.get_seq();
+        self.start_seq
+            .store(self.store.get_seq(), Ordering::Release);
         self.logical_store.clear_lid_cache();
 
         Ok(CompactStats {
@@ -1556,6 +1699,13 @@ impl BTree {
     fn refresh_internal(&self) -> Result<()> {
         self.pending_free.write().clear();
         self.pending_alloc.write().clear();
+
+        // Fast path: snapshot version unchanged, so current in-memory roots and caches are valid.
+        let (latest_seq, _) = self.store.shared_snapshot();
+        if latest_seq == self.start_seq.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         self.store.clear_cache();
         self.logical_store.clear_lid_cache();
 
@@ -1563,8 +1713,9 @@ impl BTree {
         *self.catalog_tree.root_page_id.write() = snapshot.catalog_root;
         *self.mapping_tree.root_page_id.write() = snapshot.mapping_root;
         *self.reverse_tree.root_page_id.write() = snapshot.reverse_root;
-        *self.start_root_id.write() = snapshot.catalog_root;
-        *self.start_seq.write() = snapshot.seq;
+        self.start_root_id
+            .store(snapshot.catalog_root, Ordering::Release);
+        self.start_seq.store(snapshot.seq, Ordering::Release);
         Ok(())
     }
 
@@ -1636,8 +1787,8 @@ impl Clone for BTree {
         let catalog_root = *self.catalog_tree.root_page_id.read();
         let mapping_root = *self.mapping_tree.root_page_id.read();
         let reverse_root = *self.reverse_tree.root_page_id.read();
-        let start_root_id = *self.start_root_id.read();
-        let start_seq = *self.start_seq.read();
+        let start_root_id = self.start_root_id.load(Ordering::Acquire);
+        let start_seq = self.start_seq.load(Ordering::Acquire);
 
         let physical_store: Arc<dyn PageStore> = self.store.clone();
         let mapping_tree = Arc::new(
@@ -1683,10 +1834,11 @@ impl Clone for BTree {
             pending_free: self.pending_free.clone(),
             pending_alloc: self.pending_alloc.clone(),
             writer_lock: self.writer_lock.clone(),
-            start_root_id: Arc::new(RwLock::new(start_root_id)),
-            start_seq: Arc::new(RwLock::new(start_seq)),
+            start_root_id: Arc::new(AtomicU32::new(start_root_id)),
+            start_seq: Arc::new(AtomicU64::new(start_seq)),
             bucket_root_cache: self.bucket_root_cache.clone(),
             bucket_tree_cache: self.bucket_tree_cache.clone(),
+            instance_anchor: self.instance_anchor.clone(),
         }
     }
 }

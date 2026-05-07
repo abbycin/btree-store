@@ -10,8 +10,8 @@ fn test_exec_multi_basic() {
 
     // Execute multi-bucket transaction
     tree.exec_multi(|multi| {
-        multi.execute("bucket1", |txn| txn.put(b"key1", b"value1"))?;
-        multi.execute("bucket2", |txn| txn.put(b"key2", b"value2"))?;
+        multi.exec("bucket1", |txn| txn.put(b"key1", b"value1"))?;
+        multi.exec("bucket2", |txn| txn.put(b"key2", b"value2"))?;
         Ok(())
     })
     .expect("Failed to execute multi-bucket transaction");
@@ -45,8 +45,8 @@ fn test_exec_multi_rollback() {
 
     // Execute multi-bucket transaction that fails
     let res: btree_store::Result<()> = tree.exec_multi(|multi| {
-        multi.execute("bucket1", |txn| txn.put(b"key1", b"value1"))?;
-        multi.execute("bucket2", |txn| txn.put(b"key2", b"value2"))?;
+        multi.exec("bucket1", |txn| txn.put(b"key1", b"value1"))?;
+        multi.exec("bucket2", |txn| txn.put(b"key2", b"value2"))?;
         Err(btree_store::Error::Internal)
     });
 
@@ -74,9 +74,9 @@ fn test_exec_multi_sequential_on_same_bucket() {
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
 
     tree.exec_multi(|multi| {
-        multi.execute("bucket1", |txn| txn.put(b"key1", b"value1"))?;
+        multi.exec("bucket1", |txn| txn.put(b"key1", b"value1"))?;
         // Second execute on same bucket should see first change
-        multi.execute("bucket1", |txn| {
+        multi.exec("bucket1", |txn| {
             let val = txn.get(b"key1").expect("Should see key1");
             assert_eq!(val, b"value1");
             txn.put(b"key1", b"value2")

@@ -148,27 +148,27 @@ The engine is optimized for high-throughput scenarios:
 ## Benchmarks
 
 Environment:
-*   **Date:** 2026-02-08
-*   **OS:** openSUSE Tumbleweed (20260131), kernel 6.18.7-1-default
-*   **CPU:** AMD Ryzen 7 4800H, 8C/16T
+*   **Date:** 2026-05-08
+*   **OS:** openSUSE Tumbleweed, kernel 6.19.12-1-default
+*   **CPU:** AMD Ryzen 5 3600, 6C/12T
 *   **Command:** `cargo bench`
 
 Results (lower is better):
 | Benchmark | Mean | 95% CI |
 | --- | --- | --- |
-| bucket_ops/create_drop_empty_bucket | 53.737 us | [53.484, 54.001] us |
-| bucket_ops/drop_large_bucket_100k | 37.526 ms | [36.650, 38.906] ms |
-| concurrent_get/4_threads_random_get | 438.833 ns | [428.752, 448.772] ns |
-| delete/delete_insert_cycle_1k | 71.924 ms | [71.699, 72.222] ms |
-| get/random_get_100k | 959.259 ns | [948.173, 971.986] ns |
-| insert/insert_1k_tx | 67.990 ms | [67.707, 68.283] ms |
+| bucket_ops/create_drop_empty_bucket | 34.963 us | [34.908, 35.015] us |
+| bucket_ops/drop_large_bucket_100k | 35.515 ms | [35.336, 35.685] ms |
+| concurrent_get/4_threads_random_get | 325.270 ns | [319.530, 329.860] ns |
+| delete/delete_insert_cycle_1k | 54.982 ms | [54.885, 55.088] ms |
+| get/random_get_100k | 448.090 ns | [443.860, 452.620] ns |
+| insert/insert_1k_tx | 52.708 ms | [52.623, 52.801] ms |
 
 Interpretation:
-*   **get**: ~0.96 us/op (random get on 100k keys).
-*   **get (4 threads)**: ~0.44 us/op (per get, concurrent reads).
-*   **put**: ~68 us/op (**single-op transactions**; `insert_1k_tx` runs 1000 separate `exec` calls).
-*   **del**: ~72 us/op (**single-op transactions** after a prefill).
-*   **bucket ops**: empty bucket create+drop ~54 us; drop 100k-key bucket ~37.5 ms.
+*   **get**: ~0.45 us/op (random get on 100k keys).
+*   **get (4 threads)**: ~0.33 us/op (per get, concurrent reads).
+*   **put**: ~53 us/op (**single-op transactions**; `insert_1k_tx` runs 1000 separate `exec` calls).
+*   **del**: ~55 us/op (**single-op transactions** after a prefill).
+*   **bucket ops**: empty bucket create+drop ~35 us; drop 100k-key bucket ~35.5 ms.
 *   These numbers are machine- and load-dependent; rerun on your hardware for comparable results.
 *   No cross-DB comparison is provided here because different engines and configurations are not directly comparable.
 

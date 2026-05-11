@@ -2,6 +2,11 @@
 
 All notable changes to the **btree_store** project will be documented in this file.
 
+## [0.1.7]
+
+### Added
+- **MSRV Declaration**: Added an explicit Minimum Supported Rust Version (MSRV) of `1.95` via `Cargo.toml` (`rust-version = "1.95"`).
+
 ## [0.1.6] - 2026-05-07
 
 ### Changed

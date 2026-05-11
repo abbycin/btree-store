@@ -45,7 +45,7 @@ fn test_concurrent_put_get() {
                     .view("concurrent", |txn| {
                         let val = txn
                             .get(key.as_bytes())
-                            .expect(&format!("Key {} not found", key));
+                            .unwrap_or_else(|_| panic!("Key {} not found", key));
                         assert_eq!(val, expected_val.as_bytes());
                         Ok(())
                     })

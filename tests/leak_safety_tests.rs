@@ -11,7 +11,7 @@ fn test_freelist_persist_and_reuse() {
     {
         let bt = BTree::open(&db_path).unwrap();
         bt.exec("default", |txn| {
-            txn.put(b"key1", &vec![0xAA; 20000]).unwrap();
+            txn.put(b"key1", vec![0xAA; 20000]).unwrap();
             Ok(())
         })
         .unwrap();
@@ -28,7 +28,7 @@ fn test_freelist_persist_and_reuse() {
     {
         let bt = BTree::open(&db_path).unwrap();
         bt.exec("default", |txn| {
-            txn.put(b"key2", &vec![0xBB; 20000]).unwrap();
+            txn.put(b"key2", vec![0xBB; 20000]).unwrap();
             Ok(())
         })
         .unwrap();
@@ -56,7 +56,7 @@ fn test_exec_rollback_no_leak() {
     // 2. Execute a transaction that fails
     let res: btree_store::Result<()> = tree.exec("data", |txn| {
         // Allocate some pages by putting large values
-        txn.put(b"large", &vec![0xAA; 1024 * 1024]).unwrap();
+        txn.put(b"large", vec![0xAA; 1024 * 1024]).unwrap();
         // Return error to trigger rollback
         Err(btree_store::Error::Internal)
     });

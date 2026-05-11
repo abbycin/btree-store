@@ -26,10 +26,11 @@ fn reproduce_mace_corruption() -> Result<()> {
             // Increase loop count to intensify stress testing
             let key = format!("put_only_key_{}", i);
             let val = vec![1u8; 100];
-            if let Err(e) = bt1.exec(bucket, |txn| txn.put(key.as_bytes(), &val)) {
-                if e.to_string().contains("Corruption") {
+            match bt1.exec(bucket, |txn| txn.put(key.as_bytes(), &val)) {
+                Err(e) if e.to_string().contains("Corruption") => {
                     panic!("THREAD 1 REPRODUCED CORRUPTION: {:?}", e);
                 }
+                _ => {}
             }
         }
     }));
@@ -46,10 +47,11 @@ fn reproduce_mace_corruption() -> Result<()> {
             let _ = bt2.exec(bucket, |txn| txn.put(key.as_bytes(), &val));
 
             // Del (triggers shrink_slot)
-            if let Err(e) = bt2.exec(bucket, |txn| txn.del(key.as_bytes())) {
-                if e.to_string().contains("Corruption") {
+            match bt2.exec(bucket, |txn| txn.del(key.as_bytes())) {
+                Err(e) if e.to_string().contains("Corruption") => {
                     panic!("THREAD 2 REPRODUCED CORRUPTION at iteration {}: {:?}", i, e);
                 }
+                _ => {}
             }
         }
     }));

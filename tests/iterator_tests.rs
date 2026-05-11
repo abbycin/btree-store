@@ -45,7 +45,7 @@ fn test_btree_buckets_list() {
 
     let bucket_names = vec!["bucket_1", "bucket_2", "bucket_3"];
     for name in &bucket_names {
-        tree.exec(*name, |_txn| Ok(())).unwrap();
+        tree.exec(name, |_txn| Ok(())).unwrap();
     }
 
     let mut buckets = tree.buckets().unwrap();

@@ -161,7 +161,7 @@ fn test_delete_complex_scenario() {
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
 
     // Insert multiple sets of key-value pairs
-    let keys = vec!["key1", "key2", "key3", "key4", "key5"];
+    let keys = ["key1", "key2", "key3", "key4", "key5"];
     tree.exec("default", |txn| {
         for (i, key) in keys.iter().enumerate() {
             let value = format!("value{}", i).into_bytes();

@@ -9,10 +9,10 @@ fn test_reuse_within_txn() {
 
     let tree = BTree::open(&db_path).unwrap();
     tree.exec("default", |txn| {
-        txn.put(b"large1", &vec![0u8; 12000]).unwrap();
+        txn.put(b"large1", vec![0u8; 12000]).unwrap();
         let size_after_put = fs::metadata(&db_path).unwrap().len();
         txn.del(b"large1").unwrap();
-        txn.put(b"large2", &vec![0u8; 12000]).unwrap();
+        txn.put(b"large2", vec![0u8; 12000]).unwrap();
         let size_after_reuse = fs::metadata(&db_path).unwrap().len();
         assert_eq!(size_after_reuse, size_after_put);
         Ok(())
@@ -28,7 +28,7 @@ fn test_reuse_after_reopen() {
     {
         let bt = BTree::open(&db_path).unwrap();
         bt.exec("default", |txn| {
-            txn.put(b"large", &vec![0u8; 10000]).unwrap();
+            txn.put(b"large", vec![0u8; 10000]).unwrap();
             Ok(())
         })
         .unwrap();
@@ -47,7 +47,7 @@ fn test_reuse_after_reopen() {
     {
         let bt = BTree::open(&db_path).unwrap();
         bt.exec("default", |txn| {
-            txn.put(b"large2", &vec![0u8; 10000]).unwrap();
+            txn.put(b"large2", vec![0u8; 10000]).unwrap();
             Ok(())
         })
         .unwrap();

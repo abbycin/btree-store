@@ -182,7 +182,7 @@ impl MetaNode {
 use crate::{
     node::{MAX_KEY_LEN, Node, PAGE_SIZE},
     page_store::{LogicalStore, PageStore, decode_u32_key, encode_u32_key},
-    store::Store,
+    store::{MetaSnapshot, Store},
 };
 
 struct Route {
@@ -823,7 +823,14 @@ impl<'a> ReadOnlyTxn<'a> {
 
 pub struct MultiTxn<'a> {
     btree: &'a BTree,
-    bucket_roots: HashMap<String, PageId>,
+    bucket_roots: HashMap<String, MultiTxnBucketRoot>,
+}
+
+#[derive(Clone, Copy)]
+struct MultiTxnBucketRoot {
+    initial_exists: bool,
+    initial: PageId,
+    current: PageId,
 }
 
 impl<'a> MultiTxn<'a> {
@@ -833,20 +840,25 @@ impl<'a> MultiTxn<'a> {
     {
         let name_bytes = bucket.as_bytes();
 
-        let initial_root = if let Some(&root) = self.bucket_roots.get(bucket) {
-            root
+        let root = if let Some(root) = self.bucket_roots.get(bucket) {
+            *root
         } else {
-            match self.btree.catalog_tree.get(name_bytes) {
-                Ok(bytes) => BucketMetadata::from_slice(&bytes).root_page_id,
-                Err(Error::NotFound) => 0,
+            let (initial_exists, current) = match self.btree.catalog_tree.get(name_bytes) {
+                Ok(bytes) => (true, BucketMetadata::from_slice(&bytes).root_page_id),
+                Err(Error::NotFound) => (false, 0),
                 Err(e) => return Err(e),
+            };
+            MultiTxnBucketRoot {
+                initial_exists,
+                initial: current,
+                current,
             }
         };
 
         let logical_store_obj: Arc<dyn PageStore> = self.btree.logical_store.clone();
         let tree = Tree::open(
             logical_store_obj,
-            Arc::new(RwLock::new(initial_root)),
+            Arc::new(RwLock::new(root.current)),
             self.btree.pending_free.clone(),
             self.btree.pending_alloc.clone(),
         )?;
@@ -858,8 +870,15 @@ impl<'a> MultiTxn<'a> {
 
         let res = f(&mut txn);
         if res.is_ok() {
-            let new_root = *txn.tree.root_page_id.read();
-            self.bucket_roots.insert(bucket.to_string(), new_root);
+            let current = *txn.tree.root_page_id.read();
+            self.bucket_roots.insert(
+                bucket.to_string(),
+                MultiTxnBucketRoot {
+                    initial_exists: root.initial_exists,
+                    initial: root.initial,
+                    current,
+                },
+            );
         }
         res
     }
@@ -896,6 +915,7 @@ pub struct BTree {
     pub(crate) writer_lock: Arc<RwLock<()>>,
     pub(crate) start_root_id: Arc<AtomicU32>,
     pub(crate) start_seq: Arc<AtomicU64>,
+    local_snapshot: Arc<RwLock<MetaSnapshot>>,
     pub(crate) bucket_root_cache: Arc<RwLock<BucketRootCache>>,
     pub(crate) bucket_tree_cache: Arc<RwLock<BucketTreeCache>>,
     instance_anchor: Option<Arc<BTree>>,
@@ -916,14 +936,22 @@ pub struct CompactStats {
 }
 
 impl BTree {
-    fn sync_local_snapshot_from_store(&self) {
-        let snapshot = self.store.cached_snapshot();
+    fn apply_local_snapshot(&self, snapshot: MetaSnapshot, clear_caches: bool) {
         *self.catalog_tree.root_page_id.write() = snapshot.catalog_root;
         *self.mapping_tree.root_page_id.write() = snapshot.mapping_root;
         *self.reverse_tree.root_page_id.write() = snapshot.reverse_root;
         self.start_root_id
             .store(snapshot.catalog_root, Ordering::Release);
         self.start_seq.store(snapshot.seq, Ordering::Release);
+        *self.local_snapshot.write() = snapshot;
+        if clear_caches {
+            self.bucket_root_cache.write().clear();
+            self.bucket_tree_cache.write().clear();
+        }
+    }
+
+    fn sync_local_snapshot_from_store(&self) {
+        self.apply_local_snapshot(self.store.cached_snapshot(), false);
     }
 
     /// Open or create a btree database at the given path.
@@ -951,6 +979,12 @@ impl BTree {
         let mapping_root = store.get_mapping_root();
         let reverse_root = store.get_reverse_root();
         let initial_seq = store.get_seq();
+        let initial_snapshot = MetaSnapshot {
+            catalog_root,
+            mapping_root,
+            reverse_root,
+            seq: initial_seq,
+        };
         let pending_free = Arc::new(RwLock::new(Vec::new()));
         let pending_alloc = Arc::new(RwLock::new(HashSet::new()));
         let mapping_root_lock = Arc::new(RwLock::new(mapping_root));
@@ -995,6 +1029,7 @@ impl BTree {
             writer_lock: Arc::new(RwLock::new(())),
             start_root_id: Arc::new(AtomicU32::new(catalog_root)),
             start_seq: Arc::new(AtomicU64::new(initial_seq)),
+            local_snapshot: Arc::new(RwLock::new(initial_snapshot)),
             bucket_root_cache: Arc::new(RwLock::new(HashMap::new())),
             bucket_tree_cache: Arc::new(RwLock::new(HashMap::new())),
             instance_anchor: None,
@@ -1122,15 +1157,21 @@ impl BTree {
         match f(&mut multi_txn) {
             Ok(res) => {
                 let mut updated = Vec::new();
-                for (name, new_root) in multi_txn.bucket_roots {
-                    let metadata = BucketMetadata {
-                        root_page_id: new_root,
-                    };
-                    self.catalog_tree
-                        .put(name.as_bytes(), metadata.as_slice())?;
-                    updated.push((name.into_bytes(), new_root));
-                }
-                if let Err(e) = self.commit_internal() {
+                let commit_res = (|| {
+                    for (name, roots) in multi_txn.bucket_roots {
+                        if roots.initial_exists && roots.current == roots.initial {
+                            continue;
+                        }
+                        let metadata = BucketMetadata {
+                            root_page_id: roots.current,
+                        };
+                        self.catalog_tree
+                            .put(name.as_bytes(), metadata.as_slice())?;
+                        updated.push((name.into_bytes(), roots.current));
+                    }
+                    self.commit_internal()
+                })();
+                if let Err(e) = commit_res {
                     *self.catalog_tree.root_page_id.write() = pre_catalog_root;
                     *self.mapping_tree.root_page_id.write() = pre_mapping_root;
                     *self.reverse_tree.root_page_id.write() = pre_reverse_root;
@@ -1275,19 +1316,12 @@ impl BTree {
         let seq_changed = latest_seq != self.start_seq.load(Ordering::Acquire);
         if seq_changed {
             let snapshot = self.store.refresh_sb()?;
+            latest_seq = snapshot.seq;
+            latest_root = snapshot.catalog_root;
             // Clear cache to avoid stale reads if version moved
             self.store.clear_cache();
             self.logical_store.clear_lid_cache();
-            *self.catalog_tree.root_page_id.write() = snapshot.catalog_root;
-            *self.mapping_tree.root_page_id.write() = snapshot.mapping_root;
-            *self.reverse_tree.root_page_id.write() = snapshot.reverse_root;
-            self.start_root_id
-                .store(snapshot.catalog_root, Ordering::Release);
-            self.start_seq.store(snapshot.seq, Ordering::Release);
-            self.bucket_root_cache.write().clear();
-            self.bucket_tree_cache.write().clear();
-            latest_seq = snapshot.seq;
-            latest_root = snapshot.catalog_root;
+            self.apply_local_snapshot(snapshot, true);
         }
 
         let name_bytes = bucket.as_bytes();
@@ -1409,9 +1443,16 @@ impl BTree {
 
         freed_lock.clear();
         alloc_lock.clear();
-        self.start_root_id.store(catalog_root, Ordering::Release);
-        self.start_seq
-            .store(self.store.get_seq(), Ordering::Release);
+        let seq = self.store.get_seq();
+        self.apply_local_snapshot(
+            MetaSnapshot {
+                catalog_root,
+                mapping_root,
+                reverse_root,
+                seq,
+            },
+            false,
+        );
         Ok(())
     }
 
@@ -1686,8 +1727,19 @@ impl BTree {
         }
 
         let _ = self.store.try_truncate_tail_with_floor(min_end)?;
-        self.start_seq
-            .store(self.store.get_seq(), Ordering::Release);
+        let catalog_root = *self.catalog_tree.root_page_id.read();
+        let mapping_root = *self.mapping_tree.root_page_id.read();
+        let reverse_root = *self.reverse_tree.root_page_id.read();
+        let seq = self.store.get_seq();
+        self.apply_local_snapshot(
+            MetaSnapshot {
+                catalog_root,
+                mapping_root,
+                reverse_root,
+                seq,
+            },
+            false,
+        );
         self.logical_store.clear_lid_cache();
 
         Ok(CompactStats {
@@ -1710,12 +1762,7 @@ impl BTree {
         self.logical_store.clear_lid_cache();
 
         let snapshot = self.store.refresh_sb()?;
-        *self.catalog_tree.root_page_id.write() = snapshot.catalog_root;
-        *self.mapping_tree.root_page_id.write() = snapshot.mapping_root;
-        *self.reverse_tree.root_page_id.write() = snapshot.reverse_root;
-        self.start_root_id
-            .store(snapshot.catalog_root, Ordering::Release);
-        self.start_seq.store(snapshot.seq, Ordering::Release);
+        self.apply_local_snapshot(snapshot, true);
         Ok(())
     }
 
@@ -1784,17 +1831,21 @@ impl BTree {
 impl Clone for BTree {
     /// Cloning a BTree handle shares the store, writer lock, and pending page tracking.
     fn clone(&self) -> Self {
-        let catalog_root = *self.catalog_tree.root_page_id.read();
-        let mapping_root = *self.mapping_tree.root_page_id.read();
-        let reverse_root = *self.reverse_tree.root_page_id.read();
-        let start_root_id = self.start_root_id.load(Ordering::Acquire);
-        let start_seq = self.start_seq.load(Ordering::Acquire);
+        let snapshot = {
+            let snapshot = self.local_snapshot.read();
+            MetaSnapshot {
+                catalog_root: snapshot.catalog_root,
+                mapping_root: snapshot.mapping_root,
+                reverse_root: snapshot.reverse_root,
+                seq: snapshot.seq,
+            }
+        };
 
         let physical_store: Arc<dyn PageStore> = self.store.clone();
         let mapping_tree = Arc::new(
             Tree::open(
                 physical_store.clone(),
-                Arc::new(RwLock::new(mapping_root)),
+                Arc::new(RwLock::new(snapshot.mapping_root)),
                 self.pending_free.clone(),
                 self.pending_alloc.clone(),
             )
@@ -1803,7 +1854,7 @@ impl Clone for BTree {
         let reverse_tree = Arc::new(
             Tree::open(
                 physical_store,
-                Arc::new(RwLock::new(reverse_root)),
+                Arc::new(RwLock::new(snapshot.reverse_root)),
                 self.pending_free.clone(),
                 self.pending_alloc.clone(),
             )
@@ -1818,7 +1869,7 @@ impl Clone for BTree {
         let catalog_tree = Arc::new(
             Tree::open(
                 logical_store_obj,
-                Arc::new(RwLock::new(catalog_root)),
+                Arc::new(RwLock::new(snapshot.catalog_root)),
                 self.pending_free.clone(),
                 self.pending_alloc.clone(),
             )
@@ -1834,8 +1885,9 @@ impl Clone for BTree {
             pending_free: self.pending_free.clone(),
             pending_alloc: self.pending_alloc.clone(),
             writer_lock: self.writer_lock.clone(),
-            start_root_id: Arc::new(AtomicU32::new(start_root_id)),
-            start_seq: Arc::new(AtomicU64::new(start_seq)),
+            start_root_id: Arc::new(AtomicU32::new(snapshot.catalog_root)),
+            start_seq: Arc::new(AtomicU64::new(snapshot.seq)),
+            local_snapshot: Arc::new(RwLock::new(snapshot)),
             bucket_root_cache: self.bucket_root_cache.clone(),
             bucket_tree_cache: self.bucket_tree_cache.clone(),
             instance_anchor: self.instance_anchor.clone(),

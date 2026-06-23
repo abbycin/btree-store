@@ -2,7 +2,19 @@
 
 All notable changes to the **btree_store** project will be documented in this file.
 
-## [0.1.7]
+## [0.1.8] - 2026-06-23
+
+### Fixed
+- **Multi-Bucket No-Op Commits**: `exec_multi` now skips catalog updates for touched buckets whose existing root did not change, avoiding unnecessary sequence bumps and snapshot churn.
+- **Empty Bucket Creation**: `exec_multi` now distinguishes missing buckets from existing empty buckets, so successful touches of new empty buckets still create catalog entries while existing empty bucket no-ops remain no-op commits.
+- **C FFI Transaction Parity**: `btree_exec_multi()` now matches Rust `exec_multi` semantics for unchanged roots, new empty buckets, and existing empty bucket no-ops.
+- **Snapshot Handle Consistency**: Cloned and same-path reopened handles now use a consistent local metadata snapshot without taking writer locks from active read callbacks, avoiding clone/open self-deadlocks.
+- **Shared Cache Stability**: Same-path reopen snapshot sync no longer clears shared bucket caches when only the local handle snapshot needs to be refreshed.
+
+### Added
+- **Snapshot Regression Tests**: Added regression coverage for multi-bucket no-op commits, empty bucket catalog creation, callback-safe clone/open paths.
+
+## [0.1.7] - 2026-05-12
 
 ### Added
 - **MSRV Declaration**: Added an explicit Minimum Supported Rust Version (MSRV) of `1.95` via `Cargo.toml` (`rust-version = "1.95"`).

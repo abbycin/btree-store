@@ -83,7 +83,9 @@ fn test_reopen_after_commit_allows_empty_commit() {
     let handle_b = BTree::open(&db_path).unwrap();
 
     // Reopened handle must align to latest snapshot; empty commit should be a no-op.
-    handle_b.commit().expect("empty commit on reopened handle should succeed");
+    handle_b
+        .commit()
+        .expect("empty commit on reopened handle should succeed");
 
     handle_b
         .view("reuse", |txn| {

@@ -28,7 +28,7 @@ struct LastError {
 }
 
 thread_local! {
-    static LAST_ERROR: RefCell<LastError> = RefCell::new(LastError { code: 0, msg: None });
+    static LAST_ERROR: RefCell<LastError> = const { RefCell::new(LastError { code: 0, msg: None }) };
 }
 
 fn map_error(err: Error) -> c_int {
@@ -103,6 +103,8 @@ pub struct Txn {
 }
 
 struct FfiBucket {
+    initial_exists: bool,
+    initial_root: PageId,
     tree: Box<Tree>,
     handle: Box<Txn>,
 }
@@ -121,9 +123,9 @@ impl MultiTxn {
 
         let btree = unsafe { &*self.btree };
         let name_bytes = name.as_bytes();
-        let initial_root = match btree.catalog_tree.get(name_bytes) {
-            Ok(bytes) => BucketMetadata::from_slice(&bytes).root_page_id,
-            Err(Error::NotFound) => 0,
+        let (initial_exists, initial_root) = match btree.catalog_tree.get(name_bytes) {
+            Ok(bytes) => (true, BucketMetadata::from_slice(&bytes).root_page_id),
+            Err(Error::NotFound) => (false, 0),
             Err(e) => return Err(e),
         };
 
@@ -140,8 +142,15 @@ impl MultiTxn {
             kind: TxnKind::Write(tree.as_ref() as *const Tree),
         });
 
-        self.buckets
-            .insert(name.to_string(), FfiBucket { tree, handle });
+        self.buckets.insert(
+            name.to_string(),
+            FfiBucket {
+                initial_exists,
+                initial_root,
+                tree,
+                handle,
+            },
+        );
         Ok(self.buckets.get_mut(name).unwrap())
     }
 }
@@ -338,6 +347,9 @@ pub extern "C" fn btree_exec_multi(
     let mut updated = Vec::new();
     for (name, bucket) in mtxn.buckets.iter() {
         let new_root = *bucket.tree.root_page_id.read();
+        if bucket.initial_exists && new_root == bucket.initial_root {
+            continue;
+        }
         let metadata = BucketMetadata {
             root_page_id: new_root,
         };
@@ -526,17 +538,17 @@ pub extern "C" fn btree_last_error(msg: *mut *const c_char, len: *mut usize) -> 
                 *len = 0;
             }
         }
-        if state.code != 0 {
-            if let Some(ref cmsg) = state.msg {
-                if !msg.is_null() {
-                    unsafe {
-                        *msg = cmsg.as_ptr();
-                    }
+        if state.code != 0
+            && let Some(ref cmsg) = state.msg
+        {
+            if !msg.is_null() {
+                unsafe {
+                    *msg = cmsg.as_ptr();
                 }
-                if !len.is_null() {
-                    unsafe {
-                        *len = cmsg.as_bytes().len();
-                    }
+            }
+            if !len.is_null() {
+                unsafe {
+                    *len = cmsg.as_bytes().len();
                 }
             }
         }

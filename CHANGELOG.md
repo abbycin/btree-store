@@ -7,12 +7,16 @@ All notable changes to the **btree_store** project will be documented in this fi
 ### Fixed
 - **Multi-Bucket No-Op Commits**: `exec_multi` now skips catalog updates for touched buckets whose existing root did not change, avoiding unnecessary sequence bumps and snapshot churn.
 - **Empty Bucket Creation**: `exec_multi` now distinguishes missing buckets from existing empty buckets, so successful touches of new empty buckets still create catalog entries while existing empty bucket no-ops remain no-op commits.
-- **C FFI Transaction Parity**: `btree_exec_multi()` now matches Rust `exec_multi` semantics for unchanged roots, new empty buckets, and existing empty bucket no-ops.
+- **Single-Bucket Empty Bucket No-Op Commits**: `exec` now skips catalog updates when an existing empty bucket's root did not change, avoiding unnecessary sequence bumps and the empty-bucket catalog churn that could surface after repeated `compact` and `reopen` sequences.
 - **Snapshot Handle Consistency**: Cloned and same-path reopened handles now use a consistent local metadata snapshot without taking writer locks from active read callbacks, avoiding clone/open self-deadlocks.
 - **Shared Cache Stability**: Same-path reopen snapshot sync no longer clears shared bucket caches when only the local handle snapshot needs to be refreshed.
+- **Freelist Retirement Across Reopen**: Repeated `compact` + `reopen` cycles now retire only freelist pages that actually left the active freelist, preventing live freelist pages from being reclaimed and later reused as catalog data.
+- **Compaction Tail Relocation Walk**: Tail-page compaction now snapshots reverse-index candidates before relocating them, avoiding reverse-tree mutation while iterating the candidate range.
 
 ### Added
-- **Snapshot Regression Tests**: Added regression coverage for multi-bucket no-op commits, empty bucket catalog creation, callback-safe clone/open paths.
+- **Fuzz Tests**: add cargo-fuzz state-machine targets for kv, multi-bucket, reopen+compact, bucket lifecycle, and concurrent snapshot scenarios
+
+
 
 ## [0.1.7] - 2026-05-12
 

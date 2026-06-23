@@ -2,9 +2,9 @@ name: Cross-platform CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
   pull_request:
-    branches: [ master ]
+    branches: [master]
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,8 +29,8 @@ jobs:
             arch: arm64
 
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v5
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -39,7 +39,7 @@ jobs:
 
       - name: Run Tests
         run: cargo test --verbose -- --nocapture
-      
+
       - name: Build FFI (release)
         run: cargo build --features ffi --release
         env:
@@ -81,8 +81,8 @@ jobs:
     name: FreeBSD (x86_64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v5
+
       - name: Run tests in FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
@@ -102,8 +102,8 @@ jobs:
     name: Linux (ARM64 cross-compile)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v5
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -114,7 +114,7 @@ jobs:
 
       - name: Build for ARM64
         run: cross build --target aarch64-unknown-linux-gnu --features ffi --verbose
-      
+
       # Note: Running tests for ARM64 on x86_64 requires QEMU via cross.
       # If you want to actually run the tests:
       - name: Run tests for ARM64

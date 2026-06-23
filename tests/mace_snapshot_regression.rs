@@ -101,6 +101,24 @@ fn exec_multi_existing_empty_bucket_noop_does_not_commit_catalog() {
 }
 
 #[test]
+fn exec_existing_empty_bucket_noop_does_not_commit_catalog() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("existing_empty_bucket_single_noop.db");
+    let tree = BTree::open(&db_path).unwrap();
+
+    tree.exec("empty_bucket", |_| Ok(())).unwrap();
+
+    let before = tree.current_seq();
+    tree.exec("empty_bucket", |_| Ok(())).unwrap();
+    let after = tree.current_seq();
+
+    assert_eq!(
+        after, before,
+        "a successful exec no-op on an existing empty bucket should not rewrite catalog"
+    );
+}
+
+#[test]
 fn clone_during_inflight_writer_uses_consistent_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("clone_writer_snapshot_boundary.db");

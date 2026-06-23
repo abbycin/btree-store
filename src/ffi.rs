@@ -1,7 +1,7 @@
 #![cfg(feature = "ffi")]
 
 use crate::page_store::PageStore;
-use crate::{BTree, BucketMetadata, Error, PageId, ReadOnlyTree, Tree};
+use crate::{BTree, BucketMetadata, Error, PageId, ReadOnlyTree, Tree, validate_bucket_name};
 use parking_lot::RwLock;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -117,6 +117,8 @@ pub struct MultiTxn {
 
 impl MultiTxn {
     fn get_or_open_bucket(&mut self, name: &str) -> crate::Result<&mut FfiBucket> {
+        validate_bucket_name(name)?;
+
         if self.buckets.contains_key(name) {
             return Ok(self.buckets.get_mut(name).unwrap());
         }

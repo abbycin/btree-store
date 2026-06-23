@@ -185,6 +185,20 @@ use crate::{
     store::{MetaSnapshot, Store},
 };
 
+fn validate_user_key(key: &[u8]) -> Result<()> {
+    if key.is_empty() {
+        return Err(Error::Invalid);
+    }
+    if key.len() > MAX_KEY_LEN {
+        return Err(Error::TooLarge);
+    }
+    Ok(())
+}
+
+fn validate_bucket_name(bucket: &str) -> Result<()> {
+    validate_user_key(bucket.as_bytes())
+}
+
 struct Route {
     node: Arc<Node>,
     page_id: PageId,
@@ -323,9 +337,7 @@ impl Tree {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if key.len() > MAX_KEY_LEN {
-            return Err(Error::TooLarge);
-        }
+        validate_user_key(key)?;
         // use local buffers to reduce lock contention and keep partial changes local until success
         let mut freed = Vec::new();
         let mut alloc = HashSet::new();
@@ -449,6 +461,8 @@ impl Tree {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+        validate_user_key(key)?;
+
         let root_id = *self.root_page_id.read();
         if root_id == 0 {
             return Err(Error::NotFound);
@@ -466,6 +480,8 @@ impl Tree {
     }
 
     pub fn del(&self, key: &[u8]) -> Result<()> {
+        validate_user_key(key)?;
+
         // use local buffers to reduce lock contention and keep partial changes local until success
         let mut freed = Vec::new();
         let mut alloc = HashSet::new();
@@ -784,6 +800,8 @@ impl ReadOnlyTree {
     }
 
     fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+        validate_user_key(key)?;
+
         if self.root_page_id == 0 {
             return Err(Error::NotFound);
         }
@@ -838,6 +856,8 @@ impl<'a> MultiTxn<'a> {
     where
         F: FnOnce(&mut Txn) -> Result<R>,
     {
+        validate_bucket_name(bucket)?;
+
         let name_bytes = bucket.as_bytes();
 
         let root = if let Some(root) = self.bucket_roots.get(bucket) {
@@ -1066,6 +1086,8 @@ impl BTree {
     where
         F: FnOnce(&mut Txn) -> Result<R>,
     {
+        validate_bucket_name(bucket)?;
+
         let _lock = self.writer_lock.write();
 
         // Auto-refresh to the latest disk state before starting a new transaction.
@@ -1074,9 +1096,9 @@ impl BTree {
 
         // Check if there's an existing bucket
         let name_bytes = bucket.as_bytes();
-        let initial_root = match self.catalog_tree.get(name_bytes) {
-            Ok(bytes) => BucketMetadata::from_slice(&bytes).root_page_id,
-            Err(Error::NotFound) => 0,
+        let (initial_exists, initial_root) = match self.catalog_tree.get(name_bytes) {
+            Ok(bytes) => (true, BucketMetadata::from_slice(&bytes).root_page_id),
+            Err(Error::NotFound) => (false, 0),
             Err(e) => return Err(e),
         };
 
@@ -1103,10 +1125,12 @@ impl BTree {
         match f(&mut txn) {
             Ok(res) => {
                 let new_root = *txn.tree.root_page_id.read();
-                let metadata = BucketMetadata {
-                    root_page_id: new_root,
-                };
-                self.catalog_tree.put(name_bytes, metadata.as_slice())?;
+                if !initial_exists || initial_root != new_root {
+                    let metadata = BucketMetadata {
+                        root_page_id: new_root,
+                    };
+                    self.catalog_tree.put(name_bytes, metadata.as_slice())?;
+                }
                 if let Err(e) = self.commit_internal() {
                     // Rollback catalog and pages on commit failure (e.g. Conflict)
                     *self.catalog_tree.root_page_id.write() = pre_catalog_root;
@@ -1309,6 +1333,8 @@ impl BTree {
     where
         F: FnOnce(&ReadOnlyTxn) -> Result<R>,
     {
+        validate_bucket_name(bucket)?;
+
         let lock = self.writer_lock.read();
 
         // For view, we also want the freshest data.
@@ -1390,12 +1416,15 @@ impl BTree {
     where
         N: AsRef<str>,
     {
+        let name = name.as_ref();
+        validate_bucket_name(name)?;
+
         let _lock = self.writer_lock.write();
 
         // ensure we are operating on the latest state
         self.refresh_internal()?;
 
-        let name_bytes = name.as_ref().as_bytes();
+        let name_bytes = name.as_bytes();
         let metadata_bytes = self.catalog_tree.get(name_bytes)?;
         let bucket_metadata = BucketMetadata::from_slice(&metadata_bytes);
 
@@ -1498,14 +1527,10 @@ impl BTree {
         target_pages_u64: u64,
         prealloc: Option<&[PageId]>,
     ) -> Result<(u64, u64, usize)> {
-        let mut moved = 0u64;
-        let mut total_candidates = 0u64;
-        let mut prealloc_idx = 0usize;
+        let mut candidates = Vec::new();
         let mut iter = self.reverse_tree.iterator_from(&encode_u32_key(tail_start));
         let mut key_buf = Vec::new();
         let mut val_buf = Vec::new();
-        let physical_store: &dyn PageStore = self.store.as_ref();
-
         while iter.next_ref(&mut key_buf, &mut val_buf) {
             let pid = decode_u32_key(&key_buf)?;
             if pid < tail_start {
@@ -1515,11 +1540,17 @@ impl BTree {
                 break;
             }
             let lid = decode_u32_key(&val_buf)?;
-            total_candidates += 1;
-            if moved >= target_pages_u64 {
-                continue;
+            candidates.push((pid, lid));
+            if candidates.len() as u64 >= target_pages_u64 {
+                break;
             }
+        }
 
+        let mut moved = 0u64;
+        let mut prealloc_idx = 0usize;
+        let physical_store: &dyn PageStore = self.store.as_ref();
+
+        for (pid, lid) in candidates {
             let new_pid = if let Some(pids) = prealloc {
                 if prealloc_idx >= pids.len() {
                     return Err(Error::Internal);
@@ -1551,7 +1582,7 @@ impl BTree {
             moved += 1;
         }
 
-        Ok((moved, total_candidates, prealloc_idx))
+        Ok((moved, moved, prealloc_idx))
     }
 
     fn compact_tail_live_pages(&self, total_pages: PageId, tail_start: PageId) -> Result<u64> {

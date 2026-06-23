@@ -241,6 +241,97 @@ fn test_empty_tree_operations() {
 }
 
 #[test]
+fn test_bucket_name_must_be_non_empty() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_empty_bucket_name_invalid.db");
+    let tree = BTree::open(&db_path).unwrap();
+
+    assert_eq!(tree.exec("", |_| Ok(())).unwrap_err(), Error::Invalid);
+    assert_eq!(tree.view("", |_| Ok(())).unwrap_err(), Error::Invalid);
+    assert_eq!(tree.del_bucket("").unwrap_err(), Error::Invalid);
+    assert_eq!(
+        tree.exec_multi(|multi| multi.exec("", |_| Ok(())))
+            .unwrap_err(),
+        Error::Invalid
+    );
+    assert!(
+        tree.buckets().unwrap().is_empty(),
+        "rejected empty bucket names must not create catalog entries"
+    );
+}
+
+#[test]
+fn test_bucket_name_must_not_exceed_key_limit() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_large_bucket_name_invalid.db");
+    let tree = BTree::open(&db_path).unwrap();
+    let bucket = "x".repeat(33);
+
+    assert_eq!(tree.exec(&bucket, |_| Ok(())).unwrap_err(), Error::TooLarge);
+    assert_eq!(tree.view(&bucket, |_| Ok(())).unwrap_err(), Error::TooLarge);
+    assert_eq!(tree.del_bucket(&bucket).unwrap_err(), Error::TooLarge);
+    assert_eq!(
+        tree.exec_multi(|multi| multi.exec(&bucket, |_| Ok(())))
+            .unwrap_err(),
+        Error::TooLarge
+    );
+    assert!(
+        tree.buckets().unwrap().is_empty(),
+        "rejected overlong bucket names must not create catalog entries"
+    );
+}
+
+#[test]
+fn test_user_key_contract_is_enforced_without_mutating_bucket() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_user_key_invalid.db");
+    let tree = BTree::open(&db_path).unwrap();
+    let too_large_key = vec![b'k'; 33];
+
+    assert_eq!(
+        tree.exec("bucket", |txn| txn.put(b"", b"value"))
+            .unwrap_err(),
+        Error::Invalid
+    );
+    assert!(
+        tree.buckets().unwrap().is_empty(),
+        "a failed empty-key write must not create a bucket"
+    );
+
+    tree.exec("bucket", |txn| txn.put(b"valid", b"value"))
+        .unwrap();
+
+    assert_eq!(
+        tree.view("bucket", |txn| txn.get(b"")).unwrap_err(),
+        Error::Invalid
+    );
+    assert_eq!(
+        tree.exec("bucket", |txn| txn.del(b"")).unwrap_err(),
+        Error::Invalid
+    );
+    assert_eq!(
+        tree.exec("bucket", |txn| txn.put(&too_large_key, b"value"))
+            .unwrap_err(),
+        Error::TooLarge
+    );
+    assert_eq!(
+        tree.view("bucket", |txn| txn.get(&too_large_key))
+            .unwrap_err(),
+        Error::TooLarge
+    );
+    assert_eq!(
+        tree.exec("bucket", |txn| txn.del(&too_large_key))
+            .unwrap_err(),
+        Error::TooLarge
+    );
+    tree.view("bucket", |txn| {
+        assert_eq!(txn.get(b"valid").unwrap(), b"value".to_vec());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn test_large_values() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_large_values.db");

@@ -1,0 +1,54 @@
+[package]
+name = "btree-store-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+tempfile = "3"
+
+[dependencies.btree-store]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "kv_model"
+path = "fuzz_targets/kv_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multi_bucket_model"
+path = "fuzz_targets/multi_bucket_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reopen_compact_model"
+path = "fuzz_targets/reopen_compact_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bucket_lifecycle"
+path = "fuzz_targets/bucket_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "concurrent_snapshot_model"
+path = "fuzz_targets/concurrent_snapshot_model.rs"
+test = false
+doc = false
+bench = false

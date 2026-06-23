@@ -94,3 +94,51 @@ fn test_reopen_after_commit_allows_empty_commit() {
         })
         .unwrap();
 }
+
+#[test]
+fn test_same_path_open_is_instance_reuse_not_true_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("reuse_vs_reopen.db");
+
+    let handle_a = Arc::new(BTree::open(&db_path).unwrap());
+    handle_a
+        .exec("reuse", |txn| {
+            txn.put(b"k0", b"v0")?;
+            Ok(())
+        })
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let reader = {
+        let handle = handle_a.clone();
+        let barrier = barrier.clone();
+        thread::spawn(move || {
+            handle
+                .view("reuse", |txn| {
+                    assert_eq!(txn.get(b"k0").unwrap(), b"v0".to_vec());
+                    barrier.wait();
+                    thread::sleep(Duration::from_millis(500));
+                    Ok(())
+                })
+                .unwrap();
+        })
+    };
+
+    barrier.wait();
+    let reopened = BTree::open(&db_path).unwrap();
+    let start = Instant::now();
+    reopened
+        .exec("reuse", |txn| {
+            txn.put(b"k1", b"v1")?;
+            Ok(())
+        })
+        .unwrap();
+    let blocked = start.elapsed();
+
+    reader.join().unwrap();
+    assert!(
+        blocked > Duration::from_millis(200),
+        "same-path open should reuse the live instance instead of performing a true reopen; actual: {:?}",
+        blocked
+    );
+}

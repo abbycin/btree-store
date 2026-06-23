@@ -83,7 +83,7 @@ void btree_close(BTree *db);
 int btree_exec(BTree *db, const char *bucket, int (*fn)(Txn *txn, void *ctx), void *ctx);
 ```
 - db: database handle
-- bucket: utf-8 bucket name
+- bucket: utf-8 bucket name, encoded length must be 1..=32 bytes
 - fn: callback invoked within a write transaction
 - ctx: user context pointer passed to fn
 - returns: callback rc on non-zero, or error code on internal failure
@@ -93,7 +93,7 @@ int btree_exec(BTree *db, const char *bucket, int (*fn)(Txn *txn, void *ctx), vo
 int btree_view(BTree *db, const char *bucket, int (*fn)(Txn *txn, void *ctx), void *ctx);
 ```
 - db: database handle
-- bucket: utf-8 bucket name
+- bucket: utf-8 bucket name, encoded length must be 1..=32 bytes
 - fn: callback invoked within a read transaction
 - ctx: user context pointer passed to fn
 - returns: callback rc on non-zero, or error code on internal failure
@@ -111,7 +111,7 @@ int btree_exec_multi(BTree *db, int (*fn)(MultiTxn *mtxn, void *ctx), void *ctx)
 int mtxn_bucket(MultiTxn *mtxn, const char *bucket, Txn **out);
 ```
 - mtxn: handle provided to btree_exec_multi callback
-- bucket: utf-8 bucket name
+- bucket: utf-8 bucket name, encoded length must be 1..=32 bytes
 - out: output txn handle for the bucket
 - returns: 0 on success, non-zero on error
 - note: out handle valid only during the callback
@@ -120,7 +120,7 @@ int mtxn_bucket(MultiTxn *mtxn, const char *bucket, Txn **out);
 int txn_get(Txn *txn, const uint8_t *key, size_t klen, uint8_t **out, size_t *out_len);
 ```
 - txn: transaction handle
-- key/klen: key bytes
+- key/klen: key bytes, length must be 1..=32 bytes
 - out/out_len: output buffer and length, valid on success
 - returns: 0 on success, non-zero on error
 - note: caller must free out with btree_free
@@ -129,7 +129,7 @@ int txn_get(Txn *txn, const uint8_t *key, size_t klen, uint8_t **out, size_t *ou
 int txn_put(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen);
 ```
 - txn: transaction handle
-- key/klen: key bytes
+- key/klen: key bytes, length must be 1..=32 bytes
 - val/vlen: value bytes
 - returns: 0 on success, non-zero on error
 - note: invalid in read-only view
@@ -138,7 +138,7 @@ int txn_put(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_
 int txn_del(Txn *txn, const uint8_t *key, size_t klen);
 ```
 - txn: transaction handle
-- key/klen: key bytes
+- key/klen: key bytes, length must be 1..=32 bytes
 - returns: 0 on success, non-zero on error
 - note: invalid in read-only view
 
@@ -177,6 +177,7 @@ void btree_last_error_clear(void);
 
 ## API Contract
 - callback must not call `exec`/`view`
+- keys and bucket names are invalid when empty or longer than 32 bytes
 - `Txn` and `MultiTxn` handles are valid only during the callback
 - `longjmp` across ffi is unsafe
 - panics are not caught; build with `panic=abort`

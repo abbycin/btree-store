@@ -205,6 +205,22 @@ fn get_shared_meta(path: &Path, sb: &MetaNode) -> Arc<SharedMeta> {
     map.insert(key, Arc::downgrade(&shared));
     shared
 }
+
+fn retired_freelist_pages(previous: Vec<PageId>, current: &[PageId]) -> Vec<PageId> {
+    if previous.is_empty() {
+        return Vec::new();
+    }
+    if current.is_empty() {
+        return previous;
+    }
+
+    let current_pages: HashSet<PageId> = current.iter().copied().collect();
+    previous
+        .into_iter()
+        .filter(|pid| !current_pages.contains(pid))
+        .collect()
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FreeListHeader {
@@ -460,7 +476,8 @@ impl Store {
         if let Some(stale) = stale_sb
             && let Ok((_, pages)) = store.read_freelist_from_disk(stale.freelist_root)
         {
-            *store.freelist_pages_stale.lock() = pages;
+            let current_pages = store.freelist_pages.lock().clone();
+            *store.freelist_pages_stale.lock() = retired_freelist_pages(pages, &current_pages);
         }
         Ok(store)
     }
@@ -835,7 +852,8 @@ impl Store {
         self.file.pwrite_all(&sb.as_page_slice(), write_offset)?;
         self.shared.update(sb.catalog_root, sb.seq);
 
-        *freelist_pages_stale = std::mem::take(&mut *freelist_pages);
+        let previous_pages = std::mem::take(&mut *freelist_pages);
+        *freelist_pages_stale = retired_freelist_pages(previous_pages, &new_pages);
         *freelist_pages = new_pages;
         Ok(())
     }
@@ -1195,7 +1213,8 @@ impl Store {
                 *free_guard = freelist;
                 let mut pages_guard = self.freelist_pages.lock();
                 let mut stale_guard = self.freelist_pages_stale.lock();
-                *stale_guard = std::mem::take(&mut *pages_guard);
+                let previous_pages = std::mem::take(&mut *pages_guard);
+                *stale_guard = retired_freelist_pages(previous_pages, &freelist_pages);
                 *pages_guard = freelist_pages;
                 let mut stale_free = self.freelist_stale.lock();
                 stale_free.clear();

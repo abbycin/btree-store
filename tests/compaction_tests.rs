@@ -208,3 +208,157 @@ fn test_default_compaction_skips_when_low_address_budget_is_insufficient() {
     assert!(stats.remaining_candidates > 0);
     assert_eq!(size_after, size_before);
 }
+
+#[test]
+fn test_compaction_preserves_empty_bucket_catalog_across_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("test_compaction_empty_bucket_catalog.db");
+
+    let tree = BTree::open(&db_path).expect("open btree failed");
+
+    tree.exec("zz", |_| Ok(()))
+        .expect("first touch of empty bucket failed");
+    assert_eq!(tree.buckets().unwrap(), vec!["zz".to_string()]);
+
+    tree.exec("zz", |_| Ok(()))
+        .expect("second touch of empty bucket failed");
+    assert_eq!(
+        tree.buckets().unwrap(),
+        vec!["zz".to_string()],
+        "re-touching an existing empty bucket must not lose it"
+    );
+
+    tree.compact(u64::MAX).expect("first compact failed");
+    assert_eq!(
+        tree.buckets().unwrap(),
+        vec!["zz".to_string()],
+        "first compact must preserve empty bucket catalog entry"
+    );
+
+    drop(tree);
+
+    let reopened = BTree::open(&db_path).expect("reopen btree failed");
+    assert_eq!(
+        reopened.buckets().unwrap(),
+        vec!["zz".to_string()],
+        "reopen must preserve empty bucket catalog entry"
+    );
+
+    reopened.compact(u64::MAX).expect("second compact failed");
+    assert_eq!(
+        reopened.buckets().unwrap(),
+        vec!["zz".to_string()],
+        "second compact must preserve empty bucket catalog entry"
+    );
+
+    reopened.compact(u64::MAX).expect("third compact failed");
+    assert_eq!(
+        reopened.buckets().unwrap(),
+        vec!["zz".to_string()],
+        "repeated compact must preserve empty bucket catalog entry"
+    );
+
+    reopened
+        .exec("empty", |_| Ok(()))
+        .expect("touch empty bucket failed");
+    let mut buckets = reopened.buckets().unwrap();
+    buckets.sort();
+    assert_eq!(
+        buckets,
+        vec!["empty".to_string(), "zz".to_string()],
+        "touching another empty bucket must not lose zz"
+    );
+
+    reopened
+        .exec("b", |_| Ok(()))
+        .expect("touch b bucket failed");
+
+    let mut buckets = reopened.buckets().unwrap();
+    buckets.sort();
+    assert_eq!(
+        buckets,
+        vec!["b".to_string(), "empty".to_string(), "zz".to_string()],
+        "later bucket creation must not lose the original empty bucket"
+    );
+}
+
+#[test]
+fn test_compaction_preserves_multiple_empty_buckets_across_repeated_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("test_compaction_multiple_empty_buckets.db");
+
+    let tree = BTree::open(&db_path).expect("open btree failed");
+
+    tree.exec("empty", |_| Ok(()))
+        .expect("touch empty bucket failed");
+    assert_eq!(
+        sorted_buckets(&tree),
+        vec!["empty".to_string()],
+        "first empty bucket must be visible immediately"
+    );
+
+    tree.exec("zz", |_| Ok(())).expect("touch zz bucket failed");
+    assert_eq!(
+        sorted_buckets(&tree),
+        vec!["empty".to_string(), "zz".to_string()],
+        "second empty bucket must be visible immediately"
+    );
+
+    tree.compact(u64::MAX).expect("first compact failed");
+    assert_eq!(
+        sorted_buckets(&tree),
+        vec!["empty".to_string(), "zz".to_string()],
+        "first full compact must preserve both empty buckets"
+    );
+
+    drop(tree);
+
+    let reopened = BTree::open(&db_path).expect("first reopen failed");
+    assert_eq!(
+        sorted_buckets(&reopened),
+        vec!["empty".to_string(), "zz".to_string()],
+        "first reopen must preserve both empty buckets"
+    );
+
+    reopened.compact(u64::MAX).expect("second compact failed");
+    assert_eq!(
+        sorted_buckets(&reopened),
+        vec!["empty".to_string(), "zz".to_string()],
+        "second full compact must preserve both empty buckets"
+    );
+
+    reopened.compact(u64::MAX).expect("third compact failed");
+    assert_eq!(
+        sorted_buckets(&reopened),
+        vec!["empty".to_string(), "zz".to_string()],
+        "third full compact must preserve both empty buckets"
+    );
+
+    drop(reopened);
+
+    let reopened = BTree::open(&db_path).expect("second reopen failed");
+    assert_eq!(
+        sorted_buckets(&reopened),
+        vec!["empty".to_string(), "zz".to_string()],
+        "second reopen must preserve both empty buckets"
+    );
+
+    drop(reopened);
+
+    let reopened = BTree::open(&db_path).expect("third reopen failed");
+    assert_eq!(
+        sorted_buckets(&reopened),
+        vec!["empty".to_string(), "zz".to_string()],
+        "third reopen must preserve both empty buckets"
+    );
+}
+
+fn sorted_buckets(tree: &BTree) -> Vec<String> {
+    let mut buckets = tree.buckets().expect("list buckets failed");
+    buckets.sort();
+    buckets
+}

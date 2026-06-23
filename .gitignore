@@ -6,3 +6,6 @@ Cargo.lock
 !benchmark.md
 !README.md
 !CHANGELOG.md
+!fuzz/README.md
+ffi
+*.db

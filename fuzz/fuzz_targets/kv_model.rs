@@ -25,6 +25,7 @@ impl<'a> Arbitrary<'a> for KvCase {
 #[derive(Clone, Debug)]
 enum KvOp {
     Put(Key, Value),
+    Update(Key, Value),
     Del(Key),
     Get(Key),
     Touch,
@@ -37,15 +38,16 @@ enum KvOp {
 
 impl<'a> Arbitrary<'a> for KvOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=8u8)? {
+        match u.int_in_range(0..=9u8)? {
             0 => Ok(Self::Put(Key::arbitrary(u)?, Value::arbitrary(u)?)),
-            1 => Ok(Self::Del(Key::arbitrary(u)?)),
-            2 => Ok(Self::Get(Key::arbitrary(u)?)),
-            3 => Ok(Self::Touch),
-            4 => Ok(Self::Observe(Key::arbitrary(u)?)),
-            5 => Ok(Self::AbortPut(Key::arbitrary(u)?, Value::arbitrary(u)?)),
-            6 => Ok(Self::AbortDel(Key::arbitrary(u)?)),
-            7 => Ok(Self::Reopen),
+            1 => Ok(Self::Update(Key::arbitrary(u)?, Value::arbitrary(u)?)),
+            2 => Ok(Self::Del(Key::arbitrary(u)?)),
+            3 => Ok(Self::Get(Key::arbitrary(u)?)),
+            4 => Ok(Self::Touch),
+            5 => Ok(Self::Observe(Key::arbitrary(u)?)),
+            6 => Ok(Self::AbortPut(Key::arbitrary(u)?, Value::arbitrary(u)?)),
+            7 => Ok(Self::AbortDel(Key::arbitrary(u)?)),
+            8 => Ok(Self::Reopen),
             _ => Ok(Self::Validate),
         }
     }
@@ -56,6 +58,7 @@ fuzz_target!(|case: KvCase| {
     for op in case.ops {
         match op {
             KvOp::Put(key, value) => harness.exec_put(KV_BUCKET, &key, &value),
+            KvOp::Update(key, value) => harness.exec_update(KV_BUCKET, &key, &value),
             KvOp::Del(key) => harness.exec_del(KV_BUCKET, &key),
             KvOp::Get(key) => harness.exec_get(KV_BUCKET, &key),
             KvOp::Touch => harness.exec_touch(KV_BUCKET),

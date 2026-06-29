@@ -60,6 +60,7 @@ impl<'a> Arbitrary<'a> for Value {
 #[derive(Clone, Debug)]
 pub enum MultiStep {
     Put(Bucket, Key, Value),
+    Update(Bucket, Key, Value),
     Del(Bucket, Key),
     Get(Bucket, Key),
     Observe(Bucket, Key),
@@ -68,15 +69,20 @@ pub enum MultiStep {
 
 impl<'a> Arbitrary<'a> for MultiStep {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=4u8)? {
+        match u.int_in_range(0..=5u8)? {
             0 => Ok(Self::Put(
                 Bucket::arbitrary(u)?,
                 Key::arbitrary(u)?,
                 Value::arbitrary(u)?,
             )),
-            1 => Ok(Self::Del(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
-            2 => Ok(Self::Get(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
-            3 => Ok(Self::Observe(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
+            1 => Ok(Self::Update(
+                Bucket::arbitrary(u)?,
+                Key::arbitrary(u)?,
+                Value::arbitrary(u)?,
+            )),
+            2 => Ok(Self::Del(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
+            3 => Ok(Self::Get(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
+            4 => Ok(Self::Observe(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
             _ => Ok(Self::Touch(Bucket::arbitrary(u)?)),
         }
     }
@@ -90,6 +96,11 @@ struct Model {
 impl Model {
     fn touch_bucket(&mut self, bucket: &str) {
         self.buckets.entry(bucket.to_string()).or_default();
+    }
+
+    fn update_in_txn(&mut self, bucket: &str, key: &[u8], value: &[u8]) -> bool {
+        self.touch_bucket(bucket);
+        self.update(bucket, key, value)
     }
 
     fn put(&mut self, bucket: &str, key: Vec<u8>, value: Vec<u8>) {
@@ -114,6 +125,17 @@ impl Model {
         } else {
             Err(Error::NotFound)
         }
+    }
+
+    fn update(&mut self, bucket: &str, key: &[u8], value: &[u8]) -> bool {
+        let Some(entries) = self.buckets.get_mut(bucket) else {
+            return false;
+        };
+        let Some(current) = entries.get_mut(key) else {
+            return false;
+        };
+        *current = value.to_vec();
+        true
     }
 
     fn del_bucket(&mut self, bucket: &str) -> DbResult<()> {
@@ -201,6 +223,18 @@ impl Harness {
                 expect_db_err(actual, expected_err, "exec del missing key");
             }
         }
+        self.validate();
+    }
+
+    pub fn exec_update(&mut self, bucket: Bucket, key: &Key, value: &Value) {
+        let mut next_model = self.model.clone();
+        let expected = next_model.update_in_txn(bucket.as_str(), &key.0, &value.0);
+        let actual = self
+            .db()
+            .exec(bucket.as_str(), |txn| txn.update(&key.0, &value.0));
+        let actual_updated = expect_db_ok(actual, "exec update");
+        assert_eq!(actual_updated, expected, "exec update result mismatch");
+        self.model = next_model;
         self.validate();
     }
 
@@ -389,6 +423,10 @@ fn apply_multi_model_step(model: &mut Model, step: &MultiStep) -> DbResult<()> {
             model.put(bucket.as_str(), key.0.clone(), value.0.clone());
             Ok(())
         }
+        MultiStep::Update(bucket, key, value) => {
+            let _ = model.update_in_txn(bucket.as_str(), &key.0, &value.0);
+            Ok(())
+        }
         MultiStep::Del(bucket, key) => model.del(bucket.as_str(), &key.0),
         MultiStep::Get(bucket, key) => model.get(bucket.as_str(), &key.0).map(|_| ()),
         MultiStep::Observe(bucket, _) | MultiStep::Touch(bucket) => {
@@ -410,6 +448,15 @@ fn apply_multi_engine_step(
                 "multi put",
             );
             model.put(bucket.as_str(), key.0.clone(), value.0.clone());
+            Ok(())
+        }
+        MultiStep::Update(bucket, key, value) => {
+            let expected = model.update_in_txn(bucket.as_str(), &key.0, &value.0);
+            let actual = expect_db_ok(
+                multi.exec(bucket.as_str(), |txn| txn.update(&key.0, &value.0)),
+                "multi update",
+            );
+            assert_eq!(actual, expected, "multi update result mismatch");
             Ok(())
         }
         MultiStep::Del(bucket, key) => {

@@ -119,6 +119,64 @@ fn exec_existing_empty_bucket_noop_does_not_commit_catalog() {
 }
 
 #[test]
+fn exec_multi_update_miss_then_touch_same_bucket_still_creates_catalog_entry() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("multi_update_miss_then_touch_same_bucket.db");
+    let tree = BTree::open(&db_path).unwrap();
+
+    tree.exec_multi(|multi| {
+        multi.exec("empty_bucket", |txn| {
+            assert!(!txn.update(interval_key(1), b"file1")?);
+            Ok(())
+        })?;
+        multi.exec("empty_bucket", |_| Ok(()))?;
+        Ok(())
+    })
+    .unwrap();
+
+    let buckets = tree.buckets().unwrap();
+    assert!(
+        buckets.iter().any(|bucket| bucket == "empty_bucket"),
+        "a later touch in the same multi transaction must still create the bucket after update(false)"
+    );
+}
+
+#[test]
+fn exec_multi_update_miss_on_missing_bucket_still_creates_catalog_entry() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("multi_update_miss_missing_bucket_materializes_bucket.db");
+    let tree = BTree::open(&db_path).unwrap();
+
+    let before = tree.current_seq();
+    tree.exec_multi(|multi| {
+        multi.exec("empty_bucket", |txn| {
+            assert!(!txn.update(interval_key(1), b"file1")?);
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .unwrap();
+    let after = tree.current_seq();
+
+    assert_eq!(
+        after,
+        before + 1,
+        "successful exec_multi update(false) on a missing bucket should still commit catalog state"
+    );
+    assert!(
+        tree.buckets()
+            .unwrap()
+            .iter()
+            .any(|bucket| bucket == "empty_bucket"),
+        "successful exec_multi update(false) on a missing bucket should materialize the empty bucket"
+    );
+}
+
+#[test]
 fn clone_during_inflight_writer_uses_consistent_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("clone_writer_snapshot_boundary.db");

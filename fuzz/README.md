@@ -8,6 +8,9 @@ and checks these invariants after successful operations:
 
 - `buckets()` matches the modeled bucket set.
 - Point reads match the model.
+- `update()` returns `false` without mutating existing key/value state when the key is missing.
+  A successful transaction may still materialize the bucket under normal `exec`/`exec_multi`
+  semantics if the bucket was previously missing.
 - Iteration returns exactly the modeled key/value pairs.
 - Failed transactions and aborted `exec_multi` calls leave the database unchanged.
 - Reopen, same-path open, clone reads, and compaction preserve the model.
@@ -23,18 +26,19 @@ without making each fuzz iteration too expensive.
 
 ## Targets
 
-- `kv_model`: single-bucket puts, deletes, reads, empty-bucket creation, aborts,
-  and reopen checks.
+- `kv_model`: single-bucket puts, updates, deletes, reads, empty-bucket
+  creation, aborts, and reopen checks.
 - `multi_bucket_model`: atomic `exec_multi` batches across buckets, including
-  repeated same-bucket steps, no-op bucket touches, missing-key aborts, and
-  explicit aborts.
-- `reopen_compact_model`: multi-bucket writes mixed with reopen, same-path open,
-  clone read validation, and `compact(0)` / `compact(u64::MAX)`.
-- `bucket_lifecycle`: bucket creation, deletion, recreation, missing-bucket
-  checks, and reopen validation.
+  repeated same-bucket steps, `update(false)` key/value no-ops, no-op bucket touches,
+  missing-key aborts, and explicit aborts.
+- `reopen_compact_model`: multi-bucket puts, updates, deletes, reopen,
+  same-path open, clone read validation, and `compact(0)` / `compact(u64::MAX)`.
+- `bucket_lifecycle`: bucket creation, updates, deletion, recreation,
+  missing-bucket checks, and reopen validation.
 - `concurrent_snapshot_model`: one-writer/many-reader races where readers use a
   stale handle, `clone()`, or same-path `open()` and must observe either the
-  full pre-commit snapshot or the full post-commit snapshot for a bucket.
+  full pre-commit snapshot or the full post-commit snapshot for a bucket, even
+  when the writer callback mixes `update(false)` key/value no-ops with real writes.
 
 ## Commands
 

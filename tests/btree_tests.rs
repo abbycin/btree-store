@@ -154,6 +154,113 @@ fn test_overwrite_existing_key() {
 }
 
 #[test]
+fn test_update_existing_key_returns_true() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_update_existing_key.db");
+
+    let tree = BTree::open(&db_path).expect("Failed to open BTree");
+
+    tree.exec("default", |txn| txn.put(b"key", b"old")).unwrap();
+
+    let updated = tree
+        .exec("default", |txn| txn.update(b"key", b"new"))
+        .expect("Failed to update existing key");
+    assert!(updated, "update should report true for an existing key");
+
+    tree.view("default", |txn| {
+        assert_eq!(txn.get(b"key").unwrap(), b"new".to_vec());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_update_missing_key_in_existing_bucket_returns_false_without_commit() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("test_update_missing_key_existing_bucket.db");
+
+    let tree = BTree::open(&db_path).expect("Failed to open BTree");
+
+    tree.exec("default", |txn| txn.put(b"present", b"value"))
+        .unwrap();
+
+    let before = tree.current_seq();
+    let updated = tree
+        .exec("default", |txn| txn.update(b"missing", b"value"))
+        .expect("Failed to run update on missing key");
+    let after = tree.current_seq();
+
+    assert!(!updated, "update should report false for a missing key");
+    assert_eq!(after, before, "missing-key update must stay a no-op");
+
+    tree.view("default", |txn| {
+        assert_eq!(txn.get(b"present").unwrap(), b"value".to_vec());
+        assert_eq!(txn.get(b"missing"), Err(Error::NotFound));
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_update_miss_then_put_in_same_txn_still_creates_bucket() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_update_miss_then_put.db");
+
+    let tree = BTree::open(&db_path).expect("Failed to open BTree");
+
+    tree.exec("default", |txn| {
+        assert!(!txn.update(b"missing", b"value")?);
+        txn.put(b"present", b"value")?;
+        Ok(())
+    })
+    .expect("Failed to create bucket after update miss");
+
+    tree.view("default", |txn| {
+        assert_eq!(txn.get(b"present").unwrap(), b"value".to_vec());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_update_missing_key_in_missing_bucket_still_creates_empty_bucket() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("test_update_missing_key_missing_bucket_materializes_bucket.db");
+
+    let tree = BTree::open(&db_path).expect("Failed to open BTree");
+
+    let before = tree.current_seq();
+    let updated = tree
+        .exec("empty_bucket", |txn| txn.update(b"missing", b"value"))
+        .expect("Failed to run update on missing bucket");
+    let after = tree.current_seq();
+
+    assert!(!updated, "update should report false for a missing key");
+    assert_eq!(
+        after,
+        before + 1,
+        "successful exec on a missing bucket follows normal commit semantics"
+    );
+    assert!(
+        tree.buckets()
+            .unwrap()
+            .iter()
+            .any(|bucket| bucket == "empty_bucket"),
+        "successful update(false) on a missing bucket should materialize the empty bucket"
+    );
+
+    tree.view("empty_bucket", |txn| {
+        assert_eq!(txn.get(b"missing"), Err(Error::NotFound));
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn test_delete_complex_scenario() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_delete_complex_scenario.db");

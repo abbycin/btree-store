@@ -23,6 +23,7 @@ impl<'a> Arbitrary<'a> for ReopenCompactCase {
 #[derive(Clone, Debug)]
 enum ReopenCompactOp {
     Put(Bucket, Key, Value),
+    Update(Bucket, Key, Value),
     Del(Bucket, Key),
     Touch(Bucket),
     Observe(Bucket, Key),
@@ -36,20 +37,25 @@ enum ReopenCompactOp {
 
 impl<'a> Arbitrary<'a> for ReopenCompactOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=9u8)? {
+        match u.int_in_range(0..=10u8)? {
             0 => Ok(Self::Put(
                 Bucket::arbitrary(u)?,
                 Key::arbitrary(u)?,
                 Value::arbitrary(u)?,
             )),
-            1 => Ok(Self::Del(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
-            2 => Ok(Self::Touch(Bucket::arbitrary(u)?)),
-            3 => Ok(Self::Observe(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
-            4 => Ok(Self::Reopen),
-            5 => Ok(Self::CompactDefault),
-            6 => Ok(Self::CompactFull),
-            7 => Ok(Self::CloneRead),
-            8 => Ok(Self::SamePathOpenRead),
+            1 => Ok(Self::Update(
+                Bucket::arbitrary(u)?,
+                Key::arbitrary(u)?,
+                Value::arbitrary(u)?,
+            )),
+            2 => Ok(Self::Del(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
+            3 => Ok(Self::Touch(Bucket::arbitrary(u)?)),
+            4 => Ok(Self::Observe(Bucket::arbitrary(u)?, Key::arbitrary(u)?)),
+            5 => Ok(Self::Reopen),
+            6 => Ok(Self::CompactDefault),
+            7 => Ok(Self::CompactFull),
+            8 => Ok(Self::CloneRead),
+            9 => Ok(Self::SamePathOpenRead),
             _ => Ok(Self::Validate),
         }
     }
@@ -60,6 +66,9 @@ fuzz_target!(|case: ReopenCompactCase| {
     for op in case.ops {
         match op {
             ReopenCompactOp::Put(bucket, key, value) => harness.exec_put(bucket, &key, &value),
+            ReopenCompactOp::Update(bucket, key, value) => {
+                harness.exec_update(bucket, &key, &value)
+            }
             ReopenCompactOp::Del(bucket, key) => harness.exec_del(bucket, &key),
             ReopenCompactOp::Touch(bucket) => harness.exec_touch(bucket),
             ReopenCompactOp::Observe(bucket, key) => harness.exec_observe(bucket, &key),

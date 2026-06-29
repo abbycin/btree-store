@@ -39,6 +39,7 @@ int mtxn_bucket(MultiTxn *mtxn, const char *bucket, Txn **out);
 
 int txn_get(Txn *txn, const uint8_t *key, size_t klen, uint8_t **out, size_t *out_len);
 int txn_put(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen);
+int txn_update(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen, int *updated);
 int txn_del(Txn *txn, const uint8_t *key, size_t klen);
 
 void btree_free(void *p, size_t len);

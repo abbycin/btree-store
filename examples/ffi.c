@@ -47,7 +47,29 @@ static int view_get(Txn *txn, void *ctx) {
     }
     if (out && out_len > 0) {
         printf("value: %.*s\n", (int)out_len, out);
+        fflush(stdout);
         btree_free(out, out_len);
+    }
+    return 0;
+}
+
+static int exec_update(Txn *txn, void *ctx) {
+    (void)ctx;
+    int updated = 0;
+    int rc = txn_update(
+        txn,
+        (const uint8_t *)"hello",
+        5,
+        (const uint8_t *)"rust",
+        4,
+        &updated
+    );
+    if (rc != 0) {
+        return rc;
+    }
+    if (!updated) {
+        fprintf(stderr, "txn_update did not update an existing key\n");
+        return BTREE_ERR_INTERNAL;
     }
     return 0;
 }
@@ -63,8 +85,8 @@ static int view_missing(Txn *txn, void *ctx) {
     size_t out_len = 0;
     int rc = txn_get(txn, (const uint8_t *)"hello", 5, &out, &out_len);
     if (rc == BTREE_ERR_NOT_FOUND) {
-        print_last_error("expected not found");
         btree_last_error_clear();
+        puts("confirmed missing key");
         return 0;
     }
     if (rc != 0) {
@@ -114,6 +136,20 @@ int main(void) {
     rc = btree_view(db, "bucket1", view_get, NULL);
     if (rc != 0) {
         print_last_error("btree_view");
+        btree_close(db);
+        return 1;
+    }
+
+    rc = btree_exec(db, "bucket1", exec_update, NULL);
+    if (rc != 0) {
+        print_last_error("btree_exec update");
+        btree_close(db);
+        return 1;
+    }
+
+    rc = btree_view(db, "bucket1", view_get, NULL);
+    if (rc != 0) {
+        print_last_error("btree_view after update");
         btree_close(db);
         return 1;
     }

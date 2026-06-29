@@ -71,15 +71,17 @@ impl<'a> Arbitrary<'a> for ConcurrentOp {
 #[derive(Clone, Debug)]
 enum SingleStep {
     Put(DataKey, Value),
+    Update(DataKey, Value),
     Del(DataKey),
     Touch,
 }
 
 impl<'a> Arbitrary<'a> for SingleStep {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=2u8)? {
+        match u.int_in_range(0..=3u8)? {
             0 => Ok(Self::Put(DataKey::arbitrary(u)?, Value::arbitrary(u)?)),
-            1 => Ok(Self::Del(DataKey::arbitrary(u)?)),
+            1 => Ok(Self::Update(DataKey::arbitrary(u)?, Value::arbitrary(u)?)),
+            2 => Ok(Self::Del(DataKey::arbitrary(u)?)),
             _ => Ok(Self::Touch),
         }
     }
@@ -88,19 +90,25 @@ impl<'a> Arbitrary<'a> for SingleStep {
 #[derive(Clone, Debug)]
 enum MultiStep {
     Put(Bucket, DataKey, Value),
+    Update(Bucket, DataKey, Value),
     Del(Bucket, DataKey),
     Touch(Bucket),
 }
 
 impl<'a> Arbitrary<'a> for MultiStep {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=2u8)? {
+        match u.int_in_range(0..=3u8)? {
             0 => Ok(Self::Put(
                 Bucket::arbitrary(u)?,
                 DataKey::arbitrary(u)?,
                 Value::arbitrary(u)?,
             )),
-            1 => Ok(Self::Del(Bucket::arbitrary(u)?, DataKey::arbitrary(u)?)),
+            1 => Ok(Self::Update(
+                Bucket::arbitrary(u)?,
+                DataKey::arbitrary(u)?,
+                Value::arbitrary(u)?,
+            )),
+            2 => Ok(Self::Del(Bucket::arbitrary(u)?, DataKey::arbitrary(u)?)),
             _ => Ok(Self::Touch(Bucket::arbitrary(u)?)),
         }
     }
@@ -169,21 +177,30 @@ impl Model {
 
     fn apply_single(&self, bucket: &str, steps: &[SingleStep]) -> DbResult<Self> {
         let mut next = self.clone();
-        {
-            let bucket_model = next.ensure_bucket(bucket);
-            for step in steps {
-                match step {
-                    SingleStep::Put(key, value) => {
-                        bucket_model.entries.insert(key.0.clone(), value.0.clone());
-                    }
-                    SingleStep::Del(key) => {
-                        if bucket_model.entries.remove(&key.0).is_none() {
-                            return Err(Error::NotFound);
-                        }
-                    }
-                    SingleStep::Touch => {}
+        let bucket_model = next.ensure_bucket(bucket);
+        let mut touched = false;
+        for step in steps {
+            match step {
+                SingleStep::Put(key, value) => {
+                    bucket_model.entries.insert(key.0.clone(), value.0.clone());
+                    touched = true;
                 }
+                SingleStep::Update(key, value) => {
+                    if let Some(current) = bucket_model.entries.get_mut(&key.0) {
+                        *current = value.0.clone();
+                        touched = true;
+                    }
+                }
+                SingleStep::Del(key) => {
+                    if bucket_model.entries.remove(&key.0).is_none() {
+                        return Err(Error::NotFound);
+                    }
+                    touched = true;
+                }
+                SingleStep::Touch => {}
             }
+        }
+        if touched {
             bucket_model.epoch = bucket_model.epoch.saturating_add(1);
         }
         Ok(next)
@@ -199,6 +216,13 @@ impl Model {
                     bucket_model.entries.insert(key.0.clone(), value.0.clone());
                     touched.insert(bucket.as_str().to_string());
                 }
+                MultiStep::Update(bucket, key, value) => {
+                    let bucket_model = next.ensure_bucket(bucket.as_str());
+                    if let Some(current) = bucket_model.entries.get_mut(&key.0) {
+                        *current = value.0.clone();
+                        touched.insert(bucket.as_str().to_string());
+                    }
+                }
                 MultiStep::Del(bucket, key) => {
                     let bucket_model = next
                         .buckets
@@ -211,7 +235,6 @@ impl Model {
                 }
                 MultiStep::Touch(bucket) => {
                     next.ensure_bucket(bucket.as_str());
-                    touched.insert(bucket.as_str().to_string());
                 }
             }
         }
@@ -331,13 +354,12 @@ impl ConcurrentHarness {
                 for step in steps {
                     apply_single_step(txn, step)?;
                 }
-                let next_epoch = expected
-                    .as_ref()
-                    .ok()
-                    .and_then(|model| model.buckets.get(bucket.as_str()))
-                    .map(|bucket_model| bucket_model.epoch)
-                    .ok_or(Error::Internal)?;
-                txn.put(EPOCH_KEY, next_epoch.to_le_bytes())
+                if let Ok(model) = expected.as_ref()
+                    && let Some(bucket_model) = model.buckets.get(bucket.as_str())
+                {
+                    txn.put(EPOCH_KEY, bucket_model.epoch.to_le_bytes())?;
+                }
+                Ok(())
             });
             match &expected {
                 Ok(_) => {
@@ -396,29 +418,23 @@ impl ConcurrentHarness {
 
             barrier.wait();
             let actual = self.db().exec_multi(|multi| {
-                let mut grouped: BTreeMap<String, Vec<&MultiStep>> = BTreeMap::new();
                 for step in steps {
-                    let bucket = match step {
-                        MultiStep::Put(bucket, _, _) => bucket.as_str(),
-                        MultiStep::Del(bucket, _) => bucket.as_str(),
-                        MultiStep::Touch(bucket) => bucket.as_str(),
-                    };
-                    grouped.entry(bucket.to_string()).or_default().push(step);
+                    multi.exec(multi_step_bucket(step), |txn| apply_multi_step(txn, step))?;
                 }
 
-                for (bucket, bucket_steps) in grouped {
-                    multi.exec(&bucket, |txn| {
-                        for step in bucket_steps {
-                            apply_multi_step(txn, step)?;
-                        }
-                        let next_epoch = expected
-                            .as_ref()
-                            .ok()
-                            .and_then(|model| model.buckets.get(bucket.as_str()))
-                            .map(|bucket_model| bucket_model.epoch)
-                            .ok_or(Error::Internal)?;
-                        txn.put(EPOCH_KEY, next_epoch.to_le_bytes())
-                    })?;
+                let expected_model = expected.as_ref().ok();
+                let buckets: BTreeSet<String> = steps
+                    .iter()
+                    .map(|step| multi_step_bucket(step).to_string())
+                    .collect();
+                for bucket in buckets {
+                    let Some(next_epoch) = expected_model
+                        .and_then(|model| model.buckets.get(bucket.as_str()))
+                        .map(|bucket_model| bucket_model.epoch)
+                    else {
+                        continue;
+                    };
+                    multi.exec(&bucket, |txn| txn.put(EPOCH_KEY, next_epoch.to_le_bytes()))?;
                 }
                 Ok(())
             });
@@ -442,6 +458,10 @@ impl ConcurrentHarness {
 fn apply_single_step(txn: &mut btree_store::Txn<'_>, step: &SingleStep) -> DbResult<()> {
     match step {
         SingleStep::Put(key, value) => txn.put(&key.0, &value.0),
+        SingleStep::Update(key, value) => {
+            txn.update(&key.0, &value.0)?;
+            Ok(())
+        }
         SingleStep::Del(key) => txn.del(&key.0),
         SingleStep::Touch => Ok(()),
     }
@@ -450,8 +470,21 @@ fn apply_single_step(txn: &mut btree_store::Txn<'_>, step: &SingleStep) -> DbRes
 fn apply_multi_step(txn: &mut btree_store::Txn<'_>, step: &MultiStep) -> DbResult<()> {
     match step {
         MultiStep::Put(_, key, value) => txn.put(&key.0, &value.0),
+        MultiStep::Update(_, key, value) => {
+            txn.update(&key.0, &value.0)?;
+            Ok(())
+        }
         MultiStep::Del(_, key) => txn.del(&key.0),
         MultiStep::Touch(_) => Ok(()),
+    }
+}
+
+fn multi_step_bucket(step: &MultiStep) -> &str {
+    match step {
+        MultiStep::Put(bucket, _, _) => bucket.as_str(),
+        MultiStep::Update(bucket, _, _) => bucket.as_str(),
+        MultiStep::Del(bucket, _) => bucket.as_str(),
+        MultiStep::Touch(bucket) => bucket.as_str(),
     }
 }
 

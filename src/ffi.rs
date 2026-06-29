@@ -92,8 +92,13 @@ fn bytes_from_raw<'a>(ptr: *const u8, len: usize) -> std::result::Result<&'a [u8
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
+#[derive(Clone, Copy)]
+struct WriteTxnState {
+    tree: *const Tree,
+}
+
 enum TxnKind {
-    Write(*const Tree),
+    Write(WriteTxnState),
     Read(*const ReadOnlyTree),
 }
 
@@ -141,7 +146,9 @@ impl MultiTxn {
 
         let tree = Box::new(tree);
         let handle = Box::new(Txn {
-            kind: TxnKind::Write(tree.as_ref() as *const Tree),
+            kind: TxnKind::Write(WriteTxnState {
+                tree: tree.as_ref() as *const Tree,
+            }),
         });
 
         self.buckets.insert(
@@ -233,7 +240,9 @@ pub extern "C" fn btree_exec(
 
     let result = btree.exec(bucket, |txn| {
         let mut handle = Txn {
-            kind: TxnKind::Write(&txn.tree as *const Tree),
+            kind: TxnKind::Write(WriteTxnState {
+                tree: &txn.tree as *const Tree,
+            }),
         };
         let rc = unsafe { cb(&mut handle as *mut Txn, ctx) };
         if rc == 0 {
@@ -443,7 +452,7 @@ pub extern "C" fn txn_get(
 
     let txn = unsafe { &*txn };
     let result = match txn.kind {
-        TxnKind::Write(ptr) => unsafe { (&*ptr).get(key) },
+        TxnKind::Write(state) => unsafe { (&*state.tree).get(key) },
         TxnKind::Read(ptr) => unsafe { (&*ptr).get(key) },
     };
 
@@ -487,8 +496,47 @@ pub extern "C" fn txn_put(
 
     let txn = unsafe { &*txn };
     match txn.kind {
-        TxnKind::Write(ptr) => match unsafe { (&*ptr).put(key, val) } {
+        TxnKind::Write(state) => match unsafe { (&*state.tree).put(key, val) } {
             Ok(_) => 0,
+            Err(e) => set_last_error_from(e),
+        },
+        TxnKind::Read(_) => set_last_error(ERR_INVALID, "read only transaction"),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn txn_update(
+    txn: *mut Txn,
+    key: *const u8,
+    klen: usize,
+    val: *const u8,
+    vlen: usize,
+    updated: *mut c_int,
+) -> c_int {
+    if txn.is_null() || updated.is_null() {
+        return invalid_arg("null pointer");
+    }
+    unsafe {
+        *updated = 0;
+    }
+    let key = match bytes_from_raw(key, klen) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let val = match bytes_from_raw(val, vlen) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let txn = unsafe { &*txn };
+    match txn.kind {
+        TxnKind::Write(state) => match unsafe { (&*state.tree).update(key, val) } {
+            Ok(was_updated) => {
+                unsafe {
+                    *updated = if was_updated { 1 } else { 0 };
+                }
+                0
+            }
             Err(e) => set_last_error_from(e),
         },
         TxnKind::Read(_) => set_last_error(ERR_INVALID, "read only transaction"),
@@ -507,7 +555,7 @@ pub extern "C" fn txn_del(txn: *mut Txn, key: *const u8, klen: usize) -> c_int {
 
     let txn = unsafe { &*txn };
     match txn.kind {
-        TxnKind::Write(ptr) => match unsafe { (&*ptr).del(key) } {
+        TxnKind::Write(state) => match unsafe { (&*state.tree).del(key) } {
             Ok(_) => 0,
             Err(e) => set_last_error_from(e),
         },
@@ -561,4 +609,208 @@ pub extern "C" fn btree_last_error(msg: *mut *const c_char, len: *mut usize) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn btree_last_error_clear() {
     clear_last_error();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ptr;
+    use tempfile::TempDir;
+
+    struct UpdateCtx {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        updated: c_int,
+        rc: c_int,
+    }
+
+    struct UpdateThenPutCtx {
+        missing_key: Vec<u8>,
+        missing_value: Vec<u8>,
+        present_key: Vec<u8>,
+        present_value: Vec<u8>,
+        updated: c_int,
+        update_rc: c_int,
+        put_rc: c_int,
+    }
+
+    unsafe extern "C" fn update_only_cb(txn: *mut Txn, ctx: *mut c_void) -> c_int {
+        let ctx = unsafe { &mut *(ctx as *mut UpdateCtx) };
+        let mut updated = -1;
+        let rc = txn_update(
+            txn,
+            ctx.key.as_ptr(),
+            ctx.key.len(),
+            ctx.value.as_ptr(),
+            ctx.value.len(),
+            &mut updated,
+        );
+        ctx.updated = updated;
+        ctx.rc = rc;
+        if rc == 0 { 0 } else { 1 }
+    }
+
+    unsafe extern "C" fn update_then_put_cb(txn: *mut Txn, ctx: *mut c_void) -> c_int {
+        let ctx = unsafe { &mut *(ctx as *mut UpdateThenPutCtx) };
+        let mut updated = -1;
+        ctx.update_rc = txn_update(
+            txn,
+            ctx.missing_key.as_ptr(),
+            ctx.missing_key.len(),
+            ctx.missing_value.as_ptr(),
+            ctx.missing_value.len(),
+            &mut updated,
+        );
+        ctx.updated = updated;
+        if ctx.update_rc != 0 {
+            return 1;
+        }
+
+        ctx.put_rc = txn_put(
+            txn,
+            ctx.present_key.as_ptr(),
+            ctx.present_key.len(),
+            ctx.present_value.as_ptr(),
+            ctx.present_value.len(),
+        );
+        if ctx.put_rc == 0 { 0 } else { 2 }
+    }
+
+    unsafe extern "C" fn multi_update_only_cb(mtxn: *mut MultiTxn, ctx: *mut c_void) -> c_int {
+        let ctx = unsafe { &mut *(ctx as *mut UpdateCtx) };
+        let mut txn = ptr::null_mut();
+        let bucket_rc = mtxn_bucket(mtxn, c"ffi_bucket".as_ptr(), &mut txn);
+        if bucket_rc != 0 {
+            ctx.rc = bucket_rc;
+            return 1;
+        }
+
+        let mut updated = -1;
+        let rc = txn_update(
+            txn,
+            ctx.key.as_ptr(),
+            ctx.key.len(),
+            ctx.value.as_ptr(),
+            ctx.value.len(),
+            &mut updated,
+        );
+        ctx.updated = updated;
+        ctx.rc = rc;
+        if rc == 0 { 0 } else { 2 }
+    }
+
+    #[test]
+    fn txn_update_missing_key_reports_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("ffi_update_missing_bucket.db");
+        let path = CString::new(db_path.to_str().unwrap()).unwrap();
+        let bucket = CString::new("ffi_bucket").unwrap();
+        let mut db = ptr::null_mut();
+
+        assert_eq!(btree_open(path.as_ptr(), &mut db), 0);
+
+        let mut ctx = UpdateCtx {
+            key: b"missing".to_vec(),
+            value: b"value".to_vec(),
+            updated: -1,
+            rc: -1,
+        };
+        assert_eq!(
+            btree_exec(
+                db,
+                bucket.as_ptr(),
+                Some(update_only_cb),
+                &mut ctx as *mut UpdateCtx as *mut c_void,
+            ),
+            0
+        );
+        assert_eq!(ctx.rc, 0);
+        assert_eq!(ctx.updated, 0);
+        assert!(
+            unsafe { (&*db).buckets().unwrap() }
+                .iter()
+                .any(|bucket_name| bucket_name == "ffi_bucket"),
+            "successful ffi update(false) should materialize the empty bucket"
+        );
+
+        btree_close(db);
+    }
+
+    #[test]
+    fn txn_update_miss_then_put_still_materializes_bucket() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("ffi_update_then_put.db");
+        let path = CString::new(db_path.to_str().unwrap()).unwrap();
+        let bucket = CString::new("ffi_bucket").unwrap();
+        let mut db = ptr::null_mut();
+
+        assert_eq!(btree_open(path.as_ptr(), &mut db), 0);
+
+        let mut ctx = UpdateThenPutCtx {
+            missing_key: b"missing".to_vec(),
+            missing_value: b"value".to_vec(),
+            present_key: b"present".to_vec(),
+            present_value: b"value".to_vec(),
+            updated: -1,
+            update_rc: -1,
+            put_rc: -1,
+        };
+        assert_eq!(
+            btree_exec(
+                db,
+                bucket.as_ptr(),
+                Some(update_then_put_cb),
+                &mut ctx as *mut UpdateThenPutCtx as *mut c_void,
+            ),
+            0
+        );
+        assert_eq!(ctx.update_rc, 0);
+        assert_eq!(ctx.updated, 0);
+        assert_eq!(ctx.put_rc, 0);
+        assert_eq!(
+            unsafe {
+                (&*db)
+                    .view("ffi_bucket", |txn| txn.get(b"present"))
+                    .unwrap()
+            },
+            b"value".to_vec()
+        );
+
+        btree_close(db);
+    }
+
+    #[test]
+    fn txn_update_missing_key_reports_false_in_exec_multi() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("ffi_multi_update_missing_bucket.db");
+        let path = CString::new(db_path.to_str().unwrap()).unwrap();
+        let mut db = ptr::null_mut();
+
+        assert_eq!(btree_open(path.as_ptr(), &mut db), 0);
+
+        let mut ctx = UpdateCtx {
+            key: b"missing".to_vec(),
+            value: b"value".to_vec(),
+            updated: -1,
+            rc: -1,
+        };
+        assert_eq!(
+            btree_exec_multi(
+                db,
+                Some(multi_update_only_cb),
+                &mut ctx as *mut UpdateCtx as *mut c_void,
+            ),
+            0
+        );
+        assert_eq!(ctx.rc, 0);
+        assert_eq!(ctx.updated, 0);
+        assert!(
+            unsafe { (&*db).buckets().unwrap() }
+                .iter()
+                .any(|bucket_name| bucket_name == "ffi_bucket"),
+            "successful ffi multi update(false) should materialize the empty bucket"
+        );
+
+        btree_close(db);
+    }
 }

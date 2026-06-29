@@ -57,6 +57,7 @@ multi bucket:
 kv operations:
 - txn_get
 - txn_put
+- txn_update
 - txn_del
 
 memory:
@@ -133,6 +134,16 @@ int txn_put(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_
 - val/vlen: value bytes
 - returns: 0 on success, non-zero on error
 - note: invalid in read-only view
+
+```
+int txn_update(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen, int *updated);
+```
+- txn: transaction handle
+- key/klen: key bytes, length must be 1..=32 bytes
+- val/vlen: value bytes
+- updated: output flag set to 1 when the key existed and was updated, 0 when the key was missing
+- returns: 0 on success, non-zero on error
+- note: missing key is reported via `updated=0`, not as an error; invalid in read-only view
 
 ```
 int txn_del(Txn *txn, const uint8_t *key, size_t klen);

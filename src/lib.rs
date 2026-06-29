@@ -356,6 +356,33 @@ impl Tree {
         Ok(())
     }
 
+    pub fn update(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        validate_user_key(key)?;
+
+        let mut freed = Vec::new();
+        let mut alloc = HashSet::new();
+
+        let result = self.execute_update(key, value, &mut freed, &mut alloc);
+        match result {
+            Ok(true) => {
+                self.merge_pending(freed, alloc);
+                Ok(true)
+            }
+            Ok(false) => {
+                for pid in alloc {
+                    let _ = self.store.free_pages_immediate(pid, 1);
+                }
+                Ok(false)
+            }
+            Err(e) => {
+                for pid in alloc {
+                    let _ = self.store.free_pages_immediate(pid, 1);
+                }
+                Err(e)
+            }
+        }
+    }
+
     fn execute_put(
         &self,
         key: &[u8],
@@ -435,6 +462,52 @@ impl Tree {
         }
 
         Ok(())
+    }
+
+    fn execute_update(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        freed: &mut Vec<(PageId, u32)>,
+        alloc: &mut HashSet<PageId>,
+    ) -> Result<bool> {
+        let mut ctx = TxContext::new(self.store.as_ref(), freed, alloc);
+        let mut root_lock = self.root_page_id.write();
+        let current_root_id = *root_lock;
+
+        if current_root_id == 0 {
+            return Ok(false);
+        }
+
+        let root_node = self.store.load_node(current_root_id)?;
+        let (mut stack, leaf_node_arc, leaf_id) =
+            self.traverse_to_leaf(root_node, current_root_id, key)?;
+        let mut current_node = (*leaf_node_arc).clone();
+
+        let pos = match current_node.search(key) {
+            Ok(pos) => pos,
+            Err(_) => return Ok(false),
+        };
+
+        current_node.update_at(ctx.store, pos, value, ctx.freed, ctx.alloc)?;
+
+        let mut new_child_id = ctx.write_node(&mut current_node)?;
+        ctx.free_page(leaf_id)?;
+
+        while let Some(Route {
+            node: parent_arc,
+            page_id: parent_id,
+            pos,
+        }) = stack.pop()
+        {
+            let mut parent = (*parent_arc).clone();
+            parent.update_child_page(pos, new_child_id);
+            new_child_id = ctx.write_node(&mut parent)?;
+            ctx.free_page(parent_id)?;
+        }
+
+        *root_lock = new_child_id;
+        Ok(true)
     }
 
     fn apply_insert(
@@ -746,12 +819,19 @@ impl TreeIterator {
     }
 }
 
+/// A mutable transaction handle scoped to a single bucket.
+///
+/// Instances are provided by [`BTree::exec`] and [`MultiTxn::exec`]. The handle
+/// is valid only for the duration of the callback that receives it.
 pub struct Txn<'a> {
     pub(crate) tree: Tree,
     pub(crate) _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> Txn<'a> {
+    /// Inserts a key/value pair or overwrites the existing value for `key`.
+    ///
+    /// The key must be non-empty and no longer than 32 bytes.
     pub fn put<K, V>(&mut self, key: K, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -760,6 +840,23 @@ impl<'a> Txn<'a> {
         self.tree.put(key.as_ref(), value.as_ref())
     }
 
+    /// Updates the value for `key` only if the key already exists.
+    ///
+    /// Returns `Ok(true)` when the key existed and was updated, or `Ok(false)`
+    /// when the key was missing and no existing key/value state changed.
+    /// The key must be non-empty and no longer than 32 bytes.
+    pub fn update<K, V>(&mut self, key: K, value: V) -> Result<bool>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.tree.update(key.as_ref(), value.as_ref())
+    }
+
+    /// Returns the value for `key`.
+    ///
+    /// Returns [`Error::NotFound`] when the bucket or key does not exist. The
+    /// key must be non-empty and no longer than 32 bytes.
     pub fn get<K>(&self, key: K) -> Result<Vec<u8>>
     where
         K: AsRef<[u8]>,
@@ -767,6 +864,10 @@ impl<'a> Txn<'a> {
         self.tree.get(key.as_ref())
     }
 
+    /// Deletes `key` from the current bucket.
+    ///
+    /// Returns [`Error::NotFound`] when the bucket or key does not exist. The
+    /// key must be non-empty and no longer than 32 bytes.
     pub fn del<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -774,6 +875,7 @@ impl<'a> Txn<'a> {
         self.tree.del(key.as_ref())
     }
 
+    /// Returns an iterator over the current bucket in key order.
     pub fn iter(&self) -> TreeIterator {
         self.tree.iterator()
     }
@@ -821,12 +923,20 @@ impl ReadOnlyTree {
     }
 }
 
+/// A read-only transaction handle scoped to a single bucket snapshot.
+///
+/// Instances are provided by [`BTree::view`]. The handle is valid only for the
+/// duration of the callback that receives it.
 pub struct ReadOnlyTxn<'a> {
     pub(crate) tree: Arc<ReadOnlyTree>,
     pub(crate) _guard: RwLockReadGuard<'a, ()>,
 }
 
 impl<'a> ReadOnlyTxn<'a> {
+    /// Returns the value for `key` from the read-only snapshot.
+    ///
+    /// Returns [`Error::NotFound`] when the bucket or key does not exist. The
+    /// key must be non-empty and no longer than 32 bytes.
     pub fn get<K>(&self, key: K) -> Result<Vec<u8>>
     where
         K: AsRef<[u8]>,
@@ -834,6 +944,7 @@ impl<'a> ReadOnlyTxn<'a> {
         self.tree.get(key.as_ref())
     }
 
+    /// Returns an iterator over the read-only bucket snapshot in key order.
     pub fn iter(&self) -> TreeIterator {
         self.tree.iterator()
     }

@@ -1,4 +1,4 @@
-# btree_store
+# btree-store
 
 [![CI](https://github.com/abbycin/btree-store/actions/workflows/ci.yml/badge.svg)](https://github.com/abbycin/btree-store/actions)
 [![Crates.io](https://img.shields.io/crates/v/btree-store.svg)](https://crates.io/crates/btree-store)
@@ -46,29 +46,33 @@ use btree_store::{BTree, Error};
 fn main() -> Result<(), Error> {
     let db = BTree::open("data.db")?;
 
-    // Read-Write Transaction
+    // Read-write transaction.
     db.exec("users", |txn| {
-        txn.put(b"id:100", b"Alice")?;
-        let val = txn.get(b"id:100")?;
-        assert_eq!(val, b"Alice");
+        txn.put("mo", "ha")?;
+        let val = txn.get("mo")?;
+        assert_eq!(val, b"ha".to_vec());
+        let updated = txn.update("elder", "+1s")?;
+        assert!(
+            !updated,
+            "update only changes an existing key and does not insert a missing key"
+        );
         Ok(())
     })?;
 
-    // Read-Only View
+    // Read-only view.
     db.view("users", |txn| {
-        let val = txn.get(b"id:100")?;
-        println!("User: {:?}", String::from_utf8_lossy(&val));
+        let val = txn.get("mo")?;
+        println!("mo: {:?}", String::from_utf8_lossy(&val));
         Ok(())
     })?;
 
-    // Multi-Bucket Atomic Transaction
+    // Multi-bucket atomic transaction.
     db.exec_multi(|multi| {
         multi.exec("users", |txn| {
-            txn.put(b"id:101", b"Bob")
+            // Overwrite the existing value.
+            txn.put("mo", "+1s")
         })?;
-        multi.exec("stats", |txn| {
-            txn.put(b"total_users", b"2")
-        })?;
+        multi.exec("quote", |txn| txn.put("moha", "naive!"))?;
         Ok(())
     })?;
 

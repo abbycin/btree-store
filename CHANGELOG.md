@@ -1,6 +1,15 @@
 # Changelog
 
-All notable changes to the **btree_store** project will be documented in this file.
+All notable changes to the **btree-store** project will be documented in this file.
+
+## [0.1.9] - 2026-06-29
+
+### Added
+- **Conditional Update API**: Added atomic `Txn::update` and C `txn_update` APIs that update only existing keys and return a boolean flag instead of reporting a missing key as an error.
+- **Update Regression Coverage**: Added single-bucket, `exec_multi`, and FFI regression tests plus cargo-fuzz model coverage for successful `update(false)` paths and follow-up writes in the same transaction.
+
+### Changed
+- **API Documentation**: README examples, FFI guide, and rustdoc for `Txn` and `ReadOnlyTxn` now document the byte-oriented return values, update semantics, and callback-scoped handle lifetime more accurately.
 
 ## [0.1.8] - 2026-06-23
 

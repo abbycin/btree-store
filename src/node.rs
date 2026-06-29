@@ -277,7 +277,7 @@ impl Node {
         Ok(index_page_ids[0])
     }
 
-    fn update_at(
+    pub(crate) fn update_at(
         &mut self,
         store: &dyn PageStore,
         pos: usize,
@@ -341,6 +341,7 @@ impl Node {
             let slot = self.slot_at_mut(pos);
             slot.update_vlen(value.len() as u32);
         }
+        self.dirty = true;
         Ok(())
     }
 

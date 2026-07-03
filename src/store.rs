@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     collections::HashSet,
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions as FileOpenOptions},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    Error, FORMAT_VERSION, MAGIC, MetaNode, PageId, Result,
+    Error, FORMAT_VERSION, MAGIC, MetaNode, OpenOptions, PageId, Result, SyncMode,
     node::{Node, PAGE_SIZE},
 };
 
@@ -54,7 +54,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     const ERROR_INVALID_FUNCTION: i32 = 1;
     const ERROR_NOT_SUPPORTED: i32 = 50;
 
-    let dir = OpenOptions::new()
+    let dir = FileOpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
@@ -396,14 +396,15 @@ pub struct Store {
     /// contention is concentrated at the B+ Tree's root
     cache: NodeCache,
     file_extended: AtomicBool,
+    sync_mode: SyncMode,
 }
 
 impl Store {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P, options: &OpenOptions) -> Result<Self> {
         let path = path.as_ref();
 
         let (file, sb, stale_sb) = if !path.exists() {
-            let file = OpenOptions::new()
+            let file = FileOpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
@@ -422,7 +423,7 @@ impl Store {
             sync_parent_dir(path)?;
             (file, sb, None)
         } else {
-            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            let file = FileOpenOptions::new().read(true).write(true).open(path)?;
 
             let mut buf0 = [0u8; PAGE_SIZE];
             let mut buf1 = [0u8; PAGE_SIZE];
@@ -466,8 +467,9 @@ impl Store {
             freelist_stale: Mutex::new(Vec::new()),
             freelist_pages: Mutex::new(Vec::new()),
             freelist_pages_stale: Mutex::new(Vec::new()),
-            cache: NodeCache::new(4096),
+            cache: NodeCache::new(options.node_cache_capacity),
             file_extended: AtomicBool::new(false),
+            sync_mode: options.sync_mode,
         };
         let (freelist, freelist_pages) =
             store.read_freelist_from_disk(store.sb.lock().freelist_root)?;
@@ -937,7 +939,7 @@ impl Store {
             self.file.set_len(new_len)?;
         }
 
-        self.file.psync_all().map_err(|_| Error::IoError)?;
+        self.sync_impl(truncated > 0)?;
         Ok(truncated)
     }
 
@@ -1081,10 +1083,20 @@ impl Store {
     }
 
     pub fn sync(&self) -> Result<()> {
-        if self.file_extended.swap(false, Ordering::SeqCst) {
-            return self.file.psync_all().map_err(|_| Error::IoError);
+        self.sync_impl(false)
+    }
+
+    fn sync_impl(&self, metadata_changed: bool) -> Result<()> {
+        let file_extended = self.file_extended.swap(false, Ordering::SeqCst);
+        match self.sync_mode {
+            SyncMode::Adaptive if file_extended || metadata_changed => {
+                self.file.psync_all().map_err(|_| Error::IoError)
+            }
+            SyncMode::Adaptive | SyncMode::Data => {
+                self.file.psync_data().map_err(|_| Error::IoError)
+            }
+            SyncMode::All => self.file.psync_all().map_err(|_| Error::IoError),
         }
-        self.file.psync_data().map_err(|_| Error::IoError)
     }
 
     pub fn load_node(&self, page_id: PageId) -> Result<Arc<Node>> {
@@ -1306,6 +1318,9 @@ impl NodeCacheShard {
     }
 
     fn put(&mut self, page_id: PageId, node: Arc<Node>) {
+        if self.capacity == 0 {
+            return;
+        }
         if let Some(idx) = self.find_entry_idx(page_id)
             && let Some(entry) = &mut self.entries[idx]
         {
@@ -1362,32 +1377,76 @@ pub struct NodeCache {
 
 impl NodeCache {
     fn new(capacity: usize) -> Self {
-        let shard_cap = std::cmp::max(1, capacity / NUM_SHARDS);
-        let mut shards = Vec::with_capacity(NUM_SHARDS);
-        for _ in 0..NUM_SHARDS {
+        let shard_count = capacity.min(NUM_SHARDS);
+        let mut shards = Vec::with_capacity(shard_count);
+        if shard_count == 0 {
+            return Self { shards };
+        }
+
+        let base = capacity / shard_count;
+        let remainder = capacity % shard_count;
+        for idx in 0..shard_count {
+            let shard_cap = base + usize::from(idx < remainder);
             shards.push(Mutex::new(NodeCacheShard::new(shard_cap)));
         }
         Self { shards }
     }
 
     fn get_shard(&self, page_id: PageId) -> &Mutex<NodeCacheShard> {
-        let idx = if NUM_SHARDS.is_power_of_two() {
-            (page_id as usize) & (NUM_SHARDS - 1)
+        debug_assert!(!self.shards.is_empty());
+        let idx = if self.shards.len().is_power_of_two() {
+            (page_id as usize) & (self.shards.len() - 1)
         } else {
-            (page_id as usize) % NUM_SHARDS
+            (page_id as usize) % self.shards.len()
         };
         &self.shards[idx]
     }
 
     pub fn get(&self, page_id: PageId) -> Option<Arc<Node>> {
+        if self.shards.is_empty() {
+            return None;
+        }
         self.get_shard(page_id).lock().get(page_id)
     }
 
     pub fn put(&self, page_id: PageId, node: Arc<Node>) {
+        if self.shards.is_empty() {
+            return;
+        }
         self.get_shard(page_id).lock().put(page_id, node)
     }
 
     pub fn invalidate(&self, page_id: PageId) {
+        if self.shards.is_empty() {
+            return;
+        }
         self.get_shard(page_id).lock().invalidate(page_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_cache_small_capacity_uses_only_nonzero_shards() {
+        for capacity in [1usize, 17, 63] {
+            let cache = NodeCache::new(capacity);
+            assert_eq!(cache.shards.len(), capacity);
+            assert_eq!(
+                cache
+                    .shards
+                    .iter()
+                    .map(|shard| shard.lock().capacity)
+                    .sum::<usize>(),
+                capacity
+            );
+            for page_id in [0_u32, 1, 63, 64, 127, 4095] {
+                assert!(
+                    cache.get_shard(page_id).lock().capacity > 0,
+                    "capacity={capacity} should give every active shard at least one slot"
+                );
+            }
+        }
     }
 }

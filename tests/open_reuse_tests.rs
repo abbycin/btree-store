@@ -1,4 +1,4 @@
-use btree_store::BTree;
+use btree_store::{BTree, Error, OpenOptions};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -141,4 +141,67 @@ fn test_same_path_open_is_instance_reuse_not_true_reopen() {
         "same-path open should reuse the live instance instead of performing a true reopen; actual: {:?}",
         blocked
     );
+}
+
+#[test]
+fn test_reopen_same_path_with_mismatched_options_returns_invalid() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("reuse_options_mismatch.db");
+
+    let opts = OpenOptions {
+        node_cache_capacity: 8,
+        ..OpenOptions::default()
+    };
+    let _handle = BTree::open_with_options(&db_path, opts).unwrap();
+
+    let err = match BTree::open_with_options(
+        &db_path,
+        OpenOptions {
+            node_cache_capacity: 16,
+            ..OpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("mismatched options should fail for the same live path"),
+        Err(err) => err,
+    };
+    assert_eq!(err, Error::Invalid);
+}
+
+#[test]
+fn test_open_with_zero_capacity_caches_still_supports_basic_io() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("zero_capacity_caches.db");
+
+    let opts = OpenOptions {
+        node_cache_capacity: 0,
+        lid_pid_cache_capacity: 0,
+        lid_pid_hot_cache_capacity: 0,
+        bucket_root_cache_capacity: 0,
+        bucket_tree_cache_capacity: 0,
+        ..OpenOptions::default()
+    };
+
+    let tree = BTree::open_with_options(&db_path, opts.clone()).unwrap();
+    tree.exec("reuse", |txn| {
+        txn.put(b"k0", b"v0")?;
+        txn.put(b"k1", b"v1")?;
+        Ok(())
+    })
+    .unwrap();
+
+    tree.view("reuse", |txn| {
+        assert_eq!(txn.get(b"k0").unwrap(), b"v0".to_vec());
+        assert_eq!(txn.get(b"k1").unwrap(), b"v1".to_vec());
+        Ok(())
+    })
+    .unwrap();
+
+    let reopened = BTree::open_with_options(&db_path, opts).unwrap();
+    reopened
+        .view("reuse", |txn| {
+            assert_eq!(txn.get(b"k0").unwrap(), b"v0".to_vec());
+            assert_eq!(txn.get(b"k1").unwrap(), b"v1".to_vec());
+            Ok(())
+        })
+        .unwrap();
 }

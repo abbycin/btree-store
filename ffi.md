@@ -44,6 +44,7 @@ ffi.exe
 ## API Overview
 open/close:
 - btree_open
+- btree_max_key_len
 - btree_close
 
 transactions:
@@ -76,6 +77,12 @@ int btree_open(const char *path, BTree **out);
 - returns: 0 on success, non-zero on error
 
 ```
+size_t btree_max_key_len(void);
+```
+- returns: maximum encoded byte length accepted for keys and bucket names
+- note: the current limit is 128 bytes
+
+```
 void btree_close(BTree *db);
 ```
 - db: handle returned by btree_open, safe to pass NULL
@@ -84,7 +91,7 @@ void btree_close(BTree *db);
 int btree_exec(BTree *db, const char *bucket, int (*fn)(Txn *txn, void *ctx), void *ctx);
 ```
 - db: database handle
-- bucket: utf-8 bucket name, encoded length must be 1..=32 bytes
+- bucket: utf-8 bucket name, encoded length must be 1..=btree_max_key_len() bytes
 - fn: callback invoked within a write transaction
 - ctx: user context pointer passed to fn
 - returns: callback rc on non-zero, or error code on internal failure
@@ -94,7 +101,7 @@ int btree_exec(BTree *db, const char *bucket, int (*fn)(Txn *txn, void *ctx), vo
 int btree_view(BTree *db, const char *bucket, int (*fn)(Txn *txn, void *ctx), void *ctx);
 ```
 - db: database handle
-- bucket: utf-8 bucket name, encoded length must be 1..=32 bytes
+- bucket: utf-8 bucket name, encoded length must be 1..=btree_max_key_len() bytes
 - fn: callback invoked within a read transaction
 - ctx: user context pointer passed to fn
 - returns: callback rc on non-zero, or error code on internal failure
@@ -112,7 +119,7 @@ int btree_exec_multi(BTree *db, int (*fn)(MultiTxn *mtxn, void *ctx), void *ctx)
 int mtxn_bucket(MultiTxn *mtxn, const char *bucket, Txn **out);
 ```
 - mtxn: handle provided to btree_exec_multi callback
-- bucket: utf-8 bucket name, encoded length must be 1..=32 bytes
+- bucket: utf-8 bucket name, encoded length must be 1..=btree_max_key_len() bytes
 - out: output txn handle for the bucket
 - returns: 0 on success, non-zero on error
 - note: out handle valid only during the callback
@@ -121,7 +128,7 @@ int mtxn_bucket(MultiTxn *mtxn, const char *bucket, Txn **out);
 int txn_get(Txn *txn, const uint8_t *key, size_t klen, uint8_t **out, size_t *out_len);
 ```
 - txn: transaction handle
-- key/klen: key bytes, length must be 1..=32 bytes
+- key/klen: key bytes, length must be 1..=btree_max_key_len() bytes
 - out/out_len: output buffer and length, valid on success
 - returns: 0 on success, non-zero on error
 - note: caller must free out with btree_free
@@ -130,7 +137,7 @@ int txn_get(Txn *txn, const uint8_t *key, size_t klen, uint8_t **out, size_t *ou
 int txn_put(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen);
 ```
 - txn: transaction handle
-- key/klen: key bytes, length must be 1..=32 bytes
+- key/klen: key bytes, length must be 1..=btree_max_key_len() bytes
 - val/vlen: value bytes
 - returns: 0 on success, non-zero on error
 - note: invalid in read-only view
@@ -139,7 +146,7 @@ int txn_put(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_
 int txn_update(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen, int *updated);
 ```
 - txn: transaction handle
-- key/klen: key bytes, length must be 1..=32 bytes
+- key/klen: key bytes, length must be 1..=btree_max_key_len() bytes
 - val/vlen: value bytes
 - updated: output flag set to 1 when the key existed and was updated, 0 when the key was missing
 - returns: 0 on success, non-zero on error
@@ -149,7 +156,7 @@ int txn_update(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, si
 int txn_del(Txn *txn, const uint8_t *key, size_t klen);
 ```
 - txn: transaction handle
-- key/klen: key bytes, length must be 1..=32 bytes
+- key/klen: key bytes, length must be 1..=btree_max_key_len() bytes
 - returns: 0 on success, non-zero on error
 - note: invalid in read-only view
 
@@ -188,7 +195,7 @@ void btree_last_error_clear(void);
 
 ## API Contract
 - callback must not call `exec`/`view`
-- keys and bucket names are invalid when empty or longer than 32 bytes
+- keys and bucket names are invalid when empty or longer than `btree_max_key_len()` bytes
 - `Txn` and `MultiTxn` handles are valid only during the callback
 - `longjmp` across ffi is unsafe
 - panics are not caught; build with `panic=abort`

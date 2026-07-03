@@ -17,8 +17,9 @@ and checks these invariants after successful operations:
 - Concurrent reader fuzzing only asserts snapshot self-consistency for the
   observed epoch; it does not require readers to see the latest writer commit.
 
-All generated database keys are bounded to `1..=32` bytes, matching
-btree-store's current `MAX_KEY_LEN` limit and its non-empty key contract.
+All generated database keys are bounded to the public `btree_store::MAX_KEY_LEN`
+limit; in the current tree that means `1..=128` bytes, while still preserving
+the non-empty key contract.
 Bucket names are generated from a fixed non-empty set and are subject to the
 same limit because bucket names are stored as catalog keys. Values may be empty
 and are bounded to 64 KiB so the target still covers inline and overflow values

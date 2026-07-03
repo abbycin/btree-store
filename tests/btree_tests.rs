@@ -1,4 +1,4 @@
-use btree_store::{BTree, Error};
+use btree_store::{BTree, Error, MAX_KEY_LEN};
 use tempfile::TempDir;
 
 #[test]
@@ -372,7 +372,7 @@ fn test_bucket_name_must_not_exceed_key_limit() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_large_bucket_name_invalid.db");
     let tree = BTree::open(&db_path).unwrap();
-    let bucket = "x".repeat(33);
+    let bucket = "x".repeat(MAX_KEY_LEN + 1);
 
     assert_eq!(tree.exec(&bucket, |_| Ok(())).unwrap_err(), Error::TooLarge);
     assert_eq!(tree.view(&bucket, |_| Ok(())).unwrap_err(), Error::TooLarge);
@@ -393,7 +393,7 @@ fn test_user_key_contract_is_enforced_without_mutating_bucket() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_user_key_invalid.db");
     let tree = BTree::open(&db_path).unwrap();
-    let too_large_key = vec![b'k'; 33];
+    let too_large_key = vec![b'k'; MAX_KEY_LEN + 1];
 
     assert_eq!(
         tree.exec("bucket", |txn| txn.put(b"", b"value"))

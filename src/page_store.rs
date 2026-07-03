@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::node::Node;
 use crate::store::Store;
-use crate::{Error, Result, Tree};
+use crate::{Error, OpenOptions, Result, Tree};
 use parking_lot::Mutex;
 
 pub type Lid = u32;
@@ -22,8 +22,6 @@ pub(crate) fn decode_u32_key(bytes: &[u8]) -> Result<u32> {
 }
 
 const LID_PID_CACHE_SHARDS: usize = 64;
-const LID_PID_CACHE_CAPACITY: usize = 8192;
-const LID_PID_HOT_CACHE_CAPACITY: usize = 32 * 1024;
 
 struct LidPidCacheEntry {
     lid: Lid,
@@ -59,6 +57,9 @@ impl LidPidCacheShard {
     }
 
     fn put(&mut self, lid: Lid, pid: Pid) {
+        if self.capacity == 0 {
+            return;
+        }
         if let Some(&idx) = self.map.get(&lid)
             && let Some(entry) = &mut self.entries[idx]
         {
@@ -117,28 +118,49 @@ struct LidPidCache {
 
 impl LidPidCache {
     fn new(capacity: usize) -> Self {
-        let shard_cap = std::cmp::max(1, capacity / LID_PID_CACHE_SHARDS);
-        let mut shards = Vec::with_capacity(LID_PID_CACHE_SHARDS);
-        for _ in 0..LID_PID_CACHE_SHARDS {
+        let shard_count = capacity.min(LID_PID_CACHE_SHARDS);
+        let mut shards = Vec::with_capacity(shard_count);
+        if shard_count == 0 {
+            return Self { shards };
+        }
+
+        let base = capacity / shard_count;
+        let remainder = capacity % shard_count;
+        for idx in 0..shard_count {
+            let shard_cap = base + usize::from(idx < remainder);
             shards.push(Mutex::new(LidPidCacheShard::new(shard_cap)));
         }
         Self { shards }
     }
 
     fn shard(&self, lid: Lid) -> &Mutex<LidPidCacheShard> {
-        let idx = (lid as usize) % LID_PID_CACHE_SHARDS;
+        debug_assert!(!self.shards.is_empty());
+        let idx = if self.shards.len().is_power_of_two() {
+            (lid as usize) & (self.shards.len() - 1)
+        } else {
+            (lid as usize) % self.shards.len()
+        };
         &self.shards[idx]
     }
 
     fn get(&self, lid: Lid) -> Option<Pid> {
+        if self.shards.is_empty() {
+            return None;
+        }
         self.shard(lid).lock().get(lid)
     }
 
     fn put(&self, lid: Lid, pid: Pid) {
+        if self.shards.is_empty() {
+            return;
+        }
         self.shard(lid).lock().put(lid, pid)
     }
 
     fn invalidate(&self, lid: Lid) {
+        if self.shards.is_empty() {
+            return;
+        }
         self.shard(lid).lock().invalidate(lid)
     }
 
@@ -155,7 +177,6 @@ struct LidPidHotCache {
 
 impl LidPidHotCache {
     fn new(capacity: usize) -> Self {
-        assert!(capacity.is_power_of_two());
         let slots = (0..capacity)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
@@ -165,7 +186,11 @@ impl LidPidHotCache {
 
     #[inline]
     fn idx(&self, lid: Lid) -> usize {
-        (lid as usize) & (self.slots.len() - 1)
+        if self.slots.len().is_power_of_two() {
+            (lid as usize) & (self.slots.len() - 1)
+        } else {
+            (lid as usize) % self.slots.len()
+        }
     }
 
     #[inline]
@@ -179,16 +204,25 @@ impl LidPidHotCache {
     }
 
     fn get(&self, lid: Lid) -> Option<Pid> {
+        if self.slots.is_empty() {
+            return None;
+        }
         let entry = self.slots[self.idx(lid)].load(Ordering::Relaxed);
         let (cached_lid, pid) = Self::decode(entry);
         if cached_lid == lid { Some(pid) } else { None }
     }
 
     fn put(&self, lid: Lid, pid: Pid) {
+        if self.slots.is_empty() {
+            return;
+        }
         self.slots[self.idx(lid)].store(Self::encode(lid, pid), Ordering::Relaxed);
     }
 
     fn invalidate(&self, lid: Lid) {
+        if self.slots.is_empty() {
+            return;
+        }
         let slot = &self.slots[self.idx(lid)];
         let entry = slot.load(Ordering::Relaxed);
         let (cached_lid, _) = Self::decode(entry);
@@ -232,13 +266,18 @@ pub struct LogicalStore {
 }
 
 impl LogicalStore {
-    pub fn new(store: Arc<Store>, mapping_tree: Arc<Tree>, reverse_tree: Arc<Tree>) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        mapping_tree: Arc<Tree>,
+        reverse_tree: Arc<Tree>,
+        options: &OpenOptions,
+    ) -> Self {
         Self {
             store,
             mapping_tree,
             reverse_tree,
-            lid_cache: LidPidCache::new(LID_PID_CACHE_CAPACITY),
-            hot_lid_cache: LidPidHotCache::new(LID_PID_HOT_CACHE_CAPACITY),
+            lid_cache: LidPidCache::new(options.lid_pid_cache_capacity),
+            hot_lid_cache: LidPidHotCache::new(options.lid_pid_hot_cache_capacity),
         }
     }
 
@@ -400,5 +439,32 @@ impl PageStore for LogicalStore {
     fn write_page(&self, lid: Lid, data: &[u8]) -> Result<()> {
         let pid = self.resolve_pid(lid)?;
         self.store.write_page(pid, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lid_pid_cache_small_capacity_uses_only_nonzero_shards() {
+        for capacity in [1usize, 17, 63] {
+            let cache = LidPidCache::new(capacity);
+            assert_eq!(cache.shards.len(), capacity);
+            assert_eq!(
+                cache
+                    .shards
+                    .iter()
+                    .map(|shard| shard.lock().capacity)
+                    .sum::<usize>(),
+                capacity
+            );
+            for lid in [0_u32, 1, 63, 64, 127, 4095] {
+                assert!(
+                    cache.shard(lid).lock().capacity > 0,
+                    "capacity={capacity} should give every active shard at least one slot"
+                );
+            }
+        }
     }
 }

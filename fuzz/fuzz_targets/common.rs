@@ -9,7 +9,7 @@ use arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
 use btree_store::{BTree, Error, MultiTxn, Result as DbResult};
 use tempfile::{Builder, TempDir};
 
-pub const MAX_KEY_LEN: usize = 32;
+pub const MAX_KEY_LEN: usize = btree_store::MAX_KEY_LEN;
 pub const MAX_VALUE_LEN: usize = 64 * 1024;
 pub const MAX_KV_OPS: usize = 256;
 pub const MAX_MULTI_OPS: usize = 128;

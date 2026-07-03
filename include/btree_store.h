@@ -30,6 +30,7 @@ typedef struct MultiTxn MultiTxn;
 #define BTREE_ERR_UNKNOWN -1000
 
 int btree_open(const char *path, BTree **out);
+size_t btree_max_key_len(void);
 void btree_close(BTree *db);
 
 int btree_exec(BTree *db, const char *bucket, int (*fn)(Txn *txn, void *ctx), void *ctx);

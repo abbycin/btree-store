@@ -147,7 +147,7 @@ The engine is optimized for high-throughput scenarios:
 
 ## Limits
 
-*   **Keys and bucket names:** 1..=32 bytes; empty keys and empty bucket names are rejected as invalid input.
+*   **Keys and bucket names:** 1..=128 bytes; empty keys and empty bucket names are rejected as invalid input.
 *   **Max file size:** ~16 TB with 4 KB pages (32-bit page ids).
 
 ## Benchmarks

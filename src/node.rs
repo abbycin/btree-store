@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use std::ptr;
 
 pub const PAGE_SIZE: usize = 4096;
-pub const MAX_INLINE_LEN: usize = 64;
-pub const MAX_KEY_LEN: usize = 32;
+pub const MAX_INLINE_LEN: usize = 256;
+pub const MAX_KEY_LEN: usize = 128;
 
 const OFFSET_CHECKSUM: usize = PAGE_SIZE - 4;
 const OFFSET_NEXT_INDIRECT: usize = PAGE_SIZE - 8;

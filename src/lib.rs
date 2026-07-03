@@ -1,11 +1,10 @@
 use std::{
-    collections::HashMap,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, io,
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -50,6 +49,66 @@ pub type PageId = u32;
 
 pub const MAGIC: u64 = 0x636f776274726565;
 pub const FORMAT_VERSION: u32 = 3;
+pub use crate::node::MAX_KEY_LEN;
+
+/// Runtime sync policy used after commits and compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    /// Sync data by default, but upgrade to a full sync when file size changes.
+    #[default]
+    Adaptive,
+    /// Always use data-only sync.
+    Data,
+    /// Always use a full file sync.
+    All,
+}
+
+/// Runtime-only options used when opening a database handle.
+///
+/// These settings do not change the on-disk format. Within a single process,
+/// the first successful open of a given path fixes the runtime options for the
+/// shared live instance. Later opens of the same path must use identical
+/// options or they return [`Error::Invalid`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// Number of physical page nodes cached by the underlying store.
+    pub node_cache_capacity: usize,
+    /// Number of logical-id to physical-id mappings cached per handle.
+    pub lid_pid_cache_capacity: usize,
+    /// Number of entries in the direct-mapped hot logical-id cache per handle.
+    pub lid_pid_hot_cache_capacity: usize,
+    /// Maximum number of bucket root lookups cached across shared handles.
+    pub bucket_root_cache_capacity: usize,
+    /// Maximum number of read-only bucket trees cached across shared handles.
+    pub bucket_tree_cache_capacity: usize,
+    /// Sync policy used after metadata commits.
+    pub sync_mode: SyncMode,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            node_cache_capacity: 8192,
+            lid_pid_cache_capacity: 8192,
+            lid_pid_hot_cache_capacity: 32 * 1024,
+            bucket_root_cache_capacity: 8192,
+            bucket_tree_cache_capacity: 8192,
+            sync_mode: SyncMode::Adaptive,
+        }
+    }
+}
+
+impl OpenOptions {
+    /// Create a new options object with the default runtime settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open or create a database using these runtime options.
+    pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<BTree> {
+        BTree::open_with_options(path, self.clone())
+    }
+}
 
 static BTREE_INSTANCE_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<BTree>>>> = OnceLock::new();
 
@@ -180,7 +239,7 @@ impl MetaNode {
 }
 
 use crate::{
-    node::{MAX_KEY_LEN, Node, PAGE_SIZE},
+    node::{Node, PAGE_SIZE},
     page_store::{LogicalStore, PageStore, decode_u32_key, encode_u32_key},
     store::{MetaSnapshot, Store},
 };
@@ -831,7 +890,7 @@ pub struct Txn<'a> {
 impl<'a> Txn<'a> {
     /// Inserts a key/value pair or overwrites the existing value for `key`.
     ///
-    /// The key must be non-empty and no longer than 32 bytes.
+    /// The key must be non-empty and no longer than [`MAX_KEY_LEN`] bytes.
     pub fn put<K, V>(&mut self, key: K, value: V) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -844,7 +903,7 @@ impl<'a> Txn<'a> {
     ///
     /// Returns `Ok(true)` when the key existed and was updated, or `Ok(false)`
     /// when the key was missing and no existing key/value state changed.
-    /// The key must be non-empty and no longer than 32 bytes.
+    /// The key must be non-empty and no longer than [`MAX_KEY_LEN`] bytes.
     pub fn update<K, V>(&mut self, key: K, value: V) -> Result<bool>
     where
         K: AsRef<[u8]>,
@@ -856,7 +915,7 @@ impl<'a> Txn<'a> {
     /// Returns the value for `key`.
     ///
     /// Returns [`Error::NotFound`] when the bucket or key does not exist. The
-    /// key must be non-empty and no longer than 32 bytes.
+    /// key must be non-empty and no longer than [`MAX_KEY_LEN`] bytes.
     pub fn get<K>(&self, key: K) -> Result<Vec<u8>>
     where
         K: AsRef<[u8]>,
@@ -867,7 +926,7 @@ impl<'a> Txn<'a> {
     /// Deletes `key` from the current bucket.
     ///
     /// Returns [`Error::NotFound`] when the bucket or key does not exist. The
-    /// key must be non-empty and no longer than 32 bytes.
+    /// key must be non-empty and no longer than [`MAX_KEY_LEN`] bytes.
     pub fn del<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
@@ -936,7 +995,7 @@ impl<'a> ReadOnlyTxn<'a> {
     /// Returns the value for `key` from the read-only snapshot.
     ///
     /// Returns [`Error::NotFound`] when the bucket or key does not exist. The
-    /// key must be non-empty and no longer than 32 bytes.
+    /// key must be non-empty and no longer than [`MAX_KEY_LEN`] bytes.
     pub fn get<K>(&self, key: K) -> Result<Vec<u8>>
     where
         K: AsRef<[u8]>,
@@ -1049,11 +1108,110 @@ pub struct BTree {
     local_snapshot: Arc<RwLock<MetaSnapshot>>,
     pub(crate) bucket_root_cache: Arc<RwLock<BucketRootCache>>,
     pub(crate) bucket_tree_cache: Arc<RwLock<BucketTreeCache>>,
+    options: OpenOptions,
     instance_anchor: Option<Arc<BTree>>,
 }
 
-type BucketRootCache = HashMap<Vec<u8>, (PageId, u64)>;
-type BucketTreeCache = HashMap<Vec<u8>, (PageId, u64, Arc<ReadOnlyTree>)>;
+struct BucketCacheEntry<V> {
+    value: V,
+    seq: u64,
+    used: AtomicBool,
+}
+
+struct BucketCache<V> {
+    capacity: usize,
+    hand: usize,
+    entries: HashMap<Vec<u8>, BucketCacheEntry<V>>,
+    slots: Vec<Option<Vec<u8>>>,
+}
+
+impl<V> BucketCache<V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            hand: 0,
+            entries: HashMap::new(),
+            slots: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.hand = 0;
+        self.entries.clear();
+        self.slots.clear();
+    }
+
+    fn get(&self, key: &[u8], seq: u64) -> Option<&V> {
+        let entry = self.entries.get(key)?;
+        if entry.seq != seq {
+            return None;
+        }
+        entry.used.store(true, Ordering::Relaxed);
+        Some(&entry.value)
+    }
+
+    fn insert(&mut self, key: Vec<u8>, seq: u64, value: V) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(entry) = self.entries.get_mut(key.as_slice()) {
+            entry.value = value;
+            entry.seq = seq;
+            entry.used.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        let slot_idx = if self.entries.len() < self.capacity {
+            let idx = self.slots.len();
+            self.slots.push(None);
+            idx
+        } else {
+            self.evict_slot()
+        };
+
+        self.slots[slot_idx] = Some(key.clone());
+        self.entries.insert(
+            key,
+            BucketCacheEntry {
+                value,
+                seq,
+                used: AtomicBool::new(false),
+            },
+        );
+    }
+
+    fn evict_slot(&mut self) -> usize {
+        debug_assert!(!self.slots.is_empty());
+        loop {
+            let idx = self.hand;
+            self.hand = (self.hand + 1) % self.slots.len();
+
+            let should_evict = {
+                let key = self.slots[idx]
+                    .as_ref()
+                    .expect("bucket cache slot should contain a key");
+                let entry = self
+                    .entries
+                    .get(key.as_slice())
+                    .expect("bucket cache slot should map to a live entry");
+                !entry.used.swap(false, Ordering::Relaxed)
+            };
+
+            if should_evict {
+                let evicted_key = self.slots[idx]
+                    .take()
+                    .expect("bucket cache slot should contain the evicted key");
+                self.entries
+                    .remove(evicted_key.as_slice())
+                    .expect("bucket cache eviction should remove the mapped entry");
+                return idx;
+            }
+        }
+    }
+}
+
+type BucketRootCache = BucketCache<PageId>;
+type BucketTreeCache = BucketCache<Arc<ReadOnlyTree>>;
 
 /// compact all pages when total data pages are at or below this threshold
 const COMPACT_SMALL_DATA_THRESHOLD_PAGES: u64 = 1024;
@@ -1085,8 +1243,18 @@ impl BTree {
         self.apply_local_snapshot(self.store.cached_snapshot(), false);
     }
 
-    /// Open or create a btree database at the given path.
+    /// Open or create a btree database at the given path using default runtime options.
+    ///
+    /// This is equivalent to `BTree::open_with_options(path, OpenOptions::default())`.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_options(path, OpenOptions::default())
+    }
+
+    /// Open or create a btree database at the given path using explicit runtime options.
+    ///
+    /// Within a single process, opening the same path again reuses the live
+    /// instance. Reopens must use identical runtime options.
+    pub fn open_with_options<P: AsRef<Path>>(path: P, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref();
         let key = normalize_db_path(path);
 
@@ -1099,13 +1267,16 @@ impl BTree {
             }
             upgraded
         } {
+            if existing.options != options {
+                return Err(Error::Invalid);
+            }
             let mut handle = existing.as_ref().clone();
             handle.instance_anchor = Some(existing);
             handle.sync_local_snapshot_from_store();
             return Ok(handle);
         }
 
-        let store = Arc::new(Store::open(path)?);
+        let store = Arc::new(Store::open(path, &options)?);
         let catalog_root = store.get_catalog_root();
         let mapping_root = store.get_mapping_root();
         let reverse_root = store.get_reverse_root();
@@ -1139,6 +1310,7 @@ impl BTree {
             store.clone(),
             mapping_tree.clone(),
             reverse_tree.clone(),
+            &options,
         ));
         let catalog_tree_root_lock = Arc::new(RwLock::new(catalog_root));
         let logical_store_obj: Arc<dyn PageStore> = logical_store.clone();
@@ -1161,8 +1333,13 @@ impl BTree {
             start_root_id: Arc::new(AtomicU32::new(catalog_root)),
             start_seq: Arc::new(AtomicU64::new(initial_seq)),
             local_snapshot: Arc::new(RwLock::new(initial_snapshot)),
-            bucket_root_cache: Arc::new(RwLock::new(HashMap::new())),
-            bucket_tree_cache: Arc::new(RwLock::new(HashMap::new())),
+            bucket_root_cache: Arc::new(RwLock::new(BucketRootCache::new(
+                options.bucket_root_cache_capacity,
+            ))),
+            bucket_tree_cache: Arc::new(RwLock::new(BucketTreeCache::new(
+                options.bucket_tree_cache_capacity,
+            ))),
+            options: options.clone(),
             instance_anchor: None,
         };
         let instance_arc = Arc::new(instance);
@@ -1170,6 +1347,9 @@ impl BTree {
             let mut reg = btree_instance_registry().lock();
             sweep_dead_btree_instances(&mut reg);
             if let Some(existing) = reg.get(&key).and_then(|w| w.upgrade()) {
+                if existing.options != options {
+                    return Err(Error::Invalid);
+                }
                 let mut handle = existing.as_ref().clone();
                 handle.instance_anchor = Some(existing);
                 handle.sync_local_snapshot_from_store();
@@ -1253,7 +1433,7 @@ impl BTree {
                 let latest_seq = self.store.get_seq();
                 self.bucket_root_cache
                     .write()
-                    .insert(name_bytes.to_vec(), (new_root, latest_seq));
+                    .insert(name_bytes.to_vec(), latest_seq, new_root);
                 Ok(res)
             }
             Err(e) => {
@@ -1316,7 +1496,7 @@ impl BTree {
                 let latest_seq = self.store.get_seq();
                 let mut cache = self.bucket_root_cache.write();
                 for (name, new_root) in updated {
-                    cache.insert(name, (new_root, latest_seq));
+                    cache.insert(name, latest_seq, new_root);
                 }
                 Ok(res)
             }
@@ -1462,17 +1642,11 @@ impl BTree {
         }
 
         let name_bytes = bucket.as_bytes();
-        let cached_tree =
-            self.bucket_tree_cache
-                .read()
-                .get(name_bytes)
-                .and_then(|(_root, seq, tree)| {
-                    if *seq == latest_seq {
-                        Some(tree.clone())
-                    } else {
-                        None
-                    }
-                });
+        let cached_tree = self
+            .bucket_tree_cache
+            .read()
+            .get(name_bytes, latest_seq)
+            .cloned();
         if let Some(tree) = cached_tree {
             let txn = ReadOnlyTxn { tree, _guard: lock };
             return f(&txn);
@@ -1481,14 +1655,8 @@ impl BTree {
         let cached_root = self
             .bucket_root_cache
             .read()
-            .get(name_bytes)
-            .and_then(|(root, seq)| {
-                if *seq == latest_seq {
-                    Some(*root)
-                } else {
-                    None
-                }
-            });
+            .get(name_bytes, latest_seq)
+            .copied();
 
         let bucket_root = if let Some(root) = cached_root {
             root
@@ -1507,7 +1675,7 @@ impl BTree {
             let root = metadata.root_page_id;
             self.bucket_root_cache
                 .write()
-                .insert(name_bytes.to_vec(), (root, latest_seq));
+                .insert(name_bytes.to_vec(), latest_seq, root);
             root
         };
 
@@ -1515,7 +1683,7 @@ impl BTree {
         let tree = Arc::new(ReadOnlyTree::new(logical_store_obj, bucket_root)?);
         self.bucket_tree_cache
             .write()
-            .insert(name_bytes.to_vec(), (bucket_root, latest_seq, tree.clone()));
+            .insert(name_bytes.to_vec(), latest_seq, tree.clone());
 
         let txn = ReadOnlyTxn { tree, _guard: lock };
 
@@ -1596,7 +1764,20 @@ impl BTree {
         Ok(())
     }
 
-    /// Commit pending catalog changes if no conflict is detected.
+    /// Flushes any pending internal metadata changes held by this handle.
+    ///
+    /// This is a low-level API. Normal write operations should use [`BTree::exec`],
+    /// [`BTree::exec_multi`], or [`BTree::del_bucket`], which already commit on
+    /// success.
+    ///
+    /// If there are no pending page allocations/frees and the current catalog,
+    /// mapping, and reverse roots already match the cached snapshot, this is a
+    /// no-op and returns `Ok(())`.
+    ///
+    /// Unlike [`BTree::exec`] and [`BTree::exec_multi`], this method does not
+    /// refresh the handle to the latest on-disk state before attempting the
+    /// commit. If another writer has already advanced the sequence, this method
+    /// returns [`Error::Conflict`].
     pub fn commit(&self) -> Result<()> {
         let _lock = self.writer_lock.write();
         self.commit_internal()
@@ -1931,6 +2112,7 @@ impl BTree {
             self.store.clone(),
             mapping_tree,
             reverse_tree,
+            &self.options,
         ));
         let logical_store_obj: Arc<dyn PageStore> = logical_store;
         let catalog = Tree::open(
@@ -2006,6 +2188,7 @@ impl Clone for BTree {
             self.store.clone(),
             mapping_tree.clone(),
             reverse_tree.clone(),
+            &self.options,
         ));
         let logical_store_obj: Arc<dyn PageStore> = logical_store.clone();
         let catalog_tree = Arc::new(
@@ -2032,7 +2215,122 @@ impl Clone for BTree {
             local_snapshot: Arc::new(RwLock::new(snapshot)),
             bucket_root_cache: self.bucket_root_cache.clone(),
             bucket_tree_cache: self.bucket_tree_cache.clone(),
+            options: self.options.clone(),
             instance_anchor: self.instance_anchor.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::Node;
+    use crate::page_store::{Lid, PageStore};
+
+    struct DummyPageStore;
+
+    impl PageStore for DummyPageStore {
+        fn alloc_pages(&self, _nr_pages: u32, _alloc: &mut HashSet<u32>) -> Result<Vec<Lid>> {
+            Err(Error::Internal)
+        }
+
+        fn schedule_free(&self, _lid: Lid, _freed: &mut Vec<(u32, u32)>) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn free_pages_immediate(&self, _page_id: u32, _nr_pages: u32) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn unfree_pages_immediate(&self, _page_id: u32, _nr_pages: u32) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn load_node(&self, _lid: Lid) -> Result<Arc<Node>> {
+            Err(Error::Internal)
+        }
+
+        fn load_page(&self, _lid: Lid) -> Result<Vec<u8>> {
+            Err(Error::Internal)
+        }
+
+        fn load_data(&self, _lids: &[Lid], _len: usize) -> Result<Vec<u8>> {
+            Err(Error::Internal)
+        }
+
+        fn read_data(&self, _lids: &[Lid], _buf: &mut [u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn write_data(&self, _lids: &[Lid], _data: &[u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn write_page(&self, _lid: Lid, _data: &[u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+    }
+
+    fn dummy_read_only_tree() -> Arc<ReadOnlyTree> {
+        Arc::new(ReadOnlyTree {
+            store: Arc::new(DummyPageStore),
+            root_page_id: 0,
+            root_node: None,
+        })
+    }
+
+    #[test]
+    fn bucket_root_cache_overwrite_keeps_storage_bounded() {
+        let mut cache = BucketRootCache::new(usize::MAX);
+        cache.insert(b"a".to_vec(), 1, 1);
+
+        for seq in 1..=64 {
+            cache.insert(b"b".to_vec(), seq as u64, seq);
+        }
+
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.slots.len(), 2);
+        assert_eq!(cache.get(b"a", 1).copied(), Some(1));
+        assert_eq!(cache.get(b"b", 64).copied(), Some(64));
+        assert_eq!(cache.get(b"b", 63).copied(), None);
+    }
+
+    #[test]
+    fn bucket_root_cache_keeps_hot_entry_under_cold_insert_pressure() {
+        let mut cache = BucketRootCache::new(2);
+        cache.insert(b"a".to_vec(), 1, 1);
+        cache.insert(b"b".to_vec(), 1, 2);
+
+        assert_eq!(cache.get(b"a", 1).copied(), Some(1));
+        cache.insert(b"c".to_vec(), 1, 3);
+        assert_eq!(cache.get(b"a", 1).copied(), Some(1));
+
+        cache.insert(b"d".to_vec(), 1, 4);
+
+        assert_eq!(cache.get(b"a", 1).copied(), Some(1));
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.slots.len(), 2);
+    }
+
+    #[test]
+    fn bucket_tree_cache_overwrite_keeps_storage_bounded() {
+        let mut cache = BucketTreeCache::new(usize::MAX);
+        cache.insert(b"a".to_vec(), 1, dummy_read_only_tree());
+
+        let mut expected_tree = dummy_read_only_tree();
+        for seq in 1..=64 {
+            expected_tree = dummy_read_only_tree();
+            cache.insert(b"b".to_vec(), seq, expected_tree.clone());
+        }
+
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.slots.len(), 2);
+        assert!(cache.get(b"a", 1).is_some());
+        let cached_tree = cache
+            .get(b"b", 64)
+            .cloned()
+            .expect("latest tree should stay cached");
+        assert!(Arc::ptr_eq(&cached_tree, &expected_tree));
+        assert!(cache.get(b"b", 63).is_none());
     }
 }

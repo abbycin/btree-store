@@ -9,7 +9,7 @@ homepage = "https://github.com/abbycin/btree-store"
 repository = "https://github.com/abbycin/btree-store"
 description = "A persistent, embedded key-value storage engine in Rust featuring a Copy-On-Write (COW) B-Tree, ACID compliance, and crash safety with multi-bucket support"
 license = "MIT"
-keywords = ["database", "kv", "btree", "storage", "embedded"]
+keywords = ["database", "kv", "btree", "storage", "lmdb"]
 categories = ["database-implementations", "data-structures"]
 
 [features]

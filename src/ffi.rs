@@ -1,7 +1,9 @@
 #![cfg(feature = "ffi")]
 
 use crate::page_store::PageStore;
-use crate::{BTree, BucketMetadata, Error, PageId, ReadOnlyTree, Tree, validate_bucket_name};
+use crate::{
+    BTree, BucketMetadata, Error, MAX_KEY_LEN, PageId, ReadOnlyTree, Tree, validate_bucket_name,
+};
 use parking_lot::RwLock;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -207,6 +209,11 @@ pub extern "C" fn btree_open(path: *const c_char, out: *mut *mut BTree) -> c_int
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn btree_max_key_len() -> usize {
+    MAX_KEY_LEN
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn btree_close(db: *mut BTree) {
     if db.is_null() {
         return;
@@ -393,7 +400,7 @@ pub extern "C" fn btree_exec_multi(
     let latest_seq = btree.store.get_seq();
     let mut cache = btree.bucket_root_cache.write();
     for (name, new_root) in updated {
-        cache.insert(name, (new_root, latest_seq));
+        cache.insert(name, latest_seq, new_root);
     }
 
     0
@@ -812,5 +819,10 @@ mod tests {
         );
 
         btree_close(db);
+    }
+
+    #[test]
+    fn ffi_exposes_current_max_key_len() {
+        assert_eq!(btree_max_key_len(), MAX_KEY_LEN);
     }
 }

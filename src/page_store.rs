@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::node::Node;
 use crate::store::Store;
-use crate::{Error, OpenOptions, Result, Tree};
+use crate::{CacheMode, Error, OpenOptions, Result, Tree};
 use parking_lot::Mutex;
 
-pub type Lid = u32;
-pub type Pid = u32;
+pub(crate) type Lid = u32;
+pub(crate) type Pid = u32;
 
 pub(crate) fn encode_u32_key(value: u32) -> [u8; 4] {
     value.to_be_bytes()
@@ -238,7 +238,7 @@ impl LidPidHotCache {
     }
 }
 
-pub trait PageStore: Send + Sync {
+pub(crate) trait PageStore: Send + Sync {
     fn alloc_pages(&self, nr_pages: u32, alloc: &mut HashSet<u32>) -> Result<Vec<Lid>>;
 
     fn alloc_page(&self, alloc: &mut HashSet<u32>) -> Result<Lid> {
@@ -248,16 +248,43 @@ pub trait PageStore: Send + Sync {
 
     fn schedule_free(&self, lid: Lid, freed: &mut Vec<(u32, u32)>) -> Result<()>;
     fn free_pages_immediate(&self, page_id: u32, nr_pages: u32) -> Result<()>;
-    fn unfree_pages_immediate(&self, page_id: u32, nr_pages: u32) -> Result<()>;
     fn load_node(&self, lid: Lid) -> Result<Arc<Node>>;
     fn load_page(&self, lid: Lid) -> Result<Vec<u8>>;
     fn load_data(&self, lids: &[Lid], len: usize) -> Result<Vec<u8>>;
     fn read_data(&self, lids: &[Lid], buf: &mut [u8]) -> Result<()>;
     fn write_data(&self, lids: &[Lid], data: &[u8]) -> Result<()>;
     fn write_page(&self, lid: Lid, data: &[u8]) -> Result<()>;
+
+    fn cached_node_is_leaf(&self, _lid: Lid) -> Option<bool> {
+        None
+    }
+
+    fn cache_node(&self, _lid: Lid, _node: Arc<Node>) {}
+
+    fn load_node_with_mode(&self, lid: Lid, mode: CacheMode) -> Result<Arc<Node>> {
+        match mode {
+            CacheMode::Default => self.load_node(lid),
+            CacheMode::ByPass => {
+                let raw = self.load_page_with_mode(lid, mode)?;
+                Ok(Arc::new(Node::from_raw(raw)?))
+            }
+        }
+    }
+
+    fn load_page_with_mode(&self, lid: Lid, _mode: CacheMode) -> Result<Vec<u8>> {
+        self.load_page(lid)
+    }
+
+    fn load_data_with_mode(&self, lids: &[Lid], len: usize, _mode: CacheMode) -> Result<Vec<u8>> {
+        self.load_data(lids, len)
+    }
+
+    fn read_data_with_mode(&self, lids: &[Lid], buf: &mut [u8], _mode: CacheMode) -> Result<()> {
+        self.read_data(lids, buf)
+    }
 }
 
-pub struct LogicalStore {
+pub(crate) struct LogicalStore {
     store: Arc<Store>,
     mapping_tree: Arc<Tree>,
     reverse_tree: Arc<Tree>,
@@ -266,7 +293,7 @@ pub struct LogicalStore {
 }
 
 impl LogicalStore {
-    pub fn new(
+    pub(crate) fn new(
         store: Arc<Store>,
         mapping_tree: Arc<Tree>,
         reverse_tree: Arc<Tree>,
@@ -286,7 +313,7 @@ impl LogicalStore {
         self.hot_lid_cache.clear();
     }
 
-    fn resolve_pid(&self, lid: Lid) -> Result<Pid> {
+    fn resolve_pid_with_mode(&self, lid: Lid, _mode: CacheMode) -> Result<Pid> {
         if let Some(pid) = self.hot_lid_cache.get(lid) {
             return Ok(pid);
         }
@@ -294,6 +321,7 @@ impl LogicalStore {
             self.hot_lid_cache.put(lid, pid);
             return Ok(pid);
         }
+
         let key = encode_u32_key(lid);
         let value = self.mapping_tree.get(&key)?;
         let pid = decode_u32_key(&value)?;
@@ -302,12 +330,20 @@ impl LogicalStore {
         Ok(pid)
     }
 
-    fn map_lids(&self, lids: &[Lid]) -> Result<Vec<Pid>> {
+    fn resolve_pid(&self, lid: Lid) -> Result<Pid> {
+        self.resolve_pid_with_mode(lid, CacheMode::Default)
+    }
+
+    fn map_lids_with_mode(&self, lids: &[Lid], mode: CacheMode) -> Result<Vec<Pid>> {
         let mut pids = Vec::with_capacity(lids.len());
         for &lid in lids {
-            pids.push(self.resolve_pid(lid)?);
+            pids.push(self.resolve_pid_with_mode(lid, mode)?);
         }
         Ok(pids)
+    }
+
+    fn map_lids(&self, lids: &[Lid]) -> Result<Vec<Pid>> {
+        self.map_lids_with_mode(lids, CacheMode::Default)
     }
 }
 
@@ -332,10 +368,6 @@ impl PageStore for Store {
         self.free_pages(page_id, nr_pages)
     }
 
-    fn unfree_pages_immediate(&self, page_id: u32, nr_pages: u32) -> Result<()> {
-        self.unfree_pages(page_id, nr_pages)
-    }
-
     fn load_node(&self, lid: Lid) -> Result<Arc<Node>> {
         self.load_node(lid)
     }
@@ -358,6 +390,14 @@ impl PageStore for Store {
 
     fn write_page(&self, lid: Lid, data: &[u8]) -> Result<()> {
         self.write_page(lid, data)
+    }
+
+    fn cached_node_is_leaf(&self, lid: Lid) -> Option<bool> {
+        Store::cached_node_is_leaf(self, lid)
+    }
+
+    fn cache_node(&self, lid: Lid, node: Arc<Node>) {
+        Store::cache_node(self, lid, node);
     }
 }
 
@@ -407,17 +447,28 @@ impl PageStore for LogicalStore {
         self.store.free_pages(page_id, nr_pages)
     }
 
-    fn unfree_pages_immediate(&self, page_id: u32, nr_pages: u32) -> Result<()> {
-        self.store.unfree_pages(page_id, nr_pages)
-    }
-
     fn load_node(&self, lid: Lid) -> Result<Arc<Node>> {
         let pid = self.resolve_pid(lid)?;
         self.store.load_node(pid)
     }
 
+    fn load_node_with_mode(&self, lid: Lid, mode: CacheMode) -> Result<Arc<Node>> {
+        match mode {
+            CacheMode::Default => self.load_node(lid),
+            CacheMode::ByPass => {
+                let raw = self.load_page_with_mode(lid, mode)?;
+                Ok(Arc::new(Node::from_raw(raw)?))
+            }
+        }
+    }
+
     fn load_page(&self, lid: Lid) -> Result<Vec<u8>> {
         let pid = self.resolve_pid(lid)?;
+        self.store.load_page(pid)
+    }
+
+    fn load_page_with_mode(&self, lid: Lid, mode: CacheMode) -> Result<Vec<u8>> {
+        let pid = self.resolve_pid_with_mode(lid, mode)?;
         self.store.load_page(pid)
     }
 
@@ -426,8 +477,18 @@ impl PageStore for LogicalStore {
         self.store.load_data(&pids, len)
     }
 
+    fn load_data_with_mode(&self, lids: &[Lid], len: usize, mode: CacheMode) -> Result<Vec<u8>> {
+        let pids = self.map_lids_with_mode(lids, mode)?;
+        self.store.load_data(&pids, len)
+    }
+
     fn read_data(&self, lids: &[Lid], buf: &mut [u8]) -> Result<()> {
         let pids = self.map_lids(lids)?;
+        self.store.read_data(&pids, buf)
+    }
+
+    fn read_data_with_mode(&self, lids: &[Lid], buf: &mut [u8], mode: CacheMode) -> Result<()> {
+        let pids = self.map_lids_with_mode(lids, mode)?;
         self.store.read_data(&pids, buf)
     }
 
@@ -440,11 +501,144 @@ impl PageStore for LogicalStore {
         let pid = self.resolve_pid(lid)?;
         self.store.write_page(pid, data)
     }
+
+    fn cached_node_is_leaf(&self, lid: Lid) -> Option<bool> {
+        let pid = self
+            .hot_lid_cache
+            .get(lid)
+            .or_else(|| self.lid_cache.get(lid))?;
+        self.store.cached_node_is_leaf(pid)
+    }
+
+    fn cache_node(&self, lid: Lid, node: Arc<Node>) {
+        if let Ok(pid) = self.resolve_pid_with_mode(lid, CacheMode::ByPass) {
+            self.lid_cache.put(lid, pid);
+            self.hot_lid_cache.put(lid, pid);
+            self.store.cache_node(pid, node);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::Node;
+    use parking_lot::RwLock;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tempfile::TempDir;
+
+    struct NoopPageStore;
+
+    impl PageStore for NoopPageStore {
+        fn alloc_pages(&self, _nr_pages: u32, _alloc: &mut HashSet<u32>) -> Result<Vec<Lid>> {
+            Err(Error::Internal)
+        }
+
+        fn schedule_free(&self, _lid: Lid, _freed: &mut Vec<(u32, u32)>) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn free_pages_immediate(&self, _page_id: u32, _nr_pages: u32) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn load_node(&self, _lid: Lid) -> Result<Arc<Node>> {
+            Err(Error::Internal)
+        }
+
+        fn load_page(&self, _lid: Lid) -> Result<Vec<u8>> {
+            Err(Error::Internal)
+        }
+
+        fn load_data(&self, _lids: &[Lid], _len: usize) -> Result<Vec<u8>> {
+            Err(Error::Internal)
+        }
+
+        fn read_data(&self, _lids: &[Lid], _buf: &mut [u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn write_data(&self, _lids: &[Lid], _data: &[u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn write_page(&self, _lid: Lid, _data: &[u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+    }
+
+    struct MappingTrackingStore {
+        root: Arc<Node>,
+        default_loads: AtomicUsize,
+        bypass_loads: AtomicUsize,
+    }
+
+    impl MappingTrackingStore {
+        fn new(root: Arc<Node>) -> Self {
+            Self {
+                root,
+                default_loads: AtomicUsize::new(0),
+                bypass_loads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PageStore for MappingTrackingStore {
+        fn alloc_pages(&self, _nr_pages: u32, _alloc: &mut HashSet<u32>) -> Result<Vec<Lid>> {
+            Err(Error::Internal)
+        }
+
+        fn schedule_free(&self, _lid: Lid, _freed: &mut Vec<(u32, u32)>) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn free_pages_immediate(&self, _page_id: u32, _nr_pages: u32) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn load_node(&self, lid: Lid) -> Result<Arc<Node>> {
+            if lid != 1 {
+                return Err(Error::NotFound);
+            }
+            self.default_loads.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(self.root.clone())
+        }
+
+        fn load_page(&self, _lid: Lid) -> Result<Vec<u8>> {
+            Err(Error::Internal)
+        }
+
+        fn load_data(&self, _lids: &[Lid], _len: usize) -> Result<Vec<u8>> {
+            Err(Error::Internal)
+        }
+
+        fn read_data(&self, _lids: &[Lid], _buf: &mut [u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn write_data(&self, _lids: &[Lid], _data: &[u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn write_page(&self, _lid: Lid, _data: &[u8]) -> Result<()> {
+            Err(Error::Internal)
+        }
+
+        fn load_node_with_mode(&self, lid: Lid, mode: CacheMode) -> Result<Arc<Node>> {
+            match mode {
+                CacheMode::Default => self.load_node(lid),
+                CacheMode::ByPass => {
+                    if lid != 1 {
+                        return Err(Error::NotFound);
+                    }
+                    self.bypass_loads.fetch_add(1, AtomicOrdering::Relaxed);
+                    Ok(self.root.clone())
+                }
+            }
+        }
+    }
 
     #[test]
     fn lid_pid_cache_small_capacity_uses_only_nonzero_shards() {
@@ -466,5 +660,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn bypass_pid_resolution_keeps_mapping_tree_on_cached_path() {
+        let mut mapping_root = Node::new_leaf();
+        mapping_root
+            .put(
+                &NoopPageStore,
+                &encode_u32_key(7),
+                &encode_u32_key(99),
+                &mut Vec::new(),
+                &mut HashSet::new(),
+            )
+            .expect("seed mapping tree");
+
+        let mapping_store = Arc::new(MappingTrackingStore::new(Arc::new(mapping_root)));
+        let mapping_tree = Arc::new(
+            Tree::open(
+                mapping_store.clone(),
+                Arc::new(RwLock::new(1)),
+                Arc::new(RwLock::new(Vec::new())),
+                Arc::new(RwLock::new(HashSet::new())),
+            )
+            .expect("open mapping tree"),
+        );
+        let reverse_tree = Arc::new(
+            Tree::open(
+                mapping_store.clone(),
+                Arc::new(RwLock::new(0)),
+                Arc::new(RwLock::new(Vec::new())),
+                Arc::new(RwLock::new(HashSet::new())),
+            )
+            .expect("open reverse tree"),
+        );
+        let temp_dir = TempDir::new().expect("temp dir");
+        let logical = LogicalStore::new(
+            Arc::new(
+                Store::open(
+                    temp_dir.path().join("mapping-cache.db"),
+                    &OpenOptions::default(),
+                )
+                .expect("store"),
+            ),
+            mapping_tree,
+            reverse_tree,
+            &OpenOptions::default(),
+        );
+
+        let pid = logical
+            .resolve_pid_with_mode(7, CacheMode::ByPass)
+            .expect("resolve pid");
+        assert_eq!(pid, 99);
+        assert_eq!(
+            mapping_store.default_loads.load(AtomicOrdering::Relaxed),
+            1,
+            "mapping tree lookup should stay on the normal cached path"
+        );
+        assert_eq!(
+            mapping_store.bypass_loads.load(AtomicOrdering::Relaxed),
+            0,
+            "mapping tree lookup must not bypass its own node cache"
+        );
     }
 }

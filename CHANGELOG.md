@@ -2,6 +2,17 @@
 
 All notable changes to the **btree-store** project will be documented in this file.
 
+## [0.1.10] - 2026-07-06
+
+### Added
+- **Configurable Runtime Open Options**: Added `OpenOptions`, `SyncMode`, and `BTree::open_with_options` so callers can tune node cache, `lid -> pid` caches, shared bucket root/tree caches, and post-commit sync policy. Reopening the same path in-process with different runtime options now returns `Error::Invalid`.
+- **Uncached Iterator APIs**: Added `Txn::iter_uncached` and `ReadOnlyTxn::iter_uncached` for scan-heavy reads that bypass leaf-node and overflow-value-page caching while preserving hot upper-level branch paths.
+- **Public Key-Length Limit Helper**: Exported `MAX_KEY_LEN` in Rust and `btree_max_key_len()` in the C API so applications can validate keys and bucket names against the engine limit before issuing operations.
+
+### Changed
+- **Bucket Cache Eviction Policy**: Shared bucket root/tree caches now use bounded second-chance eviction instead of unbounded maps, keeping hot buckets resident under churn without adding write-path locking to `view()`.
+- **Uncached Scan Cache Behavior**: Uncached iterators now preserve internal `lid -> pid` mapping-cache reuse while avoiding leaf-node cache warming, so repeated scans do not keep large leaf pages hot in the node clock cache.
+
 ## [0.1.9] - 2026-06-29
 
 ### Added

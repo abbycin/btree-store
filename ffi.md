@@ -44,6 +44,8 @@ ffi.exe
 ## API Overview
 open/close:
 - btree_open
+- btree_default_open_options
+- btree_open_with_options
 - btree_max_key_len
 - btree_close
 
@@ -61,6 +63,12 @@ kv operations:
 - txn_update
 - txn_del
 
+iteration:
+- txn_iter
+- txn_iter_uncached
+- btree_iter_next
+- btree_iter_close
+
 memory:
 - btree_free
 
@@ -75,6 +83,34 @@ int btree_open(const char *path, BTree **out);
 - path: utf-8 file path
 - out: output handle, set to non-null on success
 - returns: 0 on success, non-zero on error
+
+```
+typedef struct BTreeOpenOptions {
+    size_t node_cache_capacity;
+    size_t lid_pid_cache_capacity;
+    size_t lid_pid_hot_cache_capacity;
+    size_t bucket_root_cache_capacity;
+    size_t bucket_tree_cache_capacity;
+    uint32_t sync_mode;
+} BTreeOpenOptions;
+```
+- runtime-only open options matching the Rust `OpenOptions`
+- `sync_mode` must be one of `BTREE_SYNC_ADAPTIVE`, `BTREE_SYNC_DATA`, or `BTREE_SYNC_ALL`
+
+```
+int btree_default_open_options(BTreeOpenOptions *out);
+```
+- out: receives the current default runtime options
+- returns: 0 on success, non-zero on error
+
+```
+int btree_open_with_options(const char *path, const BTreeOpenOptions *options, BTree **out);
+```
+- path: utf-8 file path
+- options: runtime-only open options
+- out: output handle, set to non-null on success
+- returns: 0 on success, non-zero on error
+- note: same-path reopen within one process must use identical options
 
 ```
 size_t btree_max_key_len(void);
@@ -161,6 +197,35 @@ int txn_del(Txn *txn, const uint8_t *key, size_t klen);
 - note: invalid in read-only view
 
 ```
+int txn_iter(Txn *txn, BTreeIter **out);
+```
+- txn: transaction handle
+- out: iterator handle valid only during the surrounding callback
+- returns: 0 on success, non-zero on error
+
+```
+int txn_iter_uncached(Txn *txn, BTreeIter **out);
+```
+- txn: transaction handle
+- out: iterator handle valid only during the surrounding callback
+- returns: 0 on success, non-zero on error
+- note: bypasses leaf-node and overflow-value-page caching, but may still reuse cached branch paths
+
+```
+int btree_iter_next(BTreeIter *iter, int (*fn)(const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen, void *ctx), void *ctx);
+```
+- iter: iterator handle returned by `txn_iter` or `txn_iter_uncached`
+- fn: callback invoked for the next key/value pair
+- ctx: user context pointer passed to fn
+- returns: `0` when an item was produced, `1` on end-of-iteration, non-zero error code on failure
+
+```
+void btree_iter_close(BTreeIter *iter);
+```
+- iter: iterator handle returned by `txn_iter` or `txn_iter_uncached`
+- note: safe to pass NULL
+
+```
 void btree_free(void *p, size_t len);
 ```
 - p/len: buffer returned by txn_get
@@ -197,6 +262,7 @@ void btree_last_error_clear(void);
 - callback must not call `exec`/`view`
 - keys and bucket names are invalid when empty or longer than `btree_max_key_len()` bytes
 - `Txn` and `MultiTxn` handles are valid only during the callback
+- `BTreeIter` handles are valid only during the callback that created them
 - `longjmp` across ffi is unsafe
 - panics are not caught; build with `panic=abort`
 

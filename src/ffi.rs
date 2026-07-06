@@ -2,7 +2,8 @@
 
 use crate::page_store::PageStore;
 use crate::{
-    BTree, BucketMetadata, Error, MAX_KEY_LEN, PageId, ReadOnlyTree, Tree, validate_bucket_name,
+    BTree, BucketMetadata, Error, MAX_KEY_LEN, OpenOptions, PageId, ReadOnlyTree, SyncMode, Tree,
+    TreeIterator, validate_bucket_name,
 };
 use parking_lot::RwLock;
 use std::cell::{Cell, RefCell};
@@ -23,6 +24,10 @@ const ERR_DUPLICATE: c_int = -8;
 const ERR_CONFLICT: c_int = -9;
 #[allow(dead_code)]
 const ERR_UNKNOWN: c_int = -1000;
+
+pub const BTREE_SYNC_ADAPTIVE: u32 = 0;
+pub const BTREE_SYNC_DATA: u32 = 1;
+pub const BTREE_SYNC_ALL: u32 = 2;
 
 struct LastError {
     code: c_int,
@@ -109,6 +114,55 @@ pub struct Txn {
     kind: TxnKind,
 }
 
+#[repr(C)]
+pub struct BTreeOpenOptions {
+    pub node_cache_capacity: usize,
+    pub lid_pid_cache_capacity: usize,
+    pub lid_pid_hot_cache_capacity: usize,
+    pub bucket_root_cache_capacity: usize,
+    pub bucket_tree_cache_capacity: usize,
+    pub sync_mode: u32,
+}
+
+impl BTreeOpenOptions {
+    fn from_rust(options: OpenOptions) -> Self {
+        Self {
+            node_cache_capacity: options.node_cache_capacity,
+            lid_pid_cache_capacity: options.lid_pid_cache_capacity,
+            lid_pid_hot_cache_capacity: options.lid_pid_hot_cache_capacity,
+            bucket_root_cache_capacity: options.bucket_root_cache_capacity,
+            bucket_tree_cache_capacity: options.bucket_tree_cache_capacity,
+            sync_mode: match options.sync_mode {
+                SyncMode::Adaptive => BTREE_SYNC_ADAPTIVE,
+                SyncMode::Data => BTREE_SYNC_DATA,
+                SyncMode::All => BTREE_SYNC_ALL,
+            },
+        }
+    }
+
+    fn to_rust(&self) -> crate::Result<OpenOptions> {
+        let sync_mode = match self.sync_mode {
+            BTREE_SYNC_ADAPTIVE => SyncMode::Adaptive,
+            BTREE_SYNC_DATA => SyncMode::Data,
+            BTREE_SYNC_ALL => SyncMode::All,
+            _ => return Err(Error::Invalid),
+        };
+        Ok(OpenOptions {
+            node_cache_capacity: self.node_cache_capacity,
+            lid_pid_cache_capacity: self.lid_pid_cache_capacity,
+            lid_pid_hot_cache_capacity: self.lid_pid_hot_cache_capacity,
+            bucket_root_cache_capacity: self.bucket_root_cache_capacity,
+            bucket_tree_cache_capacity: self.bucket_tree_cache_capacity,
+            sync_mode,
+        })
+    }
+}
+
+#[repr(C)]
+pub struct BTreeIter {
+    iter: TreeIterator,
+}
+
 struct FfiBucket {
     initial_exists: bool,
     initial_root: PageId,
@@ -168,6 +222,8 @@ impl MultiTxn {
 
 type TxnCallback = Option<unsafe extern "C" fn(*mut Txn, *mut c_void) -> c_int>;
 type MultiTxnCallback = Option<unsafe extern "C" fn(*mut MultiTxn, *mut c_void) -> c_int>;
+type IterItemCallback =
+    Option<unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut c_void) -> c_int>;
 
 fn rollback_multi(
     btree: &BTree,
@@ -185,7 +241,35 @@ fn rollback_multi(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn btree_open(path: *const c_char, out: *mut *mut BTree) -> c_int {
+    let defaults = OpenOptions::default();
+    btree_open_with_options(
+        path,
+        &BTreeOpenOptions::from_rust(defaults) as *const BTreeOpenOptions,
+        out,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn btree_default_open_options(out: *mut BTreeOpenOptions) -> c_int {
     if out.is_null() {
+        return invalid_arg("null pointer");
+    }
+    unsafe {
+        *out = BTreeOpenOptions::from_rust(OpenOptions::default());
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn btree_open_with_options(
+    path: *const c_char,
+    options: *const BTreeOpenOptions,
+    out: *mut *mut BTree,
+) -> c_int {
+    if out.is_null() {
+        return invalid_arg("null pointer");
+    }
+    if options.is_null() {
         return invalid_arg("null pointer");
     }
     unsafe {
@@ -195,8 +279,12 @@ pub extern "C" fn btree_open(path: *const c_char, out: *mut *mut BTree) -> c_int
         Ok(s) => s,
         Err(code) => return code,
     };
+    let options = match unsafe { &*options }.to_rust() {
+        Ok(options) => options,
+        Err(e) => return set_last_error_from(e),
+    };
 
-    match BTree::open(path) {
+    match BTree::open_with_options(path, options) {
         Ok(tree) => {
             let boxed = Box::new(tree);
             unsafe {
@@ -570,6 +658,85 @@ pub extern "C" fn txn_del(txn: *mut Txn, key: *const u8, klen: usize) -> c_int {
     }
 }
 
+fn txn_make_iter(txn: &Txn, uncached: bool) -> Box<BTreeIter> {
+    let iter = match txn.kind {
+        TxnKind::Write(state) => unsafe {
+            if uncached {
+                (&*state.tree).iterator(crate::CacheMode::ByPass)
+            } else {
+                (&*state.tree).iterator(crate::CacheMode::Default)
+            }
+        },
+        TxnKind::Read(ptr) => unsafe {
+            if uncached {
+                (&*ptr).iterator(crate::CacheMode::ByPass)
+            } else {
+                (&*ptr).iterator(crate::CacheMode::Default)
+            }
+        },
+    };
+    Box::new(BTreeIter { iter })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn txn_iter(txn: *const Txn, out: *mut *mut BTreeIter) -> c_int {
+    if txn.is_null() || out.is_null() {
+        return invalid_arg("null pointer");
+    }
+    let txn = unsafe { &*txn };
+    let iter = txn_make_iter(txn, false);
+    unsafe {
+        *out = Box::into_raw(iter);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn txn_iter_uncached(txn: *const Txn, out: *mut *mut BTreeIter) -> c_int {
+    if txn.is_null() || out.is_null() {
+        return invalid_arg("null pointer");
+    }
+    let txn = unsafe { &*txn };
+    let iter = txn_make_iter(txn, true);
+    unsafe {
+        *out = Box::into_raw(iter);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn btree_iter_next(
+    iter: *mut BTreeIter,
+    cb: IterItemCallback,
+    ctx: *mut c_void,
+) -> c_int {
+    if iter.is_null() {
+        return invalid_arg("null pointer");
+    }
+    let cb = match cb {
+        Some(cb) => cb,
+        None => return invalid_arg("null callback"),
+    };
+
+    let iter = unsafe { &mut *iter };
+    let mut key = Vec::new();
+    let mut val = Vec::new();
+    if !iter.iter.next_ref(&mut key, &mut val) {
+        return 1;
+    }
+    unsafe { cb(key.as_ptr(), key.len(), val.as_ptr(), val.len(), ctx) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn btree_iter_close(iter: *mut BTreeIter) {
+    if iter.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(iter));
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn btree_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
@@ -641,6 +808,10 @@ mod tests {
         put_rc: c_int,
     }
 
+    struct IterCollectCtx {
+        pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    }
+
     unsafe extern "C" fn update_only_cb(txn: *mut Txn, ctx: *mut c_void) -> c_int {
         let ctx = unsafe { &mut *(ctx as *mut UpdateCtx) };
         let mut updated = -1;
@@ -704,6 +875,28 @@ mod tests {
         ctx.updated = updated;
         ctx.rc = rc;
         if rc == 0 { 0 } else { 2 }
+    }
+
+    unsafe extern "C" fn collect_iter_item(
+        key_ptr: *const u8,
+        key_len: usize,
+        val_ptr: *const u8,
+        val_len: usize,
+        ctx: *mut c_void,
+    ) -> c_int {
+        let ctx = unsafe { &mut *(ctx as *mut IterCollectCtx) };
+        let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) }.to_vec();
+        let val = unsafe { std::slice::from_raw_parts(val_ptr, val_len) }.to_vec();
+        ctx.pairs.push((key, val));
+        0
+    }
+
+    unsafe extern "C" fn fill_iter_bucket(txn: *mut Txn, _ctx: *mut c_void) -> c_int {
+        let rc = txn_put(txn, b"a".as_ptr(), 1, b"1".as_ptr(), 1);
+        if rc != 0 {
+            return rc;
+        }
+        txn_put(txn, b"b".as_ptr(), 1, b"2".as_ptr(), 1)
     }
 
     #[test]
@@ -824,5 +1017,143 @@ mod tests {
     #[test]
     fn ffi_exposes_current_max_key_len() {
         assert_eq!(btree_max_key_len(), MAX_KEY_LEN);
+    }
+
+    #[test]
+    fn ffi_default_open_options_match_rust_defaults() {
+        let mut options = BTreeOpenOptions {
+            node_cache_capacity: 0,
+            lid_pid_cache_capacity: 0,
+            lid_pid_hot_cache_capacity: 0,
+            bucket_root_cache_capacity: 0,
+            bucket_tree_cache_capacity: 0,
+            sync_mode: u32::MAX,
+        };
+        assert_eq!(btree_default_open_options(&mut options), 0);
+        let defaults = OpenOptions::default();
+        assert_eq!(options.node_cache_capacity, defaults.node_cache_capacity);
+        assert_eq!(options.lid_pid_cache_capacity, defaults.lid_pid_cache_capacity);
+        assert_eq!(
+            options.lid_pid_hot_cache_capacity,
+            defaults.lid_pid_hot_cache_capacity
+        );
+        assert_eq!(
+            options.bucket_root_cache_capacity,
+            defaults.bucket_root_cache_capacity
+        );
+        assert_eq!(
+            options.bucket_tree_cache_capacity,
+            defaults.bucket_tree_cache_capacity
+        );
+        assert_eq!(options.sync_mode, BTREE_SYNC_ADAPTIVE);
+    }
+
+    #[test]
+    fn ffi_open_with_options_rejects_invalid_sync_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("ffi_invalid_sync_mode.db");
+        let path = CString::new(db_path.to_str().unwrap()).unwrap();
+        let mut db = ptr::null_mut();
+        let mut options = BTreeOpenOptions::from_rust(OpenOptions::default());
+        options.sync_mode = 99;
+
+        assert_eq!(
+            btree_open_with_options(path.as_ptr(), &options, &mut db),
+            ERR_INVALID
+        );
+        assert!(db.is_null());
+    }
+
+    #[test]
+    fn ffi_iter_and_iter_uncached_follow_rust_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("ffi_iter_uncached.db");
+        let path = CString::new(db_path.to_str().unwrap()).unwrap();
+        let bucket = CString::new("ffi_bucket").unwrap();
+        let mut db = ptr::null_mut();
+
+        assert_eq!(btree_open(path.as_ptr(), &mut db), 0);
+        assert_eq!(btree_exec(db, bucket.as_ptr(), Some(fill_iter_bucket), ptr::null_mut()), 0);
+
+        let mut normal_pairs = IterCollectCtx { pairs: Vec::new() };
+        let mut uncached_pairs = IterCollectCtx { pairs: Vec::new() };
+
+        let view_result = unsafe {
+            (&*db)
+                .view("ffi_bucket", |txn| {
+                    let ffi_txn = Txn {
+                        kind: TxnKind::Read(txn.tree.as_ref() as *const ReadOnlyTree),
+                    };
+
+                    let mut iter = ptr::null_mut();
+                    assert_eq!(txn_iter(&ffi_txn, &mut iter), 0);
+                    assert_eq!(
+                        btree_iter_next(
+                            iter,
+                            Some(collect_iter_item),
+                            &mut normal_pairs as *mut IterCollectCtx as *mut c_void
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        btree_iter_next(
+                            iter,
+                            Some(collect_iter_item),
+                            &mut normal_pairs as *mut IterCollectCtx as *mut c_void
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        btree_iter_next(
+                            iter,
+                            Some(collect_iter_item),
+                            &mut normal_pairs as *mut IterCollectCtx as *mut c_void
+                        ),
+                        1
+                    );
+                    btree_iter_close(iter);
+
+                    let mut uncached_iter = ptr::null_mut();
+                    assert_eq!(txn_iter_uncached(&ffi_txn, &mut uncached_iter), 0);
+                    assert_eq!(
+                        btree_iter_next(
+                            uncached_iter,
+                            Some(collect_iter_item),
+                            &mut uncached_pairs as *mut IterCollectCtx as *mut c_void
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        btree_iter_next(
+                            uncached_iter,
+                            Some(collect_iter_item),
+                            &mut uncached_pairs as *mut IterCollectCtx as *mut c_void
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        btree_iter_next(
+                            uncached_iter,
+                            Some(collect_iter_item),
+                            &mut uncached_pairs as *mut IterCollectCtx as *mut c_void
+                        ),
+                        1
+                    );
+                    btree_iter_close(uncached_iter);
+                    Ok(())
+                })
+                .unwrap()
+        };
+        assert_eq!(view_result, ());
+        assert_eq!(normal_pairs.pairs, uncached_pairs.pairs);
+        assert_eq!(
+            normal_pairs.pairs,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
+            ]
+        );
+
+        btree_close(db);
     }
 }

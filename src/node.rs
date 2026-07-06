@@ -1,5 +1,5 @@
 use crate::page_store::PageStore;
-use crate::{Error, PageId, Result};
+use crate::{CacheMode, Error, PageId, Result};
 use std::alloc::{Layout, alloc, dealloc};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ const OFFSET_CHECKSUM: usize = PAGE_SIZE - 4;
 const OFFSET_NEXT_INDIRECT: usize = PAGE_SIZE - 8;
 const IDS_PER_INDIRECT_PAGE: usize = OFFSET_NEXT_INDIRECT / std::mem::size_of::<PageId>();
 
-pub struct AlignedPage {
+pub(crate) struct AlignedPage {
     ptr: *mut u8,
     layout: Layout,
 }
@@ -38,19 +38,19 @@ impl AlignedPage {
         page
     }
 
-    pub fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, PAGE_SIZE) }
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, PAGE_SIZE) }
     }
 
-    pub fn as_ptr(&self) -> *const u8 {
+    pub(crate) fn as_ptr(&self) -> *const u8 {
         self.ptr
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr
     }
 }
@@ -78,7 +78,7 @@ impl Clone for AlignedPage {
 
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Debug)]
-pub struct NodeHeader {
+pub(crate) struct NodeHeader {
     pub checksum: u64,
     pub is_leaf: u64,
     pub elems: u64,
@@ -95,7 +95,7 @@ pub const fn size_to_pages(size: usize) -> usize {
 
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Debug)]
-pub struct Slot {
+pub(crate) struct Slot {
     pub pos: u32,
     pub klen: u32,
     pub vlen: u32,
@@ -103,23 +103,23 @@ pub struct Slot {
 }
 
 impl Slot {
-    pub fn is_inline(&self) -> bool {
+    pub(crate) fn is_inline(&self) -> bool {
         self.page_id[0] == 0
     }
 
-    pub fn data_offset(&self) -> usize {
+    pub(crate) fn data_offset(&self) -> usize {
         self.pos as usize
     }
 
-    pub fn key_len(&self) -> usize {
+    pub(crate) fn key_len(&self) -> usize {
         self.klen as usize
     }
 
-    pub fn value_len(&self) -> usize {
+    pub(crate) fn value_len(&self) -> usize {
         self.vlen as usize
     }
 
-    pub fn nr_pages(&self) -> u32 {
+    pub(crate) fn nr_pages(&self) -> u32 {
         if self.vlen == 0 {
             0
         } else {
@@ -133,9 +133,9 @@ impl Slot {
 }
 
 #[derive(Clone)]
-pub struct Node {
-    pub page: AlignedPage,
-    pub dirty: bool,
+pub(crate) struct Node {
+    page: AlignedPage,
+    pub(crate) dirty: bool,
 }
 
 impl Node {
@@ -155,14 +155,14 @@ impl Node {
         unsafe { &mut *self.page.as_mut_ptr().add(slot_off).cast::<Slot>() }
     }
 
-    pub fn key_at(&self, pos: usize) -> &[u8] {
+    pub(crate) fn key_at(&self, pos: usize) -> &[u8] {
         let slot = self.slot_at(pos);
         let off = slot.data_offset();
         let len = slot.key_len();
         &self.page.as_slice()[off..off + len]
     }
 
-    pub fn value_at(&self, pos: usize) -> &[u8] {
+    pub(crate) fn value_at(&self, pos: usize) -> &[u8] {
         let slot = self.slot_at(pos);
         assert!(slot.is_inline());
         let off = slot.data_offset() + slot.key_len();
@@ -207,6 +207,15 @@ impl Node {
         store: &dyn PageStore,
         slot: &Slot,
     ) -> Result<Vec<PageId>> {
+        self.collect_page_ids_with_mode(store, slot, CacheMode::Default)
+    }
+
+    pub(crate) fn collect_page_ids_with_mode(
+        &self,
+        store: &dyn PageStore,
+        slot: &Slot,
+        mode: CacheMode,
+    ) -> Result<Vec<PageId>> {
         let nr_pages = slot.nr_pages() as usize;
         if nr_pages <= NR_INLINE_PAGE {
             return Ok(slot.page_id[0..nr_pages].to_vec());
@@ -216,7 +225,7 @@ impl Node {
         let mut curr_index_page = slot.page_id[0];
 
         while pages.len() < nr_pages {
-            let data = store.load_page(curr_index_page)?;
+            let data = store.load_page_with_mode(curr_index_page, mode)?;
             let stored_checksum =
                 u32::from_le_bytes(data[OFFSET_CHECKSUM..PAGE_SIZE].try_into().unwrap());
             let computed_checksum = crc32c::crc32c(&data[..OFFSET_CHECKSUM]);
@@ -415,7 +424,7 @@ impl Node {
         self.slot_at_mut(pos)
     }
 
-    pub fn shrink_slot(&mut self, pos: usize) -> Slot {
+    pub(crate) fn shrink_slot(&mut self, pos: usize) -> Slot {
         let elems = self.header().elems;
         let slot = *self.slot_at(pos);
         let slot_off = HEADER_SIZE + pos * SLOT_SIZE;
@@ -546,7 +555,7 @@ impl Node {
         self.update_checksum();
     }
 
-    pub fn from_raw(data: Vec<u8>) -> Result<Self> {
+    pub(crate) fn from_raw(data: Vec<u8>) -> Result<Self> {
         if data.len() != PAGE_SIZE {
             return Err(Error::Corruption);
         }
@@ -598,15 +607,15 @@ impl Node {
         this
     }
 
-    pub fn new_leaf() -> Self {
+    pub(crate) fn new_leaf() -> Self {
         Self::new(true)
     }
 
-    pub fn new_branch() -> Self {
+    pub(crate) fn new_branch() -> Self {
         Self::new(false)
     }
 
-    pub fn finalize(&mut self) -> &[u8] {
+    pub(crate) fn finalize(&mut self) -> &[u8] {
         if self.dirty {
             self.update_checksum();
             self.dirty = false;
@@ -614,23 +623,23 @@ impl Node {
         self.page.as_slice()
     }
 
-    pub fn header(&self) -> &NodeHeader {
+    pub(crate) fn header(&self) -> &NodeHeader {
         unsafe { &*self.page.as_ptr().cast::<NodeHeader>() }
     }
 
-    pub fn header_mut(&mut self) -> &mut NodeHeader {
+    pub(crate) fn header_mut(&mut self) -> &mut NodeHeader {
         unsafe { &mut *self.page.as_mut_ptr().cast::<NodeHeader>() }
     }
 
-    pub fn is_leaf(&self) -> bool {
+    pub(crate) fn is_leaf(&self) -> bool {
         self.header().is_leaf == 1
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.header().elems == 0
     }
 
-    pub fn put(
+    pub(crate) fn put(
         &mut self,
         store: &dyn PageStore,
         key: &[u8],
@@ -668,22 +677,27 @@ impl Node {
         Ok(())
     }
 
-    pub fn get(&self, store: &dyn PageStore, key: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn get_with_mode(
+        &self,
+        store: &dyn PageStore,
+        key: &[u8],
+        mode: CacheMode,
+    ) -> Result<Vec<u8>> {
         match self.search(key) {
             Ok(pos) => {
                 let slot = self.slot_at(pos);
                 if slot.is_inline() {
                     Ok(self.value_at(pos).to_vec())
                 } else {
-                    let pages = self.collect_page_ids(store, slot)?;
-                    store.load_data(&pages, slot.value_len())
+                    let pages = self.collect_page_ids_with_mode(store, slot, mode)?;
+                    store.load_data_with_mode(&pages, slot.value_len(), mode)
                 }
             }
             Err(_) => Err(Error::NotFound),
         }
     }
 
-    pub fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
+    pub(crate) fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
         let mut lo = 0;
         let mut hi = self.header().elems as usize;
         let elems = hi;
@@ -704,7 +718,7 @@ impl Node {
         }
     }
 
-    pub fn child_pos_for_key(&self, key: &[u8]) -> usize {
+    pub(crate) fn child_pos_for_key(&self, key: &[u8]) -> usize {
         debug_assert!(!self.is_leaf());
 
         let mut lo = 0usize;
@@ -719,7 +733,7 @@ impl Node {
         lo.saturating_sub(1)
     }
 
-    pub fn del(
+    pub(crate) fn del(
         &mut self,
         store: &dyn PageStore,
         key: &[u8],
@@ -738,7 +752,7 @@ impl Node {
         }
     }
 
-    pub fn split(&mut self) -> Result<(Vec<u8>, Node)> {
+    pub(crate) fn split(&mut self) -> Result<(Vec<u8>, Node)> {
         let mid = (self.header().elems / 2) as usize;
         let sep = self.key_at(mid).to_vec();
         let is_leaf = self.is_leaf();
@@ -757,7 +771,7 @@ impl Node {
         Ok((sep, node))
     }
 
-    pub fn update_checksum(&mut self) {
+    pub(crate) fn update_checksum(&mut self) {
         self.header_mut().checksum = 0;
         let real = self.calc_checksum();
         self.header_mut().checksum = real as u64;
@@ -770,7 +784,7 @@ impl Node {
         crc
     }
 
-    pub fn data_at(&self, pos: usize) -> &[u8] {
+    pub(crate) fn data_at(&self, pos: usize) -> &[u8] {
         let slot = self.slot_at(pos);
         let len = if self.is_leaf() && slot.is_inline() {
             slot.key_len() + slot.value_len()
@@ -781,19 +795,19 @@ impl Node {
         &self.page.as_slice()[off..off + len]
     }
 
-    pub fn child_at(&self, pos: usize) -> PageId {
+    pub(crate) fn child_at(&self, pos: usize) -> PageId {
         debug_assert!(!self.is_leaf());
         self.slot_at(pos).page_id[0]
     }
 
-    pub fn update_child_page(&mut self, pos: usize, page_id: PageId) {
+    pub(crate) fn update_child_page(&mut self, pos: usize, page_id: PageId) {
         debug_assert!(!self.is_leaf());
         let slot = self.slot_at_mut(pos);
         slot.page_id[0] = page_id;
         self.dirty = true;
     }
 
-    pub fn num_children(&self) -> usize {
+    pub(crate) fn num_children(&self) -> usize {
         self.header().elems as usize
     }
 }

@@ -118,11 +118,45 @@ static int multi_ops(MultiTxn *mtxn, void *ctx) {
     return txn_put(t2, (const uint8_t *)"k2", 2, (const uint8_t *)"v2", 2);
 }
 
+static int print_iter_item(
+    const uint8_t *key,
+    size_t klen,
+    const uint8_t *val,
+    size_t vlen,
+    void *ctx
+) {
+    (void)ctx;
+    printf("iter: %.*s=%.*s\n", (int)klen, key, (int)vlen, val);
+    return 0;
+}
+
+static int view_iter_uncached(Txn *txn, void *ctx) {
+    (void)ctx;
+    BTreeIter *iter = NULL;
+    int rc = txn_iter_uncached(txn, &iter);
+    if (rc != 0) {
+        return rc;
+    }
+    while ((rc = btree_iter_next(iter, print_iter_item, NULL)) == 0) {
+    }
+    btree_iter_close(iter);
+    return rc == 1 ? 0 : rc;
+}
+
 int main(void) {
     BTree *db = NULL;
-    int rc = btree_open("ffi_example.db", &db);
+    BTreeOpenOptions options;
+    int rc = btree_default_open_options(&options);
     if (rc != 0) {
-        print_last_error("btree_open");
+        print_last_error("btree_default_open_options");
+        return 1;
+    }
+    options.bucket_tree_cache_capacity = 1024;
+    options.sync_mode = BTREE_SYNC_ADAPTIVE;
+
+    rc = btree_open_with_options("ffi_example.db", &options, &db);
+    if (rc != 0) {
+        print_last_error("btree_open_with_options");
         return 1;
     }
 
@@ -150,6 +184,13 @@ int main(void) {
     rc = btree_view(db, "bucket1", view_get, NULL);
     if (rc != 0) {
         print_last_error("btree_view after update");
+        btree_close(db);
+        return 1;
+    }
+
+    rc = btree_view(db, "bucket1", view_iter_uncached, NULL);
+    if (rc != 0) {
+        print_last_error("btree_view uncached iter");
         btree_close(db);
         return 1;
     }

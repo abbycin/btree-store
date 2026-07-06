@@ -16,11 +16,11 @@ use crate::{
     node::{Node, PAGE_SIZE},
 };
 
-pub struct MetaSnapshot {
-    pub catalog_root: PageId,
-    pub mapping_root: PageId,
-    pub reverse_root: PageId,
-    pub seq: u64,
+pub(crate) struct MetaSnapshot {
+    pub(crate) catalog_root: PageId,
+    pub(crate) mapping_root: PageId,
+    pub(crate) reverse_root: PageId,
+    pub(crate) seq: u64,
 }
 
 /// Abstract Trait for Positional I/O to support Linux, Windows, macOS, FreeBSD.
@@ -385,7 +385,7 @@ fn parse_current_meta(buf: &[u8]) -> Result<Option<MetaNode>> {
     Ok(None)
 }
 
-pub struct Store {
+pub(crate) struct Store {
     file: File,
     sb: Mutex<MetaNode>,
     shared: Arc<SharedMeta>,
@@ -400,7 +400,7 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open<P: AsRef<Path>>(path: P, options: &OpenOptions) -> Result<Self> {
+    pub(crate) fn open<P: AsRef<Path>>(path: P, options: &OpenOptions) -> Result<Self> {
         let path = path.as_ref();
 
         let (file, sb, stale_sb) = if !path.exists() {
@@ -943,15 +943,15 @@ impl Store {
         Ok(truncated)
     }
 
-    pub fn get_seq(&self) -> u64 {
+    pub(crate) fn get_seq(&self) -> u64 {
         self.sb.lock().seq
     }
 
-    pub fn shared_snapshot(&self) -> (u64, PageId) {
+    pub(crate) fn shared_snapshot(&self) -> (u64, PageId) {
         self.shared.snapshot()
     }
 
-    pub fn get_next_page_id(&self) -> PageId {
+    pub(crate) fn get_next_page_id(&self) -> PageId {
         self.sb.lock().next_page_id
     }
 
@@ -1035,13 +1035,13 @@ impl Store {
         Ok(Some(pages))
     }
 
-    pub fn alloc_pages(&self, nr_pages: u32) -> Result<Vec<PageId>> {
+    pub(crate) fn alloc_pages(&self, nr_pages: u32) -> Result<Vec<PageId>> {
         let mut sb = self.sb.lock();
         let mut freelist = self.freelist.lock();
         self.alloc_pages_inner(&mut sb, &mut freelist, nr_pages)
     }
 
-    pub fn alloc_lids(&self, nr_pages: u32) -> Result<Vec<PageId>> {
+    pub(crate) fn alloc_lids(&self, nr_pages: u32) -> Result<Vec<PageId>> {
         if nr_pages == 0 {
             return Ok(Vec::new());
         }
@@ -1057,7 +1057,7 @@ impl Store {
         Ok(lids)
     }
 
-    pub fn free_pages(&self, page_id: PageId, nr_pages: u32) -> Result<()> {
+    pub(crate) fn free_pages(&self, page_id: PageId, nr_pages: u32) -> Result<()> {
         if page_id == 0 || nr_pages == 0 {
             return Ok(());
         }
@@ -1072,7 +1072,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn unfree_pages(&self, page_id: PageId, nr_pages: u32) -> Result<()> {
+    pub(crate) fn unfree_pages(&self, page_id: PageId, nr_pages: u32) -> Result<()> {
         if page_id == 0 || nr_pages == 0 {
             return Ok(());
         }
@@ -1082,7 +1082,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&self) -> Result<()> {
         self.sync_impl(false)
     }
 
@@ -1099,7 +1099,7 @@ impl Store {
         }
     }
 
-    pub fn load_node(&self, page_id: PageId) -> Result<Arc<Node>> {
+    pub(crate) fn load_node(&self, page_id: PageId) -> Result<Arc<Node>> {
         if let Some(node) = self.cache.get(page_id) {
             return Ok(node);
         }
@@ -1111,17 +1111,17 @@ impl Store {
         Ok(node)
     }
 
-    pub fn load_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+    pub(crate) fn load_page(&self, page_id: PageId) -> Result<Vec<u8>> {
         self.load_data(&[page_id], PAGE_SIZE)
     }
 
-    pub fn load_data(&self, pages: &[PageId], len: usize) -> Result<Vec<u8>> {
+    pub(crate) fn load_data(&self, pages: &[PageId], len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
         self.read_data(pages, &mut buf)?;
         Ok(buf)
     }
 
-    pub fn read_data(&self, pages: &[PageId], buf: &mut [u8]) -> Result<()> {
+    pub(crate) fn read_data(&self, pages: &[PageId], buf: &mut [u8]) -> Result<()> {
         for (i, &pid) in pages.iter().enumerate() {
             let offset = pid as u64 * PAGE_SIZE as u64;
             let start = i * PAGE_SIZE;
@@ -1134,7 +1134,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn write_data(&self, pages: &[PageId], data: &[u8]) -> Result<()> {
+    pub(crate) fn write_data(&self, pages: &[PageId], data: &[u8]) -> Result<()> {
         for (i, &pid) in pages.iter().enumerate() {
             let offset = pid as u64 * PAGE_SIZE as u64;
             let start = i * PAGE_SIZE;
@@ -1147,23 +1147,23 @@ impl Store {
         Ok(())
     }
 
-    pub fn write_page(&self, page_id: PageId, data: &[u8]) -> Result<()> {
+    pub(crate) fn write_page(&self, page_id: PageId, data: &[u8]) -> Result<()> {
         self.write_data(&[page_id], data)
     }
 
-    pub fn get_catalog_root(&self) -> PageId {
+    pub(crate) fn get_catalog_root(&self) -> PageId {
         self.sb.lock().catalog_root
     }
 
-    pub fn get_mapping_root(&self) -> PageId {
+    pub(crate) fn get_mapping_root(&self) -> PageId {
         self.sb.lock().mapping_root
     }
 
-    pub fn get_reverse_root(&self) -> PageId {
+    pub(crate) fn get_reverse_root(&self) -> PageId {
         self.sb.lock().reverse_root
     }
 
-    pub fn cached_snapshot(&self) -> MetaSnapshot {
+    pub(crate) fn cached_snapshot(&self) -> MetaSnapshot {
         let sb = self.sb.lock();
         MetaSnapshot {
             catalog_root: sb.catalog_root,
@@ -1173,7 +1173,7 @@ impl Store {
         }
     }
 
-    pub fn max_freelist_page_id(&self) -> PageId {
+    pub(crate) fn max_freelist_page_id(&self) -> PageId {
         self.freelist_pages
             .lock()
             .iter()
@@ -1182,7 +1182,7 @@ impl Store {
             .unwrap_or(0)
     }
 
-    pub fn refresh_sb(&self) -> Result<MetaSnapshot> {
+    pub(crate) fn refresh_sb(&self) -> Result<MetaSnapshot> {
         let mut buf0 = [0u8; PAGE_SIZE];
         let mut buf1 = [0u8; PAGE_SIZE];
 
@@ -1248,12 +1248,20 @@ impl Store {
         })
     }
 
-    pub fn clear_cache(&self) {
+    pub(crate) fn clear_cache(&self) {
         for shard in &self.cache.shards {
             let mut guard = shard.lock();
             guard.entries.iter_mut().for_each(|e| *e = None);
             guard.positions.clear();
         }
+    }
+
+    pub(crate) fn cached_node_is_leaf(&self, page_id: PageId) -> Option<bool> {
+        self.cache.peek(page_id).map(|node| node.is_leaf())
+    }
+
+    pub(crate) fn cache_node(&self, page_id: PageId, node: Arc<Node>) {
+        self.cache.put(page_id, node);
     }
 }
 
@@ -1317,6 +1325,11 @@ impl NodeCacheShard {
         None
     }
 
+    fn peek(&self, page_id: PageId) -> Option<Arc<Node>> {
+        self.find_entry_idx(page_id)
+            .and_then(|idx| self.entries[idx].as_ref().map(|entry| entry.node.clone()))
+    }
+
     fn put(&mut self, page_id: PageId, node: Arc<Node>) {
         if self.capacity == 0 {
             return;
@@ -1371,7 +1384,7 @@ impl NodeCacheShard {
 
 const NUM_SHARDS: usize = 64;
 
-pub struct NodeCache {
+struct NodeCache {
     shards: Vec<Mutex<NodeCacheShard>>,
 }
 
@@ -1402,21 +1415,28 @@ impl NodeCache {
         &self.shards[idx]
     }
 
-    pub fn get(&self, page_id: PageId) -> Option<Arc<Node>> {
+    fn get(&self, page_id: PageId) -> Option<Arc<Node>> {
         if self.shards.is_empty() {
             return None;
         }
         self.get_shard(page_id).lock().get(page_id)
     }
 
-    pub fn put(&self, page_id: PageId, node: Arc<Node>) {
+    fn peek(&self, page_id: PageId) -> Option<Arc<Node>> {
+        if self.shards.is_empty() {
+            return None;
+        }
+        self.get_shard(page_id).lock().peek(page_id)
+    }
+
+    fn put(&self, page_id: PageId, node: Arc<Node>) {
         if self.shards.is_empty() {
             return;
         }
         self.get_shard(page_id).lock().put(page_id, node)
     }
 
-    pub fn invalidate(&self, page_id: PageId) {
+    fn invalidate(&self, page_id: PageId) {
         if self.shards.is_empty() {
             return;
         }
@@ -1448,5 +1468,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn node_cache_peek_does_not_refresh_usage_bit() {
+        let cache = NodeCache::new(1);
+        let page_id = 7;
+        cache.put(page_id, Arc::new(Node::new_leaf()));
+
+        {
+            let shard = cache.get_shard(page_id);
+            let mut guard = shard.lock();
+            let entry = guard.entries[0].as_mut().expect("cached entry");
+            entry.usage = false;
+        }
+
+        let node = cache.peek(page_id).expect("peeked node");
+        assert!(node.is_leaf());
+
+        let shard = cache.get_shard(page_id);
+        let guard = shard.lock();
+        let entry = guard.entries[0].as_ref().expect("cached entry");
+        assert!(
+            !entry.usage,
+            "peek should not refresh the clock-cache usage bit"
+        );
     }
 }

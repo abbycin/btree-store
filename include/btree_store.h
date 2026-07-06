@@ -16,6 +16,16 @@ extern "C" {
 typedef struct BTree BTree;
 typedef struct Txn Txn;
 typedef struct MultiTxn MultiTxn;
+typedef struct BTreeIter BTreeIter;
+
+typedef struct BTreeOpenOptions {
+    size_t node_cache_capacity;
+    size_t lid_pid_cache_capacity;
+    size_t lid_pid_hot_cache_capacity;
+    size_t bucket_root_cache_capacity;
+    size_t bucket_tree_cache_capacity;
+    uint32_t sync_mode;
+} BTreeOpenOptions;
 
 #define BTREE_OK 0
 #define BTREE_ERR_NOT_FOUND -1
@@ -29,7 +39,13 @@ typedef struct MultiTxn MultiTxn;
 #define BTREE_ERR_CONFLICT -9
 #define BTREE_ERR_UNKNOWN -1000
 
+#define BTREE_SYNC_ADAPTIVE 0
+#define BTREE_SYNC_DATA 1
+#define BTREE_SYNC_ALL 2
+
 int btree_open(const char *path, BTree **out);
+int btree_default_open_options(BTreeOpenOptions *out);
+int btree_open_with_options(const char *path, const BTreeOpenOptions *options, BTree **out);
 size_t btree_max_key_len(void);
 void btree_close(BTree *db);
 
@@ -42,6 +58,10 @@ int txn_get(Txn *txn, const uint8_t *key, size_t klen, uint8_t **out, size_t *ou
 int txn_put(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen);
 int txn_update(Txn *txn, const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen, int *updated);
 int txn_del(Txn *txn, const uint8_t *key, size_t klen);
+int txn_iter(Txn *txn, BTreeIter **out);
+int txn_iter_uncached(Txn *txn, BTreeIter **out);
+int btree_iter_next(BTreeIter *iter, int (*fn)(const uint8_t *key, size_t klen, const uint8_t *val, size_t vlen, void *ctx), void *ctx);
+void btree_iter_close(BTreeIter *iter);
 
 void btree_free(void *p, size_t len);
 // last_error message pointer is valid until next ffi call on the same thread or btree_last_error_clear

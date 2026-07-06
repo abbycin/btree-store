@@ -51,6 +51,13 @@ pub const MAGIC: u64 = 0x636f776274726565;
 pub const FORMAT_VERSION: u32 = 3;
 pub use crate::node::MAX_KEY_LEN;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CacheMode {
+    #[default]
+    Default,
+    ByPass,
+}
+
 /// Runtime sync policy used after commits and compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
@@ -299,15 +306,15 @@ impl<'a> TxContext<'a> {
     }
 }
 
-pub struct Tree {
+pub(crate) struct Tree {
     store: Arc<dyn PageStore>,
-    pub root_page_id: Arc<RwLock<PageId>>,
+    pub(crate) root_page_id: Arc<RwLock<PageId>>,
     pending_free: Arc<RwLock<Vec<(PageId, u32)>>>,
     pending_alloc: Arc<RwLock<HashSet<PageId>>>,
 }
 
 impl Tree {
-    pub fn open(
+    pub(crate) fn open(
         store: Arc<dyn PageStore>,
         root_page_id: Arc<RwLock<PageId>>,
         pending_free: Arc<RwLock<Vec<(PageId, u32)>>>,
@@ -395,7 +402,7 @@ impl Tree {
         free.insert(idx, (start as PageId, (end - start) as u32));
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         validate_user_key(key)?;
         // use local buffers to reduce lock contention and keep partial changes local until success
         let mut freed = Vec::new();
@@ -415,7 +422,7 @@ impl Tree {
         Ok(())
     }
 
-    pub fn update(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+    pub(crate) fn update(&self, key: &[u8], value: &[u8]) -> Result<bool> {
         validate_user_key(key)?;
 
         let mut freed = Vec::new();
@@ -592,7 +599,12 @@ impl Tree {
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+    #[inline(always)]
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+        self.get_with_mode(key, CacheMode::Default)
+    }
+
+    pub(crate) fn get_with_mode(&self, key: &[u8], mode: CacheMode) -> Result<Vec<u8>> {
         validate_user_key(key)?;
 
         let root_id = *self.root_page_id.read();
@@ -600,18 +612,20 @@ impl Tree {
             return Err(Error::NotFound);
         }
 
-        let root_node = self.store.load_node(root_id)?;
+        let root_node = self.store.load_node_with_mode(root_id, mode)?;
         let mut current = root_node;
         loop {
             if current.is_leaf() {
-                return current.get(self.store.as_ref(), key);
+                return current.get_with_mode(self.store.as_ref(), key, mode);
             }
             let pos = current.child_pos_for_key(key);
-            current = self.store.load_node(current.child_at(pos))?;
+            current = self
+                .store
+                .load_node_with_mode(current.child_at(pos), mode)?;
         }
     }
 
-    pub fn del(&self, key: &[u8]) -> Result<()> {
+    pub(crate) fn del(&self, key: &[u8]) -> Result<()> {
         validate_user_key(key)?;
 
         // use local buffers to reduce lock contention and keep partial changes local until success
@@ -750,42 +764,77 @@ impl Tree {
         Ok(())
     }
 
-    pub fn iterator(&self) -> TreeIterator {
+    pub(crate) fn iterator(&self, mode: CacheMode) -> TreeIterator {
         let root_id = *self.root_page_id.read();
-        TreeIterator::new(self.store.clone(), root_id)
+        TreeIterator::new(self.store.clone(), root_id, None, mode)
     }
 
-    pub fn iterator_from(&self, key: &[u8]) -> TreeIterator {
+    pub(crate) fn iterator_from(&self, key: &[u8], mode: CacheMode) -> TreeIterator {
         let root_id = *self.root_page_id.read();
-        TreeIterator::new_from(self.store.clone(), root_id, key)
+        TreeIterator::new_from(self.store.clone(), root_id, None, key, mode)
     }
 }
 
 pub struct TreeIterator {
     store: Arc<dyn PageStore>,
+    mode: CacheMode,
     stack: Vec<(Arc<Node>, usize)>,
     current_leaf: Option<(Arc<Node>, usize)>,
 }
 
 impl TreeIterator {
-    fn new(store: Arc<dyn PageStore>, root_id: PageId) -> Self {
+    #[inline]
+    fn load_child_node(&self, child_id: PageId) -> Result<Arc<Node>> {
+        match self.mode {
+            CacheMode::Default => self.store.load_node_with_mode(child_id, CacheMode::Default),
+            CacheMode::ByPass => {
+                if matches!(self.store.cached_node_is_leaf(child_id), Some(false)) {
+                    return self.store.load_node_with_mode(child_id, CacheMode::Default);
+                }
+
+                let node = self
+                    .store
+                    .load_node_with_mode(child_id, CacheMode::ByPass)?;
+                if !node.is_leaf() {
+                    self.store.cache_node(child_id, node.clone());
+                }
+                Ok(node)
+            }
+        }
+    }
+
+    fn new(
+        store: Arc<dyn PageStore>,
+        root_id: PageId,
+        root_node: Option<Arc<Node>>,
+        mode: CacheMode,
+    ) -> Self {
         let mut iter = Self {
             store,
+            mode,
             stack: Vec::new(),
             current_leaf: None,
         };
 
-        if root_id != 0
-            && let Ok(node) = iter.store.load_node(root_id)
-        {
-            iter.push_node(node);
+        if root_id != 0 {
+            let node = root_node.or_else(|| iter.store.load_node_with_mode(root_id, mode).ok());
+            if let Some(node) = node {
+                iter.push_node(node);
+            }
         }
         iter
     }
 
-    fn new_from(store: Arc<dyn PageStore>, root_id: PageId, key: &[u8]) -> Self {
+    fn new_from(
+        store: Arc<dyn PageStore>,
+        root_id: PageId,
+        root_node: Option<Arc<Node>>,
+        key: &[u8],
+        mode: CacheMode,
+    ) -> Self {
         let mut iter = Self {
             store,
+            mode,
             stack: Vec::new(),
             current_leaf: None,
         };
@@ -794,9 +843,12 @@ impl TreeIterator {
             return iter;
         }
 
-        let mut node = match iter.store.load_node(root_id) {
-            Ok(node) => node,
-            Err(_) => return iter,
+        let mut node = match root_node {
+            Some(node) => node,
+            None => match iter.store.load_node_with_mode(root_id, mode) {
+                Ok(node) => node,
+                Err(_) => return iter,
+            },
         };
 
         while !node.is_leaf() {
@@ -809,7 +861,7 @@ impl TreeIterator {
                 return iter;
             }
             iter.stack.push((node.clone(), pos + 1));
-            match iter.store.load_node(child_id) {
+            match iter.load_child_node(child_id) {
                 Ok(child) => node = child,
                 Err(_) => return iter,
             }
@@ -843,9 +895,15 @@ impl TreeIterator {
                     val_buf.clear();
                     if slot.is_inline() {
                         val_buf.extend_from_slice(leaf.value_at(*idx));
-                    } else if let Ok(pages) = leaf.collect_page_ids(self.store.as_ref(), slot) {
+                    } else if let Ok(pages) =
+                        leaf.collect_page_ids_with_mode(self.store.as_ref(), slot, self.mode)
+                    {
                         val_buf.resize(slot.value_len(), 0);
-                        if self.store.read_data(&pages, val_buf).is_err() {
+                        if self
+                            .store
+                            .read_data_with_mode(&pages, val_buf, self.mode)
+                            .is_err()
+                        {
                             *idx += 1;
                             continue;
                         }
@@ -865,7 +923,7 @@ impl TreeIterator {
                 if *idx < node.num_children() {
                     let child_id = node.child_at(*idx);
                     *idx += 1;
-                    if let Ok(child_node) = self.store.load_node(child_id) {
+                    if let Ok(child_node) = self.load_child_node(child_id) {
                         self.push_node(child_node);
                     }
                 } else {
@@ -936,11 +994,20 @@ impl<'a> Txn<'a> {
 
     /// Returns an iterator over the current bucket in key order.
     pub fn iter(&self) -> TreeIterator {
-        self.tree.iterator()
+        self.tree.iterator(CacheMode::Default)
+    }
+
+    /// Returns an iterator over the current bucket without caching leaf nodes
+    /// or overflow value pages.
+    ///
+    /// Branch nodes may still be cached and reused so point reads and future
+    /// traversals keep their hot upper-level path.
+    pub fn iter_uncached(&self) -> TreeIterator {
+        self.tree.iterator(CacheMode::ByPass)
     }
 }
 
-pub struct ReadOnlyTree {
+pub(crate) struct ReadOnlyTree {
     store: Arc<dyn PageStore>,
     root_page_id: PageId,
     root_node: Option<Arc<Node>>,
@@ -960,25 +1027,48 @@ impl ReadOnlyTree {
         })
     }
 
+    fn load_root(&self, mode: CacheMode) -> Result<Arc<Node>> {
+        if self.root_page_id == 0 {
+            return Err(Error::NotFound);
+        }
+
+        let node = match mode {
+            CacheMode::Default | CacheMode::ByPass => self
+                .root_node
+                .as_ref()
+                .cloned()
+                .expect("validated read-only tree must retain its root node"),
+        };
+        Ok(node)
+    }
+
+    #[inline(always)]
     fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+        self.get_with_mode(key, CacheMode::Default)
+    }
+
+    fn get_with_mode(&self, key: &[u8], mode: CacheMode) -> Result<Vec<u8>> {
         validate_user_key(key)?;
 
         if self.root_page_id == 0 {
             return Err(Error::NotFound);
         }
 
-        let mut current = self.root_node.clone().ok_or(Error::NotFound)?;
+        let mut current = self.load_root(mode)?;
         loop {
             if current.is_leaf() {
-                return current.get(self.store.as_ref(), key);
+                return current.get_with_mode(self.store.as_ref(), key, mode);
             }
             let pos = current.child_pos_for_key(key);
-            current = self.store.load_node(current.child_at(pos))?;
+            current = self
+                .store
+                .load_node_with_mode(current.child_at(pos), mode)?;
         }
     }
 
-    fn iterator(&self) -> TreeIterator {
-        TreeIterator::new(self.store.clone(), self.root_page_id)
+    pub(crate) fn iterator(&self, mode: CacheMode) -> TreeIterator {
+        let root_node = self.root_node.clone();
+        TreeIterator::new(self.store.clone(), self.root_page_id, root_node, mode)
     }
 }
 
@@ -1005,7 +1095,18 @@ impl<'a> ReadOnlyTxn<'a> {
 
     /// Returns an iterator over the read-only bucket snapshot in key order.
     pub fn iter(&self) -> TreeIterator {
-        self.tree.iterator()
+        self.tree.iterator(CacheMode::Default)
+    }
+
+    /// Returns an iterator over the read-only bucket snapshot without caching
+    /// leaf nodes or overflow value pages.
+    ///
+    /// The root may already have been loaded through the normal cache path when
+    /// [`BTree::view`] validated the snapshot, and branch nodes may still be
+    /// cached. Leaf nodes and overflow value page reads performed by this
+    /// iterator bypass the page caches.
+    pub fn iter_uncached(&self) -> TreeIterator {
+        self.tree.iterator(CacheMode::ByPass)
     }
 }
 
@@ -1074,17 +1175,17 @@ impl<'a> MultiTxn<'a> {
     }
 }
 
-pub struct BucketMetadata {
+pub(crate) struct BucketMetadata {
     pub(crate) root_page_id: PageId,
 }
 
 impl BucketMetadata {
-    pub fn from_slice(x: &[u8]) -> Self {
+    pub(crate) fn from_slice(x: &[u8]) -> Self {
         assert!(x.len() >= std::mem::size_of::<Self>());
         unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
     }
 
-    pub fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
                 self as *const Self as *const u8,
@@ -1684,9 +1785,10 @@ impl BTree {
         self.bucket_tree_cache
             .write()
             .insert(name_bytes.to_vec(), latest_seq, tree.clone());
-
-        let txn = ReadOnlyTxn { tree, _guard: lock };
-
+        let txn = ReadOnlyTxn {
+            tree: tree.clone(),
+            _guard: lock,
+        };
         f(&txn)
     }
 
@@ -1820,7 +1922,9 @@ impl BTree {
         prealloc: Option<&[PageId]>,
     ) -> Result<(u64, u64, usize)> {
         let mut candidates = Vec::new();
-        let mut iter = self.reverse_tree.iterator_from(&encode_u32_key(tail_start));
+        let mut iter = self
+            .reverse_tree
+            .iterator_from(&encode_u32_key(tail_start), CacheMode::Default);
         let mut key_buf = Vec::new();
         let mut val_buf = Vec::new();
         while iter.next_ref(&mut key_buf, &mut val_buf) {
@@ -1879,7 +1983,9 @@ impl BTree {
 
     fn compact_tail_live_pages(&self, total_pages: PageId, tail_start: PageId) -> Result<u64> {
         let mut total_candidates = 0u64;
-        let mut iter = self.reverse_tree.iterator_from(&encode_u32_key(tail_start));
+        let mut iter = self
+            .reverse_tree
+            .iterator_from(&encode_u32_key(tail_start), CacheMode::Default);
         let mut key_buf = Vec::new();
         let mut val_buf = Vec::new();
 
@@ -2024,7 +2130,7 @@ impl BTree {
 
         let max_reverse_pid = {
             let mut max_pid = 0u32;
-            let mut iter = self.reverse_tree.iterator();
+            let mut iter = self.reverse_tree.iterator(CacheMode::Default);
             let mut key_buf = Vec::new();
             let mut val_buf = Vec::new();
             while iter.next_ref(&mut key_buf, &mut val_buf) {
@@ -2122,7 +2228,7 @@ impl BTree {
             Arc::new(RwLock::new(HashSet::new())),
         )?;
 
-        let mut iter = catalog.iterator();
+        let mut iter = catalog.iterator(CacheMode::Default);
         let mut key_buf = Vec::new();
         let mut val_buf = Vec::new();
         let mut res = Vec::new();
@@ -2239,10 +2345,6 @@ mod tests {
         }
 
         fn free_pages_immediate(&self, _page_id: u32, _nr_pages: u32) -> Result<()> {
-            Err(Error::Internal)
-        }
-
-        fn unfree_pages_immediate(&self, _page_id: u32, _nr_pages: u32) -> Result<()> {
             Err(Error::Internal)
         }
 

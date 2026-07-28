@@ -4,47 +4,38 @@
 [![Crates.io](https://img.shields.io/crates/v/btree-store.svg)](https://crates.io/crates/btree-store)
 [![License](https://img.shields.io/crates/l/btree-store.svg)](./LICENSE)
 
-**btree_store** is a persistent, embedded key-value storage engine written in Rust. It implements a robust Copy-On-Write (COW) B+ Tree architecture to ensure data integrity, crash safety, and efficient concurrent access.
+**btree-store** is a persistent, embedded key-value storage engine written in Rust, built on a Copy-On-Write (COW) B+ Tree for data integrity, crash safety, and efficient concurrent access.
 
 ## Features
 
-*   **ACID Compliance:** Atomic commits using COW, Snapshot Isolation, and double-buffered meta pages.
-*   **Closure-based Transactions:** Simplified `exec` (read-write) and `view` (read-only) APIs with automatic commit and rollback.
-*   **Auto-Refresh:** Every transaction automatically starts from the freshest disk state. No manual snapshot management required.
-*   **Conflict Detection:** Built-in "First-Committer-Wins" strategy for concurrent handles.
-*   **Batch Operations:** `exec_multi` for atomic updates across multiple buckets with a single disk sync, significantly reducing I/O overhead.
-*   **Crash Safety:** Double-buffered superblock with CRC32C checksums and ordered metadata writes; recovery selects the newest valid meta page.
-*   **Logical Namespaces:** Direct support for multiple buckets within a single database file.
-*   **Zero-Copy Access:** 8-byte aligned memory layouts allow direct pointer-to-reference conversion for maximum performance.
-*   **Robust Data Integrity:** Strengthened physical invariant checks and CRC32C checksum validation for every node and metadata page.
-*   **Shared Transaction State:** `clone()` creates a new handle that shares the same transaction context, optimized for multi-threaded components.
-*   **Manual Compaction:** Best-effort tail compaction to reclaim space when requested.
+*   **Copy-on-Write B+ Tree:** Atomic commits without in-place updates.
+*   **Snapshot Transactions:** Closure-based read/write transactions with automatic refresh, rollback, and snapshot-bound iteration.
+*   **Multi-Bucket Atomicity:** Named buckets share one database file; `exec_multi` commits updates across buckets in one generation.
+*   **Prefix Encoding:** Optional per-bucket key-prefix compression, persisted as part of the bucket layout policy.
+*   **Crash Safety:** Double-buffered metadata publication and recovery from the newest complete generation.
+*   **Concurrent Access:** One serialized writer with concurrent snapshot readers and shared runtime caching.
+*   **Durable Reclamation:** Reusable and quarantined pages are persisted and recovered with the database generation.
 
-> **Warning:** Multi-process concurrent access is NOT supported. Only one process should access the database file at a time.
+> **Warning:** Multi-process concurrent access is not supported. A competing process receives `OpenError::DatabaseBusy` if the exclusive file lock remains held after the bounded open wait.
 >
-> Within a single process, opening the same database path multiple times will return a clone of the already-opened `BTree` instance. Use `BTree::clone()` to share handles explicitly across threads/components.
+> Within a single process, re-opening the same path returns the existing `BTree` instance as a clone. Use `BTree::clone()` to share handles across threads.
 
 ## Architecture
 
-*   **Store (`src/store.rs`):** Low-level page management, sharded clock cache with explicit invalidation, and positional I/O.
-*   **Node (`src/node.rs`):** 8-byte aligned memory management (`AlignedPage`), zero-copy serialization, and checksumming.
-*   **Tree Logic (`src/lib.rs`):** Core B+ Tree algorithms and Transactional Snapshot Isolation logic.
+See [the design document](docs/design.md) for the complete architecture, transaction, persistence, recovery, and format-evolution model.
 
-## Usage
-
-Add this to your `Cargo.toml`:
-
-```bash
-cargo add btree-store
-```
 
 ### Basic Example
 
 ```rust
 use btree_store::{BTree, Error};
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = BTree::open("data.db")?;
+
+    // Buckets are created explicitly with an optional prefix-encoding flag.
+    db.new_bucket("users", false)?;
+    db.new_bucket("quote", false)?;
 
     // Read-write transaction.
     db.exec("users", |txn| {
@@ -56,14 +47,14 @@ fn main() -> Result<(), Error> {
             !updated,
             "update only changes an existing key and does not insert a missing key"
         );
-        Ok(())
+        Ok::<_, Error>(())
     })?;
 
     // Read-only view.
     db.view("users", |txn| {
         let val = txn.get("mo")?;
         println!("mo: {:?}", String::from_utf8_lossy(&val));
-        Ok(())
+        Ok::<_, Error>(())
     })?;
 
     // Multi-bucket atomic transaction.
@@ -73,122 +64,59 @@ fn main() -> Result<(), Error> {
             txn.put("mo", "+1s")
         })?;
         multi.exec("quote", |txn| txn.put("moha", "naive!"))?;
-        Ok(())
+        Ok::<_, Error>(())
     })?;
 
     Ok(())
 }
 ```
 
-## FFI (C)
+## Benchmarks
 
-Enable the `ffi` feature and build shared + static libraries:
+Environment:
+*   **Date:** 2026-08-08
+*   **OS:** openSUSE Tumbleweed, kernel 7.1.3-1-default
+*   **CPU:** AMD Ryzen 5 3600, 6C/12T
+*   **Command:** `cargo bench --bench btree_bench -- --noplot`
+*   **Method:** One Criterion run of the current version; values below are the center estimate from each benchmark
 
-Linux/macOS:
-```bash
-RUSTFLAGS="-C panic=abort" cargo build --features ffi --release
-```
+Results (lower is better):
+| Benchmark | Estimate |
+| --- | --- |
+| bucket_ops/create_drop_empty_bucket | 8.7369 us |
+| bucket_ops/drop_large_bucket_100k | 2.0382 ms |
+| concurrent_get/4_threads_random_get | 366.84 ns |
+| delete/delete_insert_cycle_1k | 9.2958 ms |
+| exec_multi/mixed_1k_exec_multi_1k | 1.0670 s |
+| get/random_get_100k | 425.37 ns |
+| insert/insert_1k_tx | 8.8122 ms |
 
-Windows (PowerShell):
-```powershell
-$env:RUSTFLAGS="-C panic=abort"; cargo build --features ffi --release
-```
+Plain vs. prefix-encoded buckets, using the same workload:
+| Workload | Plain | Prefix |
+| --- | --- | --- |
+| insert | 8.0452 ms | 8.1435 ms |
+| point_get | 8.4084 ms | 8.5309 ms |
+| update | 19.071 ms | 15.484 ms |
+| delete | 17.077 ms | 15.543 ms |
+| iterate | 8.1412 ms | 8.2080 ms |
+| mixed | 1.5102 ms | 1.5734 ms |
 
-Build and run the minimal C example (`examples/ffi.c`):
+Interpretation:
+*   **get**: ~0.43 us/op (random get on 100k keys).
+*   **get (4 threads)**: ~0.37 us/op (per get, concurrent reads).
+*   **put**: ~8.81 us/op (**single-op transactions**; `insert_1k_tx` measures 1000 separate `exec` calls).
+*   **del**: ~9.30 us/op (**single-op transactions** after a prefill).
+*   **exec_multi**: ~1067 us/exec_multi (`mixed_1k_exec_multi_1k` performs 1000 outer `exec_multi` calls, each with 1000 nested operations).
+*   **bucket ops**: empty bucket create+drop ~8.74 us; drop 100k-key bucket ~2.04 ms.
+*   **prefix encoding**: the second table compares independent plain and prefix measurements for the same workload. It uses 2000 keys and 64-byte values; prefix encoding is close to plain layout for insert, point get, and iteration, faster for update/delete, and slightly slower for mixed in this run. The 100k random-get and 4-thread random-get benchmarks are only in the standard table and were not run for both layouts.
+*   These numbers are machine- and load-dependent; rerun on your hardware for comparable results.
 
-Linux:
-```bash
-cc -I./include examples/ffi.c -L./target/release -lbtree_store -o ffi
-LD_LIBRARY_PATH=./target/release ./ffi
-```
-
-macOS:
-```bash
-cc -I./include examples/ffi.c -L./target/release -lbtree_store -o ffi
-DYLD_LIBRARY_PATH=./target/release ./ffi
-```
-
-Windows (MSVC):
-```bat
-cl /I include examples\ffi.c /Fe:ffi.exe /link /LIBPATH:target\release btree_store.dll.lib
-copy target\release\btree_store.dll .
-ffi.exe
-```
-
-Notes:
-*   The C ABI is callback-based (`btree_exec`/`btree_view`).
-*   Do not call `exec`/`view` inside callbacks.
-*   `Txn`/`MultiTxn` handles are valid only during callbacks.
-*   `longjmp` across FFI is unsafe.
-*   Panics are not caught; use `panic=abort`.
-*   `txn_get` returns a Rust-allocated buffer that must be freed with `btree_free`.
-*   `btree_last_error` returns a pointer valid until the next FFI call on the same thread or `btree_last_error_clear`.
-*   See `ffi.md` for full FFI usage documentation.
-
-## Maintenance
-
-You can trigger a best-effort tail compaction to reclaim space:
-
-```rust
-// compact using the default internal ratio
-db.compact(0)?;
-
-// compact targeting about 64 MB of tail space
-db.compact(64 * 1024 * 1024)?;
-```
-
-## Performance Design
-
-The engine is optimized for high-throughput scenarios:
-*   **8-Byte Alignment:** Every page is allocated with 8-byte alignment, allowing direct casting of raw bytes to internal structures without memory copies.
-*   **Snapshot Isolation (SI):** Readers use a stable root per transaction; each handle enforces single-writer/multi-reader via an RwLock.
-*   **Automatic Page Reclamation:** Failed or conflicted transactions automatically trigger page reclamation to prevent database bloat.
-*   **Lock-Free File I/O:** Positional reads (`pread`/`seek_read`) avoid a global file mutex for concurrent access.
 
 ## Limits
 
 *   **Keys and bucket names:** 1..=128 bytes; empty keys and empty bucket names are rejected as invalid input.
 *   **Max file size:** ~16 TB with 4 KB pages (32-bit page ids).
-
-## Benchmarks
-
-Environment:
-*   **Date:** 2026-05-08
-*   **OS:** openSUSE Tumbleweed, kernel 6.19.12-1-default
-*   **CPU:** AMD Ryzen 5 3600, 6C/12T
-*   **Command:** `cargo bench`
-
-Results (lower is better):
-| Benchmark | Mean | 95% CI |
-| --- | --- | --- |
-| bucket_ops/create_drop_empty_bucket | 34.963 us | [34.908, 35.015] us |
-| bucket_ops/drop_large_bucket_100k | 35.515 ms | [35.336, 35.685] ms |
-| concurrent_get/4_threads_random_get | 325.270 ns | [319.530, 329.860] ns |
-| delete/delete_insert_cycle_1k | 54.982 ms | [54.885, 55.088] ms |
-| get/random_get_100k | 448.090 ns | [443.860, 452.620] ns |
-| insert/insert_1k_tx | 52.708 ms | [52.623, 52.801] ms |
-
-Interpretation:
-*   **get**: ~0.45 us/op (random get on 100k keys).
-*   **get (4 threads)**: ~0.33 us/op (per get, concurrent reads).
-*   **put**: ~53 us/op (**single-op transactions**; `insert_1k_tx` runs 1000 separate `exec` calls).
-*   **del**: ~55 us/op (**single-op transactions** after a prefill).
-*   **bucket ops**: empty bucket create+drop ~35 us; drop 100k-key bucket ~35.5 ms.
-*   These numbers are machine- and load-dependent; rerun on your hardware for comparable results.
-*   No cross-DB comparison is provided here because different engines and configurations are not directly comparable.
-
-## Testing
-
-The project includes a comprehensive suite of integration tests:
-*   `smo_stress_test`: Structural Modification Operations under heavy load.
-*   `crash_safety_tests`: Verifies data integrity across simulated crashes.
-*   `concurrency_tests`: Parallel readers and writers with auto-refresh validation.
-*   `leak_safety_tests`: Ensures no pages are lost during failed operations.
-
-Run tests with:
-```bash
-cargo test
-```
+*   **On-disk format:** initial format version 1.
 
 ## License
 

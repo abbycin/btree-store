@@ -8,19 +8,27 @@ use std::{
 };
 
 use arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
-use btree_store::{BTree, Error, Result as DbResult};
+use btree_store::{BTree, Error, OpenResult, Result as DbResult};
 use libfuzzer_sys::fuzz_target;
 use tempfile::{Builder, TempDir};
 
 mod common;
 
-use common::{Bucket, MAX_KEY_LEN, Value, arbitrary_vec, bounded_nonempty_bytes};
+use common::{BUCKET_NAMES, Bucket, MAX_KEY_LEN, Value, arbitrary_vec, bounded_nonempty_bytes};
 
 const EPOCH_KEY: &[u8] = b"__epoch__";
 const MAX_CONCURRENT_OPS: usize = 96;
 const MAX_SINGLE_STEPS: usize = 8;
 const MAX_MULTI_STEPS: usize = 8;
 const MAX_RACE_READERS: usize = 4;
+const MAX_CONCURRENT_WRITERS: usize = 4;
+
+const MIXED_WRITER_BUCKETS: [Bucket; MAX_CONCURRENT_WRITERS] = [
+    Bucket::new("a"),
+    Bucket::new("b"),
+    Bucket::new("c"),
+    Bucket::new("users"),
+];
 
 #[derive(Clone, Debug)]
 struct ConcurrentCase {
@@ -46,13 +54,17 @@ enum ConcurrentOp {
         steps: Vec<MultiStep>,
         readers: Vec<ReaderPlan>,
     },
+    Mixed {
+        writers: Vec<WriterPlan>,
+        readers: Vec<ReaderPlan>,
+    },
     Reopen,
     Validate,
 }
 
 impl<'a> Arbitrary<'a> for ConcurrentOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=3u8)? {
+        match u.int_in_range(0..=4u8)? {
             0 => Ok(Self::Single {
                 bucket: Bucket::arbitrary(u)?,
                 steps: arbitrary_vec(u, MAX_SINGLE_STEPS)?,
@@ -62,7 +74,11 @@ impl<'a> Arbitrary<'a> for ConcurrentOp {
                 steps: arbitrary_vec(u, MAX_MULTI_STEPS)?,
                 readers: arbitrary_vec(u, MAX_RACE_READERS)?,
             }),
-            2 => Ok(Self::Reopen),
+            2 => Ok(Self::Mixed {
+                writers: arbitrary_vec(u, MAX_CONCURRENT_WRITERS)?,
+                readers: arbitrary_vec(u, MAX_RACE_READERS)?,
+            }),
+            3 => Ok(Self::Reopen),
             _ => Ok(Self::Validate),
         }
     }
@@ -84,6 +100,19 @@ impl<'a> Arbitrary<'a> for SingleStep {
             2 => Ok(Self::Del(DataKey::arbitrary(u)?)),
             _ => Ok(Self::Touch),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WriterPlan {
+    steps: Vec<SingleStep>,
+}
+
+impl<'a> Arbitrary<'a> for WriterPlan {
+    fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
+        Ok(Self {
+            steps: arbitrary_vec(u, MAX_SINGLE_STEPS)?,
+        })
     }
 }
 
@@ -193,7 +222,7 @@ impl Model {
                 }
                 SingleStep::Del(key) => {
                     if bucket_model.entries.remove(&key.0).is_none() {
-                        return Err(Error::NotFound);
+                        return Err(Error::KeyNotFound);
                     }
                     touched = true;
                 }
@@ -227,9 +256,9 @@ impl Model {
                     let bucket_model = next
                         .buckets
                         .get_mut(bucket.as_str())
-                        .ok_or(Error::NotFound)?;
+                        .ok_or(Error::KeyNotFound)?;
                     if bucket_model.entries.remove(&key.0).is_none() {
-                        return Err(Error::NotFound);
+                        return Err(Error::KeyNotFound);
                     }
                     touched.insert(bucket.as_str().to_string());
                 }
@@ -281,12 +310,20 @@ impl ConcurrentHarness {
             .tempdir()
             .expect("create fuzz tempdir");
         let path = dir.path().join("db.btree");
-        let db = expect_db_ok(BTree::open(&path), "open database");
+        let db = expect_open_ok(BTree::open(&path), "open database");
+        let mut model = Model::default();
+        // exec/multi now require the bucket to exist, so every bucket the
+        // harness can touch is created up front; untouched buckets stay at
+        // epoch 0 with no entries.
+        for bucket in BUCKET_NAMES {
+            expect_db_ok(db.new_bucket(bucket, false), "pre-create bucket");
+            model.ensure_bucket(bucket);
+        }
         Self {
             _dir: dir,
             path,
             db: Some(db),
-            model: Model::default(),
+            model,
         }
     }
 
@@ -303,11 +340,113 @@ impl ConcurrentHarness {
     fn reopen(&mut self) {
         let old = self.db.take();
         drop(old);
-        self.db = Some(expect_db_ok(
+        self.db = Some(expect_open_ok(
             BTree::open(&self.path),
             "reopen concurrent database",
         ));
         self.validate();
+    }
+
+    // Disjoint buckets keep each writer's before/after state independent of
+    // the serialized commit order while still exercising concurrent exec calls.
+    fn race_mixed(&mut self, writers: &[WriterPlan], readers: &[ReaderPlan]) {
+        let before = self.model.clone();
+        let expected: Vec<DbResult<Model>> = writers
+            .iter()
+            .enumerate()
+            .map(|(index, writer)| {
+                before.apply_single(mixed_writer_bucket(index).as_str(), &writer.steps)
+            })
+            .collect();
+        let stale = self.db().clone();
+        let path = self.path.clone();
+        let barrier = Arc::new(Barrier::new(writers.len() + readers.len() + 1));
+
+        thread::scope(|scope| {
+            for (index, writer) in writers.iter().enumerate() {
+                let writer = writer.clone();
+                let db = self.db().clone();
+                let barrier = barrier.clone();
+                let bucket = mixed_writer_bucket(index);
+                let expected_result = expected[index].clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    let marker_model = expected_result.clone();
+                    let actual = db.exec(bucket.as_str(), |txn| {
+                        for step in &writer.steps {
+                            apply_single_step(txn, step)?;
+                        }
+                        if let Ok(model) = marker_model.as_ref()
+                            && let Some(bucket_model) = model.buckets.get(bucket.as_str())
+                        {
+                            txn.put(EPOCH_KEY, bucket_model.epoch.to_le_bytes())?;
+                        }
+                        Ok(())
+                    });
+                    match expected_result {
+                        Ok(_) => {
+                            expect_db_ok(actual, "mixed concurrent writer commit");
+                        }
+                        Err(expected_err) => {
+                            expect_db_err(actual, expected_err, "mixed concurrent writer rollback");
+                        }
+                    }
+                });
+            }
+
+            for reader in readers {
+                let reader = reader.clone();
+                let barrier = barrier.clone();
+                let path = path.clone();
+                let base = self.db().clone();
+                let stale = stale.clone();
+                let before_state = BucketSnapshot::from_model(&before, reader.bucket.as_str());
+                let after_state = expected
+                    .iter()
+                    .enumerate()
+                    .find(|(index, _)| {
+                        mixed_writer_bucket(*index).as_str() == reader.bucket.as_str()
+                    })
+                    .and_then(|(_, result)| result.as_ref().ok())
+                    .map(|model| BucketSnapshot::from_model(model, reader.bucket.as_str()))
+                    .unwrap_or_else(|| before_state.clone());
+                scope.spawn(move || {
+                    barrier.wait();
+                    let handle = match reader.mode {
+                        ReaderMode::StaleClone => stale,
+                        ReaderMode::CloneAtRead => base.clone(),
+                        ReaderMode::SamePathOpen => {
+                            expect_open_ok(BTree::open(&path), "same-path open during mixed race")
+                        }
+                    };
+                    let actual = expect_db_ok(
+                        read_bucket_snapshot(&handle, reader.bucket.as_str()),
+                        "read mixed bucket",
+                    );
+                    assert!(
+                        actual == before_state || actual == after_state,
+                        "reader observed unexpected mixed snapshot: actual={actual:?} before={before_state:?} after={after_state:?} mode={:?} bucket={:?}",
+                        reader.mode,
+                        reader.bucket
+                    );
+                });
+            }
+
+            barrier.wait();
+        });
+
+        for (index, result) in expected.into_iter().enumerate() {
+            if let Ok(next) = result {
+                let bucket_name = mixed_writer_bucket(index).as_str().to_string();
+                let bucket_model = next
+                    .buckets
+                    .get(&bucket_name)
+                    .cloned()
+                    .expect("successful mixed writer must materialize its bucket");
+                self.model.buckets.insert(bucket_name, bucket_model);
+            }
+        }
+        self.reopen();
     }
 
     fn race_single(&mut self, bucket: Bucket, steps: &[SingleStep], readers: &[ReaderPlan]) {
@@ -335,7 +474,7 @@ impl ConcurrentHarness {
                         ReaderMode::StaleClone => stale,
                         ReaderMode::CloneAtRead => base.clone(),
                         ReaderMode::SamePathOpen => {
-                            expect_db_ok(BTree::open(&path), "same-path open during race")
+                            expect_open_ok(BTree::open(&path), "same-path open during race")
                         }
                     };
                     let actual =
@@ -366,7 +505,11 @@ impl ConcurrentHarness {
                     expect_db_ok(actual, "single-bucket concurrent commit");
                 }
                 Err(expected_err) => {
-                    expect_db_err(actual, *expected_err, "single-bucket concurrent commit");
+                    expect_db_err(
+                        actual,
+                        expected_err.clone(),
+                        "single-bucket concurrent commit",
+                    );
                 }
             }
         });
@@ -374,7 +517,7 @@ impl ConcurrentHarness {
         if let Ok(next) = expected {
             self.model = next;
         }
-        self.validate();
+        self.reopen();
     }
 
     fn race_multi(&mut self, steps: &[MultiStep], readers: &[ReaderPlan]) {
@@ -402,7 +545,7 @@ impl ConcurrentHarness {
                         ReaderMode::StaleClone => stale,
                         ReaderMode::CloneAtRead => base.clone(),
                         ReaderMode::SamePathOpen => {
-                            expect_db_ok(BTree::open(&path), "same-path open during multi race")
+                            expect_open_ok(BTree::open(&path), "same-path open during multi race")
                         }
                     };
                     let actual =
@@ -443,7 +586,11 @@ impl ConcurrentHarness {
                     expect_db_ok(actual, "multi-bucket concurrent commit");
                 }
                 Err(expected_err) => {
-                    expect_db_err(actual, *expected_err, "multi-bucket concurrent commit");
+                    expect_db_err(
+                        actual,
+                        expected_err.clone(),
+                        "multi-bucket concurrent commit",
+                    );
                 }
             }
         });
@@ -451,7 +598,7 @@ impl ConcurrentHarness {
         if let Ok(next) = expected {
             self.model = next;
         }
-        self.validate();
+        self.reopen();
     }
 }
 
@@ -465,6 +612,10 @@ fn apply_single_step(txn: &mut btree_store::Txn<'_>, step: &SingleStep) -> DbRes
         SingleStep::Del(key) => txn.del(&key.0),
         SingleStep::Touch => Ok(()),
     }
+}
+
+fn mixed_writer_bucket(index: usize) -> Bucket {
+    MIXED_WRITER_BUCKETS[index]
 }
 
 fn apply_multi_step(txn: &mut btree_store::Txn<'_>, step: &MultiStep) -> DbResult<()> {
@@ -498,7 +649,7 @@ fn read_bucket_snapshot(db: &BTree, bucket: &str) -> DbResult<BucketSnapshot> {
         while iter.next_ref(&mut key_buf, &mut val_buf) {
             if key_buf == EPOCH_KEY {
                 if val_buf.len() != std::mem::size_of::<u64>() {
-                    return Err(Error::Corruption);
+                    panic!("epoch value has invalid length {}", val_buf.len());
                 }
                 epoch = Some(u64::from_le_bytes(val_buf.as_slice().try_into().unwrap()));
             } else {
@@ -506,12 +657,12 @@ fn read_bucket_snapshot(db: &BTree, bucket: &str) -> DbResult<BucketSnapshot> {
             }
         }
         Ok(BucketSnapshot::Present {
-            epoch: epoch.ok_or(Error::Corruption)?,
+            epoch: epoch.unwrap_or(0),
             entries,
         })
     }) {
         Ok(snapshot) => Ok(snapshot),
-        Err(Error::NotFound) => Ok(BucketSnapshot::Missing),
+        Err(Error::BucketNotFound) => Ok(BucketSnapshot::Missing),
         Err(err) => Err(err),
     }
 }
@@ -532,6 +683,23 @@ fn validate_db(db: &BTree, model: &Model) {
             "read bucket snapshot for validation",
         );
         let expected = BucketSnapshot::from_model(model, bucket);
+        // A bucket that was touched must carry its epoch marker; losing it
+        // would otherwise be silently read back as epoch 0.
+        if let BucketSnapshot::Present { epoch, .. } = expected {
+            if epoch > 0 {
+                let BucketSnapshot::Present {
+                    epoch: actual_epoch,
+                    ..
+                } = &actual
+                else {
+                    panic!("touched bucket {bucket:?} must be present");
+                };
+                assert!(
+                    *actual_epoch > 0,
+                    "touched bucket {bucket:?} lost its epoch marker"
+                );
+            }
+        }
         assert_eq!(
             actual, expected,
             "concurrent target bucket snapshot mismatch for bucket {bucket:?}"
@@ -543,6 +711,13 @@ fn expect_db_ok<T>(result: DbResult<T>, context: &str) -> T {
     match result {
         Ok(value) => value,
         Err(err) => panic!("{context} returned unexpected error: {err:?}"),
+    }
+}
+
+fn expect_open_ok<T>(result: OpenResult<T>, context: &str) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => panic!("{context} returned unexpected open error: {err:?}"),
     }
 }
 
@@ -563,6 +738,7 @@ fuzz_target!(|case: ConcurrentCase| {
                 readers,
             } => harness.race_single(bucket, &steps, &readers),
             ConcurrentOp::Multi { steps, readers } => harness.race_multi(&steps, &readers),
+            ConcurrentOp::Mixed { writers, readers } => harness.race_mixed(&writers, &readers),
             ConcurrentOp::Reopen => harness.reopen(),
             ConcurrentOp::Validate => harness.validate(),
         }

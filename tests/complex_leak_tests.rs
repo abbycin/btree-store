@@ -6,62 +6,36 @@ use tempfile::TempDir;
 fn test_reuse_within_txn() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("reuse_txn.db");
+    // Transaction-local reuse must consume tracked reusable ownership without
+    // exposing the deleted value page as a leaked or reachable page.
 
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("default", false).unwrap();
     tree.exec("default", |txn| {
+        // COW node writes exercise the single-page allocator path as well as
+        // the multi-page overflow path covered below.
         txn.put(b"large1", vec![0u8; 12000]).unwrap();
         let size_after_put = fs::metadata(&db_path).unwrap().len();
         txn.del(b"large1").unwrap();
         txn.put(b"large2", vec![0u8; 12000]).unwrap();
         let size_after_reuse = fs::metadata(&db_path).unwrap().len();
         assert_eq!(size_after_reuse, size_after_put);
+        assert!(txn.get(b"large1").is_err());
+        assert_eq!(txn.get(b"large2").unwrap().len(), 12000);
         Ok(())
     })
     .unwrap();
-}
+    assert_eq!(tree.pending_pages(), (0, 0));
 
-#[test]
-fn test_reuse_after_reopen() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("reuse_reopen.db");
-
-    {
-        let bt = BTree::open(&db_path).unwrap();
-        bt.exec("default", |txn| {
-            txn.put(b"large", vec![0u8; 10000]).unwrap();
+    drop(tree);
+    let reopened = BTree::open(&db_path).unwrap();
+    reopened
+        .view("default", |txn| {
+            assert_eq!(txn.get(b"large2")?.len(), 12000);
+            assert_eq!(txn.get(b"large1"), Err(btree_store::Error::KeyNotFound));
             Ok(())
         })
         .unwrap();
-        bt.exec("default", |txn| {
-            txn.del(b"large").unwrap();
-            Ok(())
-        })
-        .unwrap();
-        bt.exec("default", |txn| {
-            txn.put(b"dummy", b"v").unwrap();
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    {
-        let bt = BTree::open(&db_path).unwrap();
-        bt.exec("default", |txn| {
-            txn.put(b"large2", vec![0u8; 10000]).unwrap();
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    {
-        let bt = BTree::open(&db_path).unwrap();
-        bt.view("default", |txn| {
-            assert!(txn.get(b"large").is_err());
-            assert_eq!(txn.get(b"dummy").unwrap(), b"v");
-            Ok(())
-        })
-        .unwrap();
-    }
 }
 
 #[test]
@@ -71,6 +45,7 @@ fn test_empty_tree_cycle() {
 
     {
         let bt = BTree::open(&db_path).unwrap();
+        bt.new_bucket("default", false).unwrap();
         bt.exec("default", |txn| {
             txn.put(b"k1", b"v1").unwrap();
             txn.put(b"k2", b"v2").unwrap();

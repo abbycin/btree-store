@@ -1,49 +1,47 @@
-use btree_store::{BTree, Result};
-use std::sync::Arc;
-use std::thread;
-use tempfile::TempDir;
-
 #[test]
 #[cfg(not(windows))]
-fn reproduce_btree_corruption() -> Result<()> {
+fn reproduce_btree_corruption() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use btree_store::BTree;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::TempDir;
+
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("reproduce_manifest.db");
 
     let btree = Arc::new(BTree::open(path)?);
 
-    // Initialize multiple buckets
+    // Initialize multiple buckets.
     let buckets = ["bucket_1", "bucket_2", "bucket_3", "bucket_4", "bucket_5"];
-    for b in buckets {
-        btree.exec(b, |_| Ok(()))?;
+    for bucket in buckets {
+        btree.new_bucket(bucket, false)?;
     }
 
-    let mut handles = vec![];
+    let mut handles = Vec::new();
 
-    // Simulate mace's concurrent scenario: Flusher and GC update different metadata buckets at the same time
-    for t in 0..4 {
+    // Simulate concurrent independent commits that exercise shared catalog state.
+    for thread_id in 0..4 {
         let btree_clone = btree.clone();
         let handle = thread::spawn(move || {
-            for i in 0..10000 {
+            for i in 0..10_000 {
                 let bucket = buckets[i % buckets.len()];
-                let key = format!("thread_{}_key_{}", t, i);
-                let val = vec![t as u8; 3840];
+                let key = format!("thread_{thread_id}_key_{i}");
+                let value = vec![thread_id as u8; 3840];
 
-                // Simulate mace's internal_commit behavior:
-                // each exec is an independent disk commit
-                if let Err(e) = btree_clone.exec(bucket, |txn| txn.put(key.as_bytes(), &val)) {
-                    // If reproduction succeeds, this should trigger Corruption or Panic
-                    eprintln!("Thread {} failed at iteration {}: {:?}", t, i, e);
-                    if e.to_string().contains("Corruption") {
-                        panic!("REPRODUCED: BTree Corruption detected!");
-                    }
-                }
+                btree_clone
+                    .exec(bucket, |txn| txn.put(key.as_bytes(), &value))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "REPRODUCED: BTree failure at thread {thread_id}, iteration {i}: {error:?}"
+                        )
+                    });
             }
         });
         handles.push(handle);
     }
 
-    for h in handles {
-        h.join().unwrap();
+    for handle in handles {
+        handle.join().unwrap();
     }
 
     Ok(())

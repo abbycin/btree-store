@@ -1,12 +1,12 @@
-use btree_store::{BTree, Result};
-use std::path::Path;
-use std::sync::Arc;
-use std::thread;
-use tempfile::TempDir;
-
 #[test]
 #[cfg(not(windows))]
-fn reproduce_mace_corruption() -> Result<()> {
+fn reproduce_mace_corruption() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use btree_store::BTree;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::TempDir;
+
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("mace_repro.db");
     if Path::new(&path).exists() {
@@ -15,49 +15,42 @@ fn reproduce_mace_corruption() -> Result<()> {
 
     let btree = Arc::new(BTree::open(&path)?);
     let bucket = "mace_bucket";
-    btree.exec(bucket, |_| Ok(()))?;
+    btree.new_bucket(bucket, false)?;
 
-    let mut handles = vec![];
+    let mut handles = Vec::new();
 
-    // Thread 1: only performs Put (simulating Flusher)
-    let bt1 = btree.clone();
+    // Thread 1: only performs Put (simulating a flusher).
+    let put_tree = btree.clone();
     handles.push(thread::spawn(move || {
-        for i in 0..10000 {
-            // Increase loop count to intensify stress testing
-            let key = format!("put_only_key_{}", i);
-            let val = vec![1u8; 100];
-            match bt1.exec(bucket, |txn| txn.put(key.as_bytes(), &val)) {
-                Err(e) if e.to_string().contains("Corruption") => {
-                    panic!("THREAD 1 REPRODUCED CORRUPTION: {:?}", e);
-                }
-                _ => {}
-            }
+        for i in 0..10_000 {
+            let key = format!("put_only_key_{i}");
+            let value = vec![1u8; 100];
+            put_tree
+                .exec(bucket, |txn| txn.put(key.as_bytes(), &value))
+                .unwrap_or_else(|error| panic!("THREAD 1 REPRODUCED FAILURE: {error:?}"));
         }
     }));
 
-    // Thread 2: Put + Del (simulating GC)
-    let bt2 = btree.clone();
+    // Thread 2: Put + Del (simulating a GC rewrite followed by reclamation).
+    let delete_tree = btree.clone();
     handles.push(thread::spawn(move || {
-        for i in 0..10000 {
-            // Increase loop count to intensify stress testing
-            let key = format!("mixed_key_{}", i);
-            let val = vec![2u8; 100];
+        for i in 0..10_000 {
+            let key = format!("mixed_key_{i}");
+            let value = vec![2u8; 100];
 
-            // Put
-            let _ = bt2.exec(bucket, |txn| txn.put(key.as_bytes(), &val));
-
-            // Del (triggers shrink_slot)
-            match bt2.exec(bucket, |txn| txn.del(key.as_bytes())) {
-                Err(e) if e.to_string().contains("Corruption") => {
-                    panic!("THREAD 2 REPRODUCED CORRUPTION at iteration {}: {:?}", i, e);
-                }
-                _ => {}
-            }
+            delete_tree
+                .exec(bucket, |txn| txn.put(key.as_bytes(), &value))
+                .unwrap_or_else(|error| panic!("THREAD 2 PUT FAILURE at iteration {i}: {error:?}"));
+            delete_tree
+                .exec(bucket, |txn| txn.del(key.as_bytes()))
+                .unwrap_or_else(|error| {
+                    panic!("THREAD 2 DELETE FAILURE at iteration {i}: {error:?}")
+                });
         }
     }));
 
-    for h in handles {
-        h.join().unwrap();
+    for handle in handles {
+        handle.join().unwrap();
     }
 
     Ok(())

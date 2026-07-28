@@ -33,13 +33,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "reopen_compact_model"
-path = "fuzz_targets/reopen_compact_model.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "bucket_lifecycle"
 path = "fuzz_targets/bucket_lifecycle.rs"
 test = false

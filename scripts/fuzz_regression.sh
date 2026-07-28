@@ -8,7 +8,6 @@ cd "${repo_dir}/fuzz"
 targets=(
   kv_model
   multi_bucket_model
-  reopen_compact_model
   bucket_lifecycle
   concurrent_snapshot_model
 )

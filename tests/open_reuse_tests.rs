@@ -1,4 +1,4 @@
-use btree_store::{BTree, Error, OpenOptions};
+use btree_store::{BTree, OpenError, OpenOptions, OptionsError};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,8 +9,11 @@ fn test_reopen_same_path_shares_writer_lock() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("reuse.db");
 
+    // Same-process opens reuse the registry entry and therefore the shared
+    // writer lock that the timing assertion below exercises.
     let handle_a = Arc::new(BTree::open(&db_path).unwrap());
     let handle_b = Arc::new(BTree::open(&db_path).unwrap());
+    handle_a.new_bucket("reuse", false).unwrap();
 
     handle_a
         .exec("reuse", |txn| {
@@ -65,6 +68,7 @@ fn test_reopen_same_path_shares_writer_lock() {
             Ok(())
         })
         .unwrap();
+    assert_eq!(handle_a.pending_pages(), (0, 0));
 }
 
 #[test]
@@ -73,6 +77,7 @@ fn test_reopen_after_commit_allows_empty_commit() {
     let db_path = temp_dir.path().join("reuse_commit.db");
 
     let handle_a = BTree::open(&db_path).unwrap();
+    handle_a.new_bucket("reuse", false).unwrap();
     handle_a
         .exec("reuse", |txn| {
             txn.put(b"k", b"v1")?;
@@ -82,7 +87,8 @@ fn test_reopen_after_commit_allows_empty_commit() {
 
     let handle_b = BTree::open(&db_path).unwrap();
 
-    // Reopened handle must align to latest snapshot; empty commit should be a no-op.
+    // Same-path handle reuse must align to the latest snapshot; empty commit
+    // should be a no-op.
     handle_b
         .commit()
         .expect("empty commit on reopened handle should succeed");
@@ -101,6 +107,7 @@ fn test_same_path_open_is_instance_reuse_not_true_reopen() {
     let db_path = temp_dir.path().join("reuse_vs_reopen.db");
 
     let handle_a = Arc::new(BTree::open(&db_path).unwrap());
+    handle_a.new_bucket("reuse", false).unwrap();
     handle_a
         .exec("reuse", |txn| {
             txn.put(b"k0", b"v0")?;
@@ -149,7 +156,7 @@ fn test_reopen_same_path_with_mismatched_options_returns_invalid() {
     let db_path = temp_dir.path().join("reuse_options_mismatch.db");
 
     let opts = OpenOptions {
-        node_cache_capacity: 8,
+        cache_capacity: 8,
         ..OpenOptions::default()
     };
     let _handle = BTree::open_with_options(&db_path, opts).unwrap();
@@ -157,31 +164,31 @@ fn test_reopen_same_path_with_mismatched_options_returns_invalid() {
     let err = match BTree::open_with_options(
         &db_path,
         OpenOptions {
-            node_cache_capacity: 16,
+            cache_capacity: 16,
             ..OpenOptions::default()
         },
     ) {
         Ok(_) => panic!("mismatched options should fail for the same live path"),
         Err(err) => err,
     };
-    assert_eq!(err, Error::Invalid);
+    assert!(matches!(
+        err,
+        OpenError::InvalidOptions(OptionsError::LiveInstanceOptionsMismatch)
+    ));
 }
 
 #[test]
-fn test_open_with_zero_capacity_caches_still_supports_basic_io() {
+fn test_open_with_zero_capacity_node_cache_still_supports_basic_io() {
     let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("zero_capacity_caches.db");
+    let db_path = temp_dir.path().join("zero_capacity_node_cache.db");
 
     let opts = OpenOptions {
-        node_cache_capacity: 0,
-        lid_pid_cache_capacity: 0,
-        lid_pid_hot_cache_capacity: 0,
-        bucket_root_cache_capacity: 0,
-        bucket_tree_cache_capacity: 0,
+        cache_capacity: 0,
         ..OpenOptions::default()
     };
 
     let tree = BTree::open_with_options(&db_path, opts.clone()).unwrap();
+    tree.new_bucket("reuse", false).unwrap();
     tree.exec("reuse", |txn| {
         txn.put(b"k0", b"v0")?;
         txn.put(b"k1", b"v1")?;

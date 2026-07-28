@@ -1,4 +1,4 @@
-use btree_store::BTree;
+use btree_store::{BTree, Error};
 use std::fs;
 use tempfile::TempDir;
 
@@ -10,6 +10,7 @@ fn test_freelist_persist_and_reuse() {
     let size_after_insert;
     {
         let bt = BTree::open(&db_path).unwrap();
+        bt.new_bucket("default", false).unwrap();
         bt.exec("default", |txn| {
             txn.put(b"key1", vec![0xAA; 20000]).unwrap();
             Ok(())
@@ -37,6 +38,15 @@ fn test_freelist_persist_and_reuse() {
     let size_after_reuse = fs::metadata(&db_path).unwrap().len();
     assert!(size_after_delete >= size_after_insert);
     assert!(size_after_reuse >= size_after_delete);
+
+    // Reopen verifies that the reusable extent was published durably rather
+    // than only being available in the previous Store instance.
+    let bt = BTree::open(&db_path).unwrap();
+    bt.view("default", |txn| {
+        assert_eq!(txn.get(b"key2")?.len(), 20000);
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
@@ -45,10 +55,12 @@ fn test_exec_rollback_no_leak() {
     let db_path = temp_dir.path().join("rollback_leak.db");
 
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("data", false).unwrap();
 
     // 1. Initial state
     tree.exec("data", |txn| {
         txn.put(b"initial", b"value").unwrap();
+        txn.put(b"overwritten", b"committed").unwrap();
         Ok(())
     })
     .unwrap();
@@ -57,12 +69,36 @@ fn test_exec_rollback_no_leak() {
     let res: btree_store::Result<()> = tree.exec("data", |txn| {
         // Allocate some pages by putting large values
         txn.put(b"large", vec![0xAA; 1024 * 1024]).unwrap();
+        txn.put(b"overwritten", b"aborted").unwrap();
+        txn.del(b"initial").unwrap();
         // Return error to trigger rollback
-        Err(btree_store::Error::Internal)
+        Err(Error::KeyNotFound)
     });
 
-    assert_eq!(res, Err(btree_store::Error::Internal));
+    assert_eq!(res, Err(Error::KeyNotFound));
 
     // 3. Verify that pages were NOT leaked (pending_alloc should be empty)
     assert_eq!(tree.pending_pages().0, 0, "Pending alloc should be empty");
+    assert_eq!(tree.pending_pages().1, 0, "Pending free should be empty");
+
+    tree.exec("data", |txn| {
+        assert_eq!(txn.get(b"initial").unwrap(), b"value");
+        assert_eq!(txn.get(b"overwritten").unwrap(), b"committed");
+        assert_eq!(txn.get(b"large"), Err(Error::KeyNotFound));
+        txn.put(b"after-rollback", b"visible").unwrap();
+        Ok(())
+    })
+    .unwrap();
+
+    drop(tree);
+    let reopened = BTree::open(&db_path).unwrap();
+    reopened
+        .view("data", |txn| {
+            assert_eq!(txn.get(b"initial").unwrap(), b"value");
+            assert_eq!(txn.get(b"overwritten").unwrap(), b"committed");
+            assert_eq!(txn.get(b"large"), Err(Error::KeyNotFound));
+            assert_eq!(txn.get(b"after-rollback").unwrap(), b"visible");
+            Ok(())
+        })
+        .unwrap();
 }

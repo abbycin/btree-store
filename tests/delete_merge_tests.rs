@@ -2,74 +2,55 @@ use btree_store::{BTree, Error};
 use tempfile::TempDir;
 
 #[test]
-fn test_simple_delete() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test_simple_delete.db");
-
-    let tree = BTree::open(&db_path).expect("Failed to open BTree");
-
-    // Add a key-value pair
-    tree.exec("default", |txn| {
-        txn.put(b"key1", b"value1").expect("Failed to put key1");
-        Ok(())
-    })
-    .unwrap();
-
-    // Verify key exists
-    tree.view("default", |txn| {
-        assert_eq!(txn.get(b"key1").unwrap(), b"value1");
-        Ok(())
-    })
-    .unwrap();
-
-    // Delete key
-    tree.exec("default", |txn| {
-        txn.del(b"key1").expect("Failed to delete key1");
-        Ok(())
-    })
-    .unwrap();
-
-    // Verify key no longer exists
-    tree.view("default", |txn| {
-        assert_eq!(txn.get(b"key1"), Err(Error::NotFound));
-        Ok(())
-    })
-    .unwrap();
-}
-
-#[test]
 fn test_delete_until_node_empty() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_delete_until_node_empty.db");
 
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
+    tree.new_bucket("default", false).unwrap();
 
-    // Add several keys
+    let keys: Vec<_> = (0..256u32)
+        .map(|i| format!("key-{i:04}").into_bytes())
+        .collect();
+
+    // Build enough leaves to force branch traversal and branch-child removal.
     tree.exec("default", |txn| {
-        txn.put(b"key1", b"value1").unwrap();
-        txn.put(b"key2", b"value2").unwrap();
-        txn.put(b"key3", b"value3").unwrap();
+        for key in &keys {
+            txn.put(key, vec![0x5a; 128]).unwrap();
+        }
         Ok(())
     })
     .unwrap();
 
-    // Delete all keys
+    // Right-to-left deletion repeatedly removes the right-most child before root collapse.
     tree.exec("default", |txn| {
-        txn.del(b"key1").unwrap();
-        txn.del(b"key2").unwrap();
-        txn.del(b"key3").unwrap();
+        for key in keys.iter().rev() {
+            txn.del(key).unwrap();
+        }
         Ok(())
     })
     .unwrap();
 
-    // Verify none exists
     tree.view("default", |txn| {
-        assert_eq!(txn.get(b"key1"), Err(Error::NotFound));
-        assert_eq!(txn.get(b"key2"), Err(Error::NotFound));
-        assert_eq!(txn.get(b"key3"), Err(Error::NotFound));
+        for index in [0, 127, 255] {
+            assert_eq!(txn.get(&keys[index]), Err(Error::KeyNotFound));
+        }
+        let mut iter = txn.iter();
+        let mut key = Vec::new();
+        let mut value = Vec::new();
+        assert!(!iter.next_ref(&mut key, &mut value));
         Ok(())
     })
     .unwrap();
+
+    tree.exec("default", |txn| txn.put(b"after-collapse", b"value"))
+        .unwrap();
+    tree.view("default", |txn| {
+        assert_eq!(txn.get(b"after-collapse").unwrap(), b"value");
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(tree.pending_pages(), (0, 0));
 }
 
 #[test]
@@ -78,6 +59,7 @@ fn test_delete_from_root() {
     let db_path = temp_dir.path().join("test_delete_from_root.db");
 
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
+    tree.new_bucket("default", false).unwrap();
 
     // Add a key
     tree.exec("default", |txn| {
@@ -103,24 +85,12 @@ fn test_delete_from_root() {
 }
 
 #[test]
-fn test_delete_nonexistent() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test_delete_nonexistent.db");
-
-    let tree = BTree::open(&db_path).expect("Failed to open BTree");
-
-    // Attempt to delete a non-existent key
-    let result = tree.exec("default", |txn| txn.del(b"nonexistent_key"));
-    assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), btree_store::Error::NotFound));
-}
-
-#[test]
 fn test_sequence_of_deletes() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_sequence_of_deletes.db");
 
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
+    tree.new_bucket("default", false).unwrap();
 
     // Add 10 keys
     tree.exec("default", |txn| {
@@ -149,7 +119,7 @@ fn test_sequence_of_deletes() {
         for i in 0..5 {
             assert_eq!(
                 txn.get(format!("key{}", i).as_bytes()),
-                Err(Error::NotFound)
+                Err(Error::KeyNotFound)
             );
         }
         for i in 5..10 {

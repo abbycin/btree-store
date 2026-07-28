@@ -10,6 +10,7 @@ fn test_view_isolation_blocks_writer() {
     let db_path = temp_dir.path().join("isolation.db");
     let tree = BTree::open(&db_path).unwrap();
     let bucket_name = "iso_bucket";
+    tree.new_bucket(bucket_name, false).unwrap();
 
     // 1. Setup initial data
     tree.exec(bucket_name, |txn| {
@@ -52,7 +53,7 @@ fn test_view_isolation_blocks_writer() {
                 while iter.next_ref(&mut key_buf, &mut val_buf) {
                     count += 1;
                 }
-                Ok(count)
+                Ok::<_, btree_store::Error>(count)
             })
             .unwrap()
     });
@@ -99,4 +100,5 @@ fn test_view_isolation_blocks_writer() {
         Ok(())
     })
     .unwrap();
+    assert_eq!(tree.pending_pages(), (0, 0));
 }

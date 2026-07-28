@@ -1,10 +1,36 @@
-use btree_store::{BTree, Error};
+use btree_store::{BTree, Error, OpenError};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
 const BUCKET: &str = "data_interval_0";
+
+enum OpenInsideViewError {
+    Runtime(Error),
+    Open(OpenError),
+}
+
+impl std::fmt::Debug for OpenInsideViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => f.debug_tuple("Runtime").field(error).finish(),
+            Self::Open(error) => f.debug_tuple("Open").field(error).finish(),
+        }
+    }
+}
+
+impl From<Error> for OpenInsideViewError {
+    fn from(error: Error) -> Self {
+        Self::Runtime(error)
+    }
+}
+
+impl From<OpenError> for OpenInsideViewError {
+    fn from(error: OpenError) -> Self {
+        Self::Open(error)
+    }
+}
 
 fn interval_key(lo: u64) -> [u8; 8] {
     lo.to_be_bytes()
@@ -15,6 +41,7 @@ fn noop_exec_multi_missing_key_touch_does_not_commit_catalog() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("noop_exec_multi_catalog_rewrite.db");
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket(BUCKET, false).unwrap();
 
     tree.exec(BUCKET, |txn| txn.put(interval_key(1), b"file1"))
         .unwrap();
@@ -22,7 +49,7 @@ fn noop_exec_multi_missing_key_touch_does_not_commit_catalog() {
     let before = tree.current_seq();
     tree.exec_multi(|multi| {
         multi.exec(BUCKET, |txn| {
-            assert_eq!(txn.get(interval_key(2)).unwrap_err(), Error::NotFound);
+            assert_eq!(txn.get(interval_key(2)).unwrap_err(), Error::KeyNotFound);
             Ok(())
         })?;
         Ok(())
@@ -41,11 +68,12 @@ fn exec_multi_same_bucket_write_then_noop_keeps_changed_root() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("same_bucket_write_then_noop.db");
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket(BUCKET, false).unwrap();
 
     tree.exec_multi(|multi| {
         multi.exec(BUCKET, |txn| txn.put(interval_key(1), b"file1"))?;
         multi.exec(BUCKET, |txn| {
-            assert_eq!(txn.get(interval_key(2)).unwrap_err(), Error::NotFound);
+            assert_eq!(txn.get(interval_key(2)).unwrap_err(), Error::KeyNotFound);
             Ok(())
         })?;
         Ok(())
@@ -60,21 +88,17 @@ fn exec_multi_same_bucket_write_then_noop_keeps_changed_root() {
 }
 
 #[test]
-fn exec_multi_empty_new_bucket_creates_catalog_entry() {
+fn new_bucket_creates_empty_catalog_entry() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("empty_new_bucket_catalog_entry.db");
     let tree = BTree::open(&db_path).unwrap();
 
-    tree.exec_multi(|multi| {
-        multi.exec("empty_bucket", |_| Ok(()))?;
-        Ok(())
-    })
-    .unwrap();
+    tree.new_bucket("empty_bucket", false).unwrap();
 
     let buckets = tree.buckets().unwrap();
     assert!(
         buckets.iter().any(|bucket| bucket == "empty_bucket"),
-        "a successful exec_multi touch of a missing bucket should create an empty bucket catalog entry"
+        "new_bucket must persist an empty bucket catalog entry"
     );
 }
 
@@ -83,6 +107,7 @@ fn exec_multi_existing_empty_bucket_noop_does_not_commit_catalog() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("existing_empty_bucket_noop.db");
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("empty_bucket", false).unwrap();
 
     tree.exec("empty_bucket", |_| Ok(())).unwrap();
 
@@ -105,6 +130,7 @@ fn exec_existing_empty_bucket_noop_does_not_commit_catalog() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("existing_empty_bucket_single_noop.db");
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("empty_bucket", false).unwrap();
 
     tree.exec("empty_bucket", |_| Ok(())).unwrap();
 
@@ -119,12 +145,13 @@ fn exec_existing_empty_bucket_noop_does_not_commit_catalog() {
 }
 
 #[test]
-fn exec_multi_update_miss_then_touch_same_bucket_still_creates_catalog_entry() {
+fn exec_multi_update_miss_then_touch_same_bucket_is_noop_on_existing_bucket() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir
         .path()
         .join("multi_update_miss_then_touch_same_bucket.db");
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("empty_bucket", false).unwrap();
 
     tree.exec_multi(|multi| {
         multi.exec("empty_bucket", |txn| {
@@ -136,20 +163,21 @@ fn exec_multi_update_miss_then_touch_same_bucket_still_creates_catalog_entry() {
     })
     .unwrap();
 
-    let buckets = tree.buckets().unwrap();
-    assert!(
-        buckets.iter().any(|bucket| bucket == "empty_bucket"),
-        "a later touch in the same multi transaction must still create the bucket after update(false)"
-    );
+    tree.view("empty_bucket", |txn| {
+        assert_eq!(txn.get(interval_key(1)).unwrap_err(), Error::KeyNotFound);
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
-fn exec_multi_update_miss_on_missing_bucket_still_creates_catalog_entry() {
+fn exec_multi_update_miss_on_existing_empty_bucket_is_noop() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir
         .path()
-        .join("multi_update_miss_missing_bucket_materializes_bucket.db");
+        .join("multi_update_miss_existing_empty_bucket.db");
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("empty_bucket", false).unwrap();
 
     let before = tree.current_seq();
     tree.exec_multi(|multi| {
@@ -163,16 +191,8 @@ fn exec_multi_update_miss_on_missing_bucket_still_creates_catalog_entry() {
     let after = tree.current_seq();
 
     assert_eq!(
-        after,
-        before + 1,
-        "successful exec_multi update(false) on a missing bucket should still commit catalog state"
-    );
-    assert!(
-        tree.buckets()
-            .unwrap()
-            .iter()
-            .any(|bucket| bucket == "empty_bucket"),
-        "successful exec_multi update(false) on a missing bucket should materialize the empty bucket"
+        after, before,
+        "successful exec_multi update(false) on an existing empty bucket is a no-op"
     );
 }
 
@@ -181,6 +201,7 @@ fn clone_during_inflight_writer_uses_consistent_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("clone_writer_snapshot_boundary.db");
     let tree = Arc::new(BTree::open(&db_path).unwrap());
+    tree.new_bucket(BUCKET, false).unwrap();
     let key = interval_key(42);
 
     let barrier = Arc::new(Barrier::new(2));
@@ -222,6 +243,7 @@ fn clone_inside_active_view_callback_does_not_deadlock() {
         .join("clone_active_view_snapshot_boundary.db");
     let stale_tree = Arc::new(BTree::open(&db_path).unwrap());
     let writer_tree = BTree::open(&db_path).unwrap();
+    writer_tree.new_bucket(BUCKET, false).unwrap();
     let key = interval_key(43);
 
     writer_tree
@@ -269,6 +291,7 @@ fn open_inside_active_view_callback_does_not_deadlock() {
         .join("open_active_view_snapshot_boundary.db");
     let stale_tree = Arc::new(BTree::open(&db_path).unwrap());
     let writer_tree = BTree::open(&db_path).unwrap();
+    writer_tree.new_bucket(BUCKET, false).unwrap();
     let key = interval_key(44);
 
     writer_tree
@@ -285,7 +308,7 @@ fn open_inside_active_view_callback_does_not_deadlock() {
         thread::spawn(move || {
             let res = tree.view(BUCKET, |txn| {
                 assert_eq!(txn.get(key).unwrap(), b"marker".to_vec());
-                BTree::open(&open_path)
+                Ok(BTree::open(&open_path).map_err(OpenInsideViewError::from))
             });
             tx.send(res).unwrap();
         });
@@ -294,6 +317,7 @@ fn open_inside_active_view_callback_does_not_deadlock() {
     let reopened = rx
         .recv_timeout(Duration::from_secs(2))
         .expect("same-path open from inside an active view callback should not deadlock")
+        .unwrap()
         .unwrap();
 
     reopened

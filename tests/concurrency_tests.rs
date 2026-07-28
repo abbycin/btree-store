@@ -1,4 +1,4 @@
-use btree_store::{BTree, Error};
+use btree_store::BTree;
 use std::thread;
 use tempfile::TempDir;
 
@@ -7,6 +7,7 @@ fn test_concurrent_put_get() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("concurrent_test.db");
     let btree = BTree::open(&db_path).unwrap();
+    btree.new_bucket("concurrent", false).unwrap();
 
     let mut handles = vec![];
     let num_threads = 4;
@@ -60,79 +61,11 @@ fn test_concurrent_put_get() {
 }
 
 #[test]
-#[cfg(not(windows))]
-fn test_concurrent_mixed_ops() {
-    let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("concurrent_mixed.db");
-    let btree = BTree::open(&db_path).unwrap();
-
-    btree
-        .exec("mixed", |txn| {
-            for i in 0..200 {
-                txn.put(format!("key_{}", i).as_bytes(), b"initial")
-                    .unwrap();
-            }
-            Ok(())
-        })
-        .unwrap();
-
-    let mut handles = vec![];
-
-    // Thread 1: Puts
-    let btree1 = btree.clone();
-    handles.push(thread::spawn(move || {
-        for i in 200..400 {
-            btree1
-                .exec("mixed", |txn| {
-                    txn.put(format!("key_{}", i).as_bytes(), b"new").unwrap();
-                    Ok(())
-                })
-                .unwrap();
-        }
-    }));
-
-    // Thread 2: Deletes
-    let btree2 = btree.clone();
-    handles.push(thread::spawn(move || {
-        for i in 0..100 {
-            let _ = btree2.exec("mixed", |txn| {
-                let _ = txn.del(format!("key_{}", i).as_bytes());
-                Ok(())
-            });
-        }
-    }));
-
-    // Thread 3: Gets
-    let btree3 = btree.clone();
-    handles.push(thread::spawn(move || {
-        for _ in 0..200 {
-            let _ = btree3
-                .view("mixed", |txn| {
-                    let _ = txn.get(b"key_150");
-                    Ok(())
-                })
-                .or_else(|e| {
-                    // If view fails due to stale cache despite auto-refresh check,
-                    // it might be a torn read from a concurrent commit (rare but possible in this architecture)
-                    if e == Error::Corruption || e == Error::NotFound {
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                });
-        }
-    }));
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
-}
-
-#[test]
 fn test_mass_delete_merge_shrink() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("merge_shrink.db");
     let btree = BTree::open(&db_path).unwrap();
+    btree.new_bucket("merge", false).unwrap();
 
     let num_entries = 1000;
     btree

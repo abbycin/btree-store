@@ -1,4 +1,4 @@
-use btree_store::{BTree, Error, MetaNode};
+use btree_store::{BTree, Error, MetaNode, OpenOptions, SyncMode};
 use std::fs;
 use std::io;
 use tempfile::TempDir;
@@ -69,42 +69,36 @@ impl TestFileExt for fs::File {
 }
 
 #[test]
-fn test_uncommitted_changes_revert() {
+fn failed_exec_publishes_consumed_meta_before_returning_error() {
     let temp_dir = TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("revert.db");
+    let db_path = temp_dir.path().join("failed_exec_meta.db");
+    let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("data", false).unwrap();
+    let before_seq = tree.current_seq();
+    // The failed write still publishes allocator metadata before the caller
+    // receives the closure error, so reopen can continue from that generation.
 
-    // 1. Initial state
-    {
-        let tree = BTree::open(&db_path).unwrap();
-        tree.exec("default", |txn| {
-            txn.put(b"key1", b"val1").unwrap();
-            Ok(())
-        })
-        .unwrap();
-    }
+    let result: btree_store::Result<()> = tree.exec("data", |txn| {
+        txn.put(b"aborted", vec![0x7a; 16 * 1024]).unwrap();
+        Err(Error::KeyNotFound)
+    });
+    assert!(result.is_err());
+    assert_eq!(tree.pending_pages(), (0, 0));
 
-    // 2. Perform changes but DON'T commit (via manual clone or separate process simulation)
-    {
-        let tree = BTree::open(&db_path).unwrap();
-        // Here we can't use exec because it auto-commits.
-        // We simulate a failed process by just opening and doing nothing,
-        // or by testing that if exec fails, it reverts.
-        let _: btree_store::Result<()> = tree.exec("default", |txn| {
-            txn.put(b"key1", b"new_val").unwrap();
-            txn.put(b"key2", b"val2").unwrap();
-            Err(Error::Internal) // Abort
-        });
-    }
-    // 3. Reopen and verify it reverted to committed state
-    {
-        let tree = BTree::open(&db_path).unwrap();
-        tree.view("default", |txn| {
-            assert_eq!(txn.get(b"key1").unwrap(), b"val1");
-            assert_eq!(txn.get(b"key2"), Err(Error::NotFound));
-            Ok(())
-        })
+    let published_seq = tree.current_seq();
+    assert!(published_seq > before_seq);
+    drop(tree);
+
+    let reopened = BTree::open(&db_path).unwrap();
+    let reopened_seq = reopened.current_seq();
+    assert_eq!(reopened_seq, published_seq);
+    assert_eq!(
+        reopened.view("data", |txn| txn.get(b"aborted")),
+        Err(Error::KeyNotFound)
+    );
+    reopened
+        .exec("data", |txn| txn.put(b"continued", b"ok"))
         .unwrap();
-    }
 }
 
 #[test]
@@ -115,6 +109,7 @@ fn test_torn_superblock_recovery() {
     // 1. Create a database with several commits
     {
         let tree = BTree::open(&db_path).unwrap();
+        tree.new_bucket("default", false).unwrap();
         tree.exec("default", |txn| {
             txn.put(b"stable", b"data").unwrap();
             Ok(())
@@ -151,12 +146,15 @@ fn test_torn_superblock_recovery() {
     // 3. Reopen and verify fallback to previous SB
     {
         let tree = BTree::open(&db_path).expect("Should open even with one corrupted SB");
+        tree.commit().unwrap();
         tree.view("default", |txn| {
             assert_eq!(txn.get(b"stable").unwrap(), b"data");
             // If we fall back to the previous SB, "latest" might be gone depending on seq.
             Ok(())
         })
         .unwrap();
+        tree.exec("default", |txn| txn.put(b"continued", b"ok"))
+            .unwrap();
     }
 }
 
@@ -166,6 +164,7 @@ fn test_exec_error_revert() {
     let db_path = temp_dir.path().join("exec_error.db");
 
     let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("data", false).unwrap();
     tree.exec("data", |txn| {
         txn.put(b"k1", b"v1").unwrap();
         Ok(())
@@ -175,13 +174,54 @@ fn test_exec_error_revert() {
     let _: btree_store::Result<()> = tree.exec("data", |txn| {
         txn.put(b"k1", b"v2").unwrap();
         txn.put(b"k2", b"v2").unwrap();
-        Err(Error::Internal)
+        Err(Error::KeyNotFound)
     });
 
     tree.view("data", |txn| {
         assert_eq!(txn.get(b"k1").unwrap(), b"v1");
-        assert_eq!(txn.get(b"k2"), Err(Error::NotFound));
+        assert_eq!(txn.get(b"k2"), Err(Error::KeyNotFound));
         Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn data_sync_publication_reopens_allocator_state_and_continues() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("data_sync_reopen.db");
+    let mut options = OpenOptions::new();
+    options.sync_mode = SyncMode::Data;
+    // This exercises durable reusable/retired list reconstruction across a
+    // publication and a subsequent allocation.
+
+    {
+        let tree = options.open(&db_path).unwrap();
+        tree.new_bucket("data", false).unwrap();
+        tree.exec("data", |txn| txn.put(b"retired", b"old"))
+            .unwrap();
+        tree.exec("data", |txn| {
+            txn.del(b"retired")?;
+            txn.put(b"stable", b"value")
+        })
+        .unwrap();
+    }
+
+    let tree = options.open(&db_path).unwrap();
+    tree.view("data", |txn| {
+        assert_eq!(txn.get(b"retired"), Err(Error::KeyNotFound));
+        assert_eq!(txn.get(b"stable")?, b"value");
+        Ok::<_, Error>(())
+    })
+    .unwrap();
+    tree.exec("data", |txn| txn.put(b"continued", b"ok"))
+        .unwrap();
+    drop(tree);
+
+    let tree = options.open(&db_path).unwrap();
+    tree.view("data", |txn| {
+        assert_eq!(txn.get(b"stable")?, b"value");
+        assert_eq!(txn.get(b"continued")?, b"ok");
+        Ok::<_, Error>(())
     })
     .unwrap();
 }

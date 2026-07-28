@@ -8,6 +8,7 @@ fn bench() {
     temp_dir.disable_cleanup(false);
     let db_path = temp_dir.path().join("bench.db");
     let btree = BTree::open(&db_path).unwrap();
+    btree.new_bucket("default", false).unwrap();
 
     let data: Vec<String> = (0..100000).map(|x| format!("key_{}", x)).collect();
 

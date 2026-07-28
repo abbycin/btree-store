@@ -1,173 +1,332 @@
-# btree_store Architecture and Design Document
+# btree-store Design
 
-## 1. System Overview
+This document describes the stable architecture, persistence protocol, lifecycle rules, and
+format boundaries of `btree-store`. It is a design document rather than an implementation guide:
+names of internal functions and individual test cases are intentionally omitted.
 
-**btree_store** is a persistent, embedded key-value storage engine written in Rust. It is designed for reliability, crash safety, and high performance using a B+ Tree data structure with Copy-On-Write (COW) semantics and a closure-based transaction model.
+## 1. Goals
 
-### Key Design Principles
-- **Copy-On-Write (COW):** Modifications never overwrite existing data in place. This ensures the database is always in a consistent state.
-- **Transactional API:** All operations are wrapped in `exec` or `view` closures, providing automatic ACID guarantees and seamless version management.
-- **Auto-Refresh Snapshot Isolation:** Transactions automatically sync to the latest disk version upon start, eliminating manual snapshot management.
+`btree-store` is a persistent, embedded key-value engine with the following goals:
 
----
+- atomic updates without a write-ahead log
+- snapshot isolation for readers
+- crash-safe publication of a complete database generation
+- multiple named buckets in one database file
+- predictable page-oriented storage and reclamation
+- efficient point reads and ordered iteration
+- a small, fixed physical format with offline migration for incompatible changes
 
-## 2. Architecture Layers
+The engine is deliberately single-writer within a process and does not provide multi-process
+concurrent access to one database path.
 
-### 2.1. User API Layer (`src/lib.rs`)
-- **`BTree`**: The central coordinator. It manages the Catalog Tree which maps bucket names to Root Page IDs.
-    - **`exec<F, R>(bucket, f)`**: Starts a read-write transaction on a single bucket. It acquires a process-level write lock, refreshes to the latest disk state, and executes the closure.
-    - **`exec_multi<F, R>(f)`**: Executes multiple operations across different buckets in a single atomic transaction. It caches root updates in memory and performs a single `commit_internal()` at the end, minimizing disk I/O.
-    - **`view<F, R>(bucket, f)`**: Starts a read-only transaction. It acquires a process-level read lock.
-- **`MultiTxn`**: A specialized handle for `exec_multi`. Its `exec` method allows switching between different buckets within the same transaction context.
-- **`Clone` Behavior**: Cloned handles share the same underlying store, writer lock, pending alloc/free trackers, and read caches, while keeping per-handle local snapshot markers (`start_seq`, `start_root_id`).
-- **Same-Path Open Reuse**: Within one process, `BTree::open(path)` reuses an already-open instance for the same normalized path and returns a refreshed clone of that live instance, rather than creating an independent second opener.
+## 2. System Model
 
-> **Note:** Concurrent access from multiple processes is not supported. Within a single process, the supported model is one live instance per database path, shared via cloning/open reuse.
+The database consists of one physical file divided into 4096-byte pages. Two pages are metadata
+slots; all remaining pages belong to the published data graph or to allocator state.
 
-### 2.2. Tree Logic Layer (`Tree` struct in `src/lib.rs`)
-Implements core B+ Tree algorithms:
-- **COW Propagation:** Every modification creates a new path from leaf to root.
-- **Transaction Context:** Tracks `freed` and `alloc` pages. 
-- **Internal Commit:** Performed at the end of `exec`, involving free list persistence, a double-buffered superblock switch, and storage sync.
+There are four logical layers:
 
-### 2.3. Node Layer (`src/node.rs`)
-Defines binary layout with strict 8-byte alignment and reinforced validation:
-- **Zero-Copy:** Casts raw memory directly to `&NodeHeader` or `&Slot`.
-- **Physical Invariants:** `Node::validate` strictly checks `is_leaf` flags, element counts, and data offset boundaries to detect corruption before it propagates.
-- **Dirty Management:** All mutation functions (e.g., `shrink_slot`, `expand_slot`) automatically set the `dirty` flag, guaranteeing that `finalize` updates the checksum before disk I/O.
-- **Slot Layout:** `Slot` keeps a 32-byte size and stores up to 5 inline page ids (`page_id[5]`) for small overflow values, avoiding index pages for up to 5 pages.
+- public handle and transaction API
+  - owns the database lifecycle and exposes bucket, read, write, and multi-bucket operations
+- catalog and bucket trees
+  - the catalog maps bucket names to bucket metadata
+  - each bucket metadata record identifies the bucket root and its layout policy
+- page and value storage
+  - B+ Tree nodes store keys and either inline values or references to overflow storage
+  - allocator pages store reusable and retired physical extents
+- runtime services
+  - positional file I/O, shared metadata snapshot, page cache, and writer/read locks
 
-### 2.4. Storage Layer (`src/store.rs`)
-- **`Store`**: Manages file I/O and a sharded clock cache.
-- **Granular Invalidation:** Cache invalidation is integrated directly into `alloc_pages` and `free_pages`. This ensures that any page ID being reused or released is immediately purged from the memory cache across all threads.
-- **Consolidated Reclamation:** A unified `free_pages` method handles all physical page releases, ensuring the on-disk free list remains consistent during commits and rollbacks.
-    - The cache uses a sharded clock-style eviction policy for low overhead under concurrency.
+The catalog tree and every bucket tree use the same physical page namespace. A published root is
+therefore resolved as:
 
----
+1. metadata slot to catalog root
+2. catalog key to bucket metadata
+3. bucket metadata to bucket root
+4. tree nodes to child nodes and value pages
 
-## 3. Core Mechanisms
+Runtime caches and transaction state are disposable. The two metadata slots and the pages reachable
+from the selected slot are the recovery authority.
 
-### 3.1. Transaction Isolation & Auto-Refresh
-The engine implements **Snapshot Isolation (SI)** with an focus on usability:
-1.  **Start-Time Sync:** `exec` calls `refresh_internal()` (refreshes `root_current` from the Superblock and clears the `NodeCache`). `view` reads a process-wide shared snapshot `(seq, root)` and clears the cache when `seq` changes.
-2.  **Snapshot Stability:** Once a closure starts, its root ID is fixed. Even if another process commits, the current closure's view remains stable.
-3.  **Conflict Detection:** `commit_internal()` rejects commits when the caller's `start_seq` is stale and returns `Error::Conflict`. Under the supported single-process model, same-path handles share one writer lock and are normally refreshed before `exec`, so ordinary same-process writers serialize instead of racing to conflict. The conflict path remains the guardrail for stale local snapshots.
+## 3. Database And Bucket Lifecycle
 
-### 3.2. Automatic Rollback Logic
-When an `exec` closure returns `Err`, the following occurs:
-1.  **Catalog Restoration:** The Catalog Tree's root is reset to its pre-transaction state.
-2.  **Physical Reclamation:** All pages allocated during the failed transaction are immediately released back to the `Store`'s free list.
-3.  **Pending State Clear:** Uncommitted `pending_free` and `pending_alloc` lists are purged.
+### 3.1 Open
 
-### 3.3. Double-Write Commit Protocol
-Ensures crash-safe metadata updates:
-1.  **Write Free List + SB:** Write free list pages and stage the new roots in the double-buffered superblock.
-2.  **Sync Data:** Flush data and metadata (`sync_all`).
-3.  **Clear Pending State:** Clear pending alloc/free trackers in memory.
+Opening a database establishes one live owner for its normalized path. Same-process opens share that
+owner and its runtime state; a competing process is rejected by the database file lock.
 
----
+For a new database, the engine creates the two metadata slots and initializes an empty catalog.
+For an existing database, opening validates both metadata candidates, selects the newest valid
+generation, and reconstructs allocator state from that generation.
 
-## 4. File Format
+Runtime options such as cache capacity and synchronization policy do not change the file format.
+They are fixed for a shared live instance and must not silently disagree between same-process
+opens.
 
-| Page ID | Content | Description |
-| :--- | :--- | :--- |
-| 0 | `MetaNode` (A) | Superblock Buffer 0 |
-| 1 | `MetaNode` (B) | Superblock Buffer 1 |
-| 2..N | Nodes / Data | B-Tree nodes, overflow data, or free list pages. |
+### 3.2 Bucket creation
 
-**Limits**
-- **Page ID width:** 32-bit page ids are used on disk (including index pages).
-- **Max file size:** ~16 TB with 4 KB pages.
+Bucket creation is a catalog transaction. It atomically adds a name and its bucket metadata with an
+empty root and a fixed layout policy. A name is visible only after the catalog generation is
+published. Creating an existing name fails without replacing its root.
 
----
+### 3.3 Bucket use
 
-## 5. Implementation Details
+A write transaction operates on an existing bucket. A read-only view also requires an existing
+bucket; no operation creates a bucket implicitly. A multi-bucket transaction may switch among
+existing buckets while retaining one transaction snapshot and one publication boundary.
 
-- **Iterators:** `TreeIterator` captures the root ID at the time of creation (`txn.iter()`), ensuring a stable view even if the transaction performs further writes later.
-- **Automatic Sync:** `BTree::open` performs recovery on startup (v2 has no `.pending` log).
+Bucket metadata is part of the catalog value space, not a separate metadata file. Its durable
+layout policy controls how future nodes in that bucket are encoded.
 
----
+### 3.4 Close and reuse
 
-## 6. Space Management
+Cloning a handle shares the live store, cache, and writer serialization while keeping transaction
+snapshots local to each operation. Closing the last live handle releases the file ownership. A
+later open reconstructs state from the published file rather than from runtime caches.
 
-**Free List Structure**
-- Free space is tracked as sorted, merged extents `(page_id, nr_pages)`.
-- `freelist_add_extent` inserts in order and coalesces adjacent ranges, keeping the list ordered by `page_id`.
-- This ordering enables efficient prefix scans (e.g., counting free pages below a limit).
+## 4. Tree Model
 
-**Allocation Strategy**
-- Normal allocations scan a limited number of low-address extents first, then take from higher extents, and finally extend the file if needed.
-- Free list pages themselves are also allocated via the same allocator and stored on disk as linked pages.
+The index is a copy-on-write B+ Tree:
 
-**Large Value Storage**
-- Leaf values with `key_len + value_len <= 64` are stored inline inside the node page.
-- Larger values are stored in overflow data pages: `nr_pages = ceil(value_len / PAGE_SIZE)`.
-- If `nr_pages <= 5`, the slot stores the data page ids directly in `page_id[0..nr_pages]`.
-- If `nr_pages > 5`, `page_id[0]` points to an indirect index chain; each index page stores page ids plus a next pointer and a checksum.
-- On update/delete, overflow data pages and index pages are scheduled into `pending_free` and reclaimed after commit, returning space to the freelist.
+- leaves contain sorted key/value records
+- branches contain ordered child references and separator keys
+- an empty root represents an empty bucket
+- a mutation rewrites the affected path from leaf to root
+- split and merge decisions preserve sorted order and equal leaf depth
+- old pages are never overwritten by a new tree version
 
----
+The tree algorithm is independent of the durable store. A transaction supplies the snapshot root,
+page reader, page writer, and page ownership journal. A successful operation returns a new root;
+the new root becomes durable only through generation publication.
 
-## 7. Tail-Window Compaction (Current)
+### 4.1 Node layouts
 
-**Goal:** Reclaim tail space by moving live pages out of the file tail, then truncating if the tail becomes free.
+The format supports two node layouts selected per bucket:
 
-**Parameters**
-- `compact(target_bytes)` uses the requested byte budget to select a tail window.
-- `target_bytes == 0` uses the default internal ratio (0.5).
-- if total data pages `<= 1024`, compact all data pages.
+- plain layout
+  - stores each key in full
+  - uses the same representation for leaves and branches, with the node kind and slot metadata
+    defining interpretation
+- prefix-encoded layout
+  - stores one shared key prefix followed by key tails
+  - compares a searched key against prefix plus tail without changing key ordering
+  - uses a self-describing node kind for encoded leaves and branches
 
-**Workflow**
-1. **Compute tail window:**  
-   - `total_pages = next_page_id`, `usable_pages = total_pages - 2`  
-   - if `usable_pages <= 1024` then `target_pages = usable_pages`  
-   - else if `target_bytes == 0` then `target_pages = ceil(usable_pages * 0.5)`  
-   - else `target_pages = ceil(target_bytes / PAGE_SIZE)`  
-   - `tail_start = total_pages - target_pages` (clamped to `>= 2`)
-2. **Move tail pages by reverse index:**  
-   - Iterate `reverse_tree` (pid -> lid) from `tail_start` to `total_pages`.  
-   - If low-address free pages below `tail_start` are available, compaction pre-allocates them with `alloc_pages_below`.
-   - For default compaction (`target_bytes == 0`), relocation is strict no-growth: if enough low pages are not available for all planned moves, the run returns without moving pages.
-   - For explicit `target_bytes`, compaction can still fall back to the normal allocator when low preallocation is unavailable or only partially available.
-   - Update mapping (`lid -> new_pid`) and reverse (`new_pid -> lid`), and add old pid to `pending_free`.
-3. **Commit:**  
-   - `commit_internal()` persists mapping/reverse roots and merges `pending_free` into the freelist.
-4. **Tail truncate attempt:**  
-   - Compute a safe floor using the max pid from mapping/reverse trees, the reverse index itself, and freelist pages.  
-   - Call `try_truncate_tail_with_floor(floor)`; if truncation fails, compaction still succeeds for logical relocation.
+Prefix encoding is a storage policy, not a change to key semantics. A bucket may retain its policy
+across reopen, and all nodes reachable from that bucket must be interpreted using the fixed format
+contract for their node class.
 
-**Return Value**
-- `CompactStats { moved_pages, remaining_candidates }` where `remaining_candidates` counts tail candidates not moved in this run.
+### 4.2 Values
 
-**Notes**
-- Low-address relocation improves the chance of freeing a contiguous tail, but truncation is still best-effort because metadata roots and freelist pages can keep the floor above `tail_start`.  
-- Default compaction (`target_bytes == 0`) prefers "do not grow the file during compaction" over partial relocation, so it may return `moved_pages = 0` when low free space is insufficient.
+Small values are stored in the leaf record. Larger values are split into raw 4096-byte overflow
+pages. A slot either contains the inline value marker, a bounded set of direct overflow page IDs,
+or the root of an indirect page chain for larger values.
 
----
+Updating or deleting a value creates the replacement references in the new tree version and retires
+the old value pages with the old tree path. Value pages are physical storage, not independently
+visible records.
 
-## 8. Read Path Optimizations (B1/B2/B3/B4)
+### 4.3 Iteration
 
-**B1: Shared Meta Snapshot**
-- A per-path `SharedMeta { seq, root }` is stored in a process-wide registry.
-- `Store::open` initializes or reuses the shared meta.
-- `commit_roots` updates `(root, seq)` atomically.
-- `view` uses the shared snapshot and avoids `refresh_sb` on the hot path; it only refreshes when `seq` changes.
+An iterator is bound to the transaction snapshot that created it. It traverses one fixed root in
+key order, and its lifetime prevents that transaction from mutating the same snapshot. It cannot
+outlive the transaction that owns the snapshot.
 
-**B2: Bucket Root Cache**
-- `bucket_root_cache: HashMap<Vec<u8>, (root, seq)>` avoids catalog lookups when `seq` matches.
-- `view` reads from cache when possible; otherwise it loads catalog and updates cache.
-- `exec`/`exec_multi` refresh cache entries on successful commit.
+## 5. Transactions And Snapshots
 
-**B3: Bucket Read-Only Tree Cache**
-- `bucket_tree_cache` caches `ReadOnlyTree` instances per bucket, avoiding per-`view` tree construction.
-- `view` checks this cache before re-reading bucket metadata; a matching `(bucket, seq)` entry can satisfy the read-only setup path directly.
-- `ReadOnlyTree` preloads its root node once, avoiding a repeated root-page load on every lookup.
-- Cache entries are invalidated on `seq` changes to prevent stale reads.
+### 5.1 Snapshot isolation
 
-**B4: LID->PID Cache**
-- `LogicalStore` maintains a two-level cache for `lid -> pid` lookups: a lock-free direct-mapped hot cache in front of the existing sharded cache, reducing mapping tree reads and lock traffic on hot paths.
-- The cache is invalidated when the shared `seq` changes or after compaction.
+Each operation observes one pair `(generation, catalog root)`:
 
-**Consistency Note**
-- These optimizations do not change snapshot isolation: caches are keyed by `seq`, and `view` refreshes roots when `seq` changes.
-- Multi-process concurrent access is not supported and remains outside the consistency guarantees.
+- a write operation refreshes to the latest published generation before its closure starts
+- a read view uses the latest shared snapshot available when it starts
+- the root remains fixed for the lifetime of the closure and its iterators
+- a concurrent publication does not change an already-started view
+
+There is one process-level writer and multiple readers. The writer lock serializes all changes to
+transaction roots and ownership journals. Reader locks allow concurrent snapshot reads while
+preventing a writer from publishing against an inconsistent in-memory state.
+
+### 5.2 Transaction state
+
+A write transaction owns a working catalog root, bucket root updates, newly allocated pages, and
+pages scheduled for retirement. This state is local to the transaction and is not shared by cloned
+handles or other write calls.
+
+Nested operations in a multi-bucket transaction use savepoints. A savepoint records the root and
+page-ownership delta at its boundary. Rolling back a savepoint discards only its uncommitted changes
+and releases pages allocated solely by that savepoint; pages from the published generation are
+never made reusable by a local rollback.
+
+### 5.3 Closure outcomes
+
+A closure-returned error is a normal transaction rollback request. Its key/value and bucket error
+is returned to the caller after restoring the pre-transaction logical state. Engine I/O,
+corruption, address-space exhaustion, and invariant failures are outside the user error contract
+and terminate through the engine's fatal fault boundary.
+
+User panics are also outside the rollback contract. The supported release configuration terminates
+the process on panic rather than promising to recover partially-owned transaction state.
+
+## 6. Generation Publication
+
+The metadata slot is the atomic publication switch. A generation is complete only when its metadata
+slot and every page named by that slot satisfy the publication protocol.
+
+A successful publication follows this ordering:
+
+1. finish the working catalog and bucket roots
+2. determine allocator state for the candidate generation
+3. write all replacement nodes, value pages, indirect pages, and allocator-list pages
+4. synchronize those dependency pages according to the configured sync policy
+5. write the next metadata slot with the new generation, roots, and allocator roots
+6. perform an independent publication synchronization
+7. expose the new generation to in-process readers and clear transaction-local state
+
+The metadata slot is never allowed to reference a page that has not crossed the dependency
+durability boundary. If publication fails before the slot switch is durable, the previous slot
+remains the recovery state. In-memory working roots and pending ownership are then discarded or
+restored without changing the previously published generation.
+
+A multi-bucket transaction executes the same protocol once. All catalog and bucket root changes are
+either named by the new slot together or remain at the old generation.
+
+## 7. Allocator And Reclamation
+
+### 7.1 Ownership classes
+
+For every physical page ID in the allocated file range, a stable published generation has exactly
+one ownership class:
+
+- reachable tree or value storage
+- reusable extent
+- retired extent
+- reusable-list page
+- retired-list page
+
+No page may be both reachable and reusable, appear in two allocator classes, or be absent from all
+ownership classes.
+
+### 7.2 Reusable and retired state
+
+The allocator maintains two separate extent sets:
+
+- reusable pages may be allocated by a later transaction
+- retired pages are no longer in the candidate data graph but may still be referenced by the
+  previous metadata generation used for crash recovery
+
+Both sets are persisted as linked extent-page chains and are restored together with the metadata
+slot. Extents are ordered by page ID and adjacent ranges are merged.
+
+### 7.3 Quarantine rule
+
+A page removed by a COW rewrite is first placed in the candidate generation's retired state. It may
+be promoted to reusable only while constructing a later generation whose fallback metadata no longer
+references it. Allocator-list pages follow the same rule: list pages named by the old slot are
+retired rather than overwritten in place.
+
+Pages allocated and released entirely inside the current transaction may be recycled locally once
+they are unreachable from the working roots. They were never reachable from a published metadata
+slot and therefore do not need generation quarantine.
+
+### 7.4 Allocation
+
+Allocation consumes reusable extents in ascending page-ID order and extends the file when no suitable
+reusable extent remains. Allocator metadata pages use the same allocation mechanism as data pages;
+their ownership is included in the candidate generation before the metadata slot is written.
+
+## 8. File Format
+
+The physical file is:
+
+| Page range | Content |
+| --- | --- |
+| 0 | metadata slot A |
+| 1 | metadata slot B |
+| 2..N | nodes, overflow pages, indirect pages, or allocator-list pages |
+
+The initial format is version 1. The metadata record contains the magic value, generation number,
+format version, catalog root, next page ID, reusable-list root, retired-list root, and checksum.
+The two metadata slots are the only database-level format discriminator.
+
+All other persisted records have fixed layouts defined by the version-1 contract. They do not carry
+independent runtime version tags. A change to a persisted layout or its interpretation increments
+the database format version; the normal reader rejects the incompatible database and an offline
+migration produces the new format.
+
+The format contract includes, at minimum:
+
+- 4096-byte pages and 32-bit physical page IDs
+- little-endian persisted integers and little-endian target support only
+- node headers, slot widths, node-class discriminants, and branch sentinel semantics
+- bucket metadata layout and its prefix-encoding policy bit
+- inline value threshold, direct overflow reference capacity, and indirect-chain layout
+- extent-list header, entry layout, ordering, and chain termination rules
+
+Only metadata slots carry CRC32C. Other page classes rely on fixed structural interpretation and
+producer/publication invariants rather than per-page checksums. A malformed page or broken physical
+reference discovered while opening or running the engine is corruption, not a user-level key/value
+error.
+
+## 9. Recovery And Failure Boundaries
+
+Recovery independently evaluates both metadata slots. A candidate is usable only if its checksum,
+magic, format version, generation fields, root references, and allocator chains are valid. Recovery
+selects the highest-generation valid candidate and ignores an incomplete or torn newer candidate.
+
+After selecting a slot, recovery reconstructs the reusable and retired sets before exposing the live
+handle. The selected catalog root is the sole source for bucket visibility and bucket roots; runtime
+caches are rebuilt lazily.
+
+The design has no separate pending log. Crash safety comes from COW page ownership plus the ordering
+of dependency synchronization and metadata publication. The fallback metadata slot remains valid
+through every pre-publication failure window.
+
+## 10. Runtime Sharing And Caching
+
+The live instance owns a shared published metadata snapshot and a physical-page cache. Cloned
+handles share these runtime services but do not share mutable transaction state.
+
+Reads use positional I/O and may run concurrently. The node cache is keyed by physical page ID and
+must invalidate an entry before that page ID is reused or released. Cache contents never determine
+durability or recovery and can be dropped without changing database meaning.
+
+## 11. API And Error Boundary
+
+The public API separates user outcomes from engine faults:
+
+- user outcomes include missing keys, missing or existing buckets, invalid inputs, and values that
+  exceed configured limits
+- opening outcomes include file I/O, invalid options, database busy, and detected corruption
+- live engine I/O, corruption, exhausted physical address space, and violated internal invariants
+  are fatal faults rather than recoverable transaction results
+
+This boundary prevents a damaged durable graph from being interpreted as an ordinary missing key and
+keeps transaction rollback semantics limited to caller-requested closure errors.
+
+## 12. Format Evolution
+
+Format version 1 is intentionally fixed. Compatibility is defined at the database level, not per
+node or per record. Runtime readers do not accumulate readers for incompatible historical layouts.
+
+When a future change alters persisted bytes or their meaning:
+
+1. define the new complete format contract
+2. increment the metadata format version
+3. reject the old database in the normal runtime
+4. provide an offline migration that reads the old contract and publishes a new database
+
+Changes that affect only runtime policy, such as cache sizing or synchronization mode, do not change
+the format version and are not persisted as data semantics.
+
+## 13. Design Invariants
+
+The following invariants define correctness at the architecture boundary:
+
+- a published metadata slot references one complete durable generation
+- a reader observes one immutable root for its transaction lifetime
+- a writer publishes all bucket changes in one metadata switch
+- an old published page is not reused before the fallback generation stops referencing it
+- every allocated physical page has exactly one published ownership class
+- cache state cannot alter durable meaning
+- a format change cannot be silently interpreted as the old format

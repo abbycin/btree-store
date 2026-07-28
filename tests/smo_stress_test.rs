@@ -9,6 +9,7 @@ fn test_smo_stress() {
     let db_path = temp_dir.path().join("smo_stress.db");
 
     let btree = BTree::open(&db_path).expect("failed to open btree");
+    btree.new_bucket("stress", false).unwrap();
 
     let mut expected = HashMap::new();
     let mut rng = rand::rng();
@@ -77,7 +78,7 @@ fn test_smo_stress() {
             // Ensure deleted keys are gone
             for k in to_delete {
                 match txn.get(k) {
-                    Err(Error::NotFound) => {}
+                    Err(Error::KeyNotFound) => {}
                     _ => panic!("key should be deleted"),
                 }
             }
@@ -92,6 +93,7 @@ fn test_sequential_split_stress() {
     let db_path = temp_dir.path().join("seq_stress.db");
 
     let btree = BTree::open(&db_path).expect("failed to open btree");
+    btree.new_bucket("seq", false).unwrap();
 
     // Sequential keys often trigger edge cases in splitting
     btree

@@ -2,6 +2,21 @@
 
 All notable changes to the **btree-store** project will be documented in this file.
 
+## [1.0.0] - 2026-08-08
+
+### Added
+- **Prefix-Encoded Buckets**: Added optional per-bucket shared-prefix encoding for B+ Tree nodes.
+- **Durable Generation Reclamation**: Persisted reusable and retired allocator extents across commits and reopen.
+
+### Changed
+- **Physical Page Storage**: Reworked the store around direct physical page IDs, COW roots, double-buffered metadata, and two-phase generation publication.
+- **Runtime Architecture**: Added shared positional I/O and a sharded physical-node cache with page-ID invalidation.
+
+### Removed
+- **Tail Compaction**: Removed tail-window relocation, truncation, and related compaction APIs.
+- **Logical Mapping Layer**: Removed the logical page namespace, mapping/reverse trees, and dedicated translation caches.
+- **C FFI**: Removed the FFI feature, C headers, examples, and generated library targets.
+
 ## [0.1.10] - 2026-07-06
 
 ### Added
@@ -27,14 +42,12 @@ All notable changes to the **btree-store** project will be documented in this fi
 ### Fixed
 - **Multi-Bucket No-Op Commits**: `exec_multi` now skips catalog updates for touched buckets whose existing root did not change, avoiding unnecessary sequence bumps and snapshot churn.
 - **Empty Bucket Creation**: `exec_multi` now distinguishes missing buckets from existing empty buckets, so successful touches of new empty buckets still create catalog entries while existing empty bucket no-ops remain no-op commits.
-- **Single-Bucket Empty Bucket No-Op Commits**: `exec` now skips catalog updates when an existing empty bucket's root did not change, avoiding unnecessary sequence bumps and the empty-bucket catalog churn that could surface after repeated `compact` and `reopen` sequences.
+- **Single-Bucket Empty Bucket No-Op Commits**: `exec` now skips catalog updates when an existing empty bucket's root did not change, avoiding unnecessary sequence bumps and empty-bucket catalog churn.
 - **Snapshot Handle Consistency**: Cloned and same-path reopened handles now use a consistent local metadata snapshot without taking writer locks from active read callbacks, avoiding clone/open self-deadlocks.
 - **Shared Cache Stability**: Same-path reopen snapshot sync no longer clears shared bucket caches when only the local handle snapshot needs to be refreshed.
-- **Freelist Retirement Across Reopen**: Repeated `compact` + `reopen` cycles now retire only freelist pages that actually left the active freelist, preventing live freelist pages from being reclaimed and later reused as catalog data.
-- **Compaction Tail Relocation Walk**: Tail-page compaction now snapshots reverse-index candidates before relocating them, avoiding reverse-tree mutation while iterating the candidate range.
 
 ### Added
-- **Fuzz Tests**: add cargo-fuzz state-machine targets for kv, multi-bucket, reopen+compact, bucket lifecycle, and concurrent snapshot scenarios
+- **Fuzz Tests**: add cargo-fuzz state-machine targets for kv, multi-bucket, bucket lifecycle, and concurrent snapshot scenarios
 
 
 
@@ -48,7 +61,6 @@ All notable changes to the **btree-store** project will be documented in this fi
 ### Changed
 - **Open Reuse Semantics**: `BTree::open(path)` reuses an existing in-process instance for the same normalized path and returns a refreshed clone.
 - **Read-Path Performance**: Added `lid -> pid` hot cache, optimized branch child-position lookup, and reduced `view` setup overhead with earlier bucket-tree cache hits and root-node fast path.
-- **Compaction Default Policy**: Default compaction (`target_bytes == 0`) now uses strict no-growth planning when low-address free pages are insufficient.
 
 ### Fixed
 - **Reopen Snapshot Freshness**: Reused handles sync to latest in-memory snapshot state, avoiding stale-sequence no-op commit conflicts.
@@ -69,12 +81,11 @@ All notable changes to the **btree-store** project will be documented in this fi
 ## [0.1.3] - 2026-02-08
 
 ### Added
-- **Tail-Window Compaction**: Added `BTree::compact(target_bytes)` with `CompactStats`, best-effort tail relocation/truncation, and new compaction tests.
-- **Logical Page Mapping**: Introduced `PageStore`/`LogicalStore` with mapping + reverse indexes to relocate pages during compaction.
+- **Logical Page Mapping**: Introduced `PageStore`/`LogicalStore` with a forward LID-to-PID mapping for logical page access.
 - **Read-Path Caches**: Added shared meta snapshots plus bucket root/tree and LID->PID caches to reduce refresh and lookup overhead.
 
 ### Changed
-- **On-Disk Format v3**: 32-bit page ids and new catalog/mapping/reverse roots (max ~16 TB with 4 KB pages); v1/v2 files now rejected with `Error::Invalid`.
+- **Page Addressing**: Added 32-bit page ids and catalog/mapping roots (max ~16 TB with 4 KB pages).
 - **Freelist & Commit Pipeline**: Free space is persisted as merged extents in freelist pages; commits stage freelist + superblock then sync (no `.pending` log).
 - **Sync Strategy**: Uses `sync_data` unless the file grows, falling back to `sync_all` only on extension.
 - **Overflow Layout**: Slots inline up to 5 page ids before spilling to index pages, reducing indirect page traffic.

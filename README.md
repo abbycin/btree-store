@@ -25,10 +25,10 @@
 See [the design document](docs/design.md) for the complete architecture, transaction, persistence, recovery, and format-evolution model.
 
 
-### Basic Example
+## Basic Example
 
 ```rust
-use btree_store::{BTree, Error};
+use btree_store::BTree;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = BTree::open("data.db")?;
@@ -47,14 +47,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             !updated,
             "update only changes an existing key and does not insert a missing key"
         );
-        Ok::<_, Error>(())
+        Ok(())
     })?;
 
     // Read-only view.
     db.view("users", |txn| {
         let val = txn.get("mo")?;
         println!("mo: {:?}", String::from_utf8_lossy(&val));
-        Ok::<_, Error>(())
+        Ok(())
     })?;
 
     // Multi-bucket atomic transaction.
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             txn.put("mo", "+1s")
         })?;
         multi.exec("quote", |txn| txn.put("moha", "naive!"))?;
-        Ok::<_, Error>(())
+        Ok(())
     })?;
 
     Ok(())

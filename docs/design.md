@@ -35,7 +35,7 @@ There are four logical layers:
   - B+ Tree nodes store keys and either inline values or references to overflow storage
   - allocator pages store reusable and retired physical extents
 - runtime services
-  - positional file I/O, shared metadata snapshot, page cache, and writer/read locks
+  - positional file I/O, shared metadata snapshot, page cache, writer mutex, and reader epoch registry
 
 The catalog tree and every bucket tree use the same physical page namespace. A published root is
 therefore resolved as:
@@ -143,9 +143,17 @@ Each operation observes one pair `(generation, catalog root)`:
 - the root remains fixed for the lifetime of the closure and its iterators
 - a concurrent publication does not change an already-started view
 
-There is one process-level writer and multiple readers. The writer lock serializes all changes to
-transaction roots and ownership journals. Reader locks allow concurrent snapshot reads while
-preventing a writer from publishing against an inconsistent in-memory state.
+There is one process-level writer and multiple readers. A writer mutex serializes all changes to
+transaction roots and ownership journals. Readers do not take the writer lock: each view pins the
+current epoch for its whole lifetime, and the allocator promotes retired pages to reusable only
+while every in-flight reader pinned at or after the current epoch. A reader therefore never blocks
+a writer, a writer never blocks a reader's traversal, and a page is never reused while an in-flight
+reader can still reference it. The epoch advances once per shared snapshot install — a normal
+publication or a writer adopting a disk-newer generation left by a failed publication — after the
+new generation is exposed to readers. A reader refresh never installs a disk-newer generation into
+the shared snapshot; it only advances its own handle to the shared generation, so a stale reader
+cannot move the shared state mid-transaction. A long-lived view delays reclamation and grows the
+file, but writes are never blocked.
 
 ### 5.2 Transaction state
 
@@ -181,7 +189,10 @@ A successful publication follows this ordering:
 4. synchronize those dependency pages according to the configured sync policy
 5. write the next metadata slot with the new generation, roots, and allocator roots
 6. perform an independent publication synchronization
-7. expose the new generation to in-process readers and clear transaction-local state
+7. expose the new generation to in-process readers
+8. advance the reader epoch after the exposure, so a reader that pins the new epoch observes the
+   new generation
+9. clear transaction-local state
 
 The metadata slot is never allowed to reference a page that has not crossed the dependency
 durability boundary. If publication fails before the slot switch is durable, the previous slot
@@ -213,7 +224,8 @@ The allocator maintains two separate extent sets:
 
 - reusable pages may be allocated by a later transaction
 - retired pages are no longer in the candidate data graph but may still be referenced by the
-  previous metadata generation used for crash recovery
+  previous metadata generation used for crash recovery or by an in-flight reader on an older
+  snapshot
 
 Both sets are persisted as linked extent-page chains and are restored together with the metadata
 slot. Extents are ordered by page ID and adjacent ranges are merged.
@@ -222,8 +234,10 @@ slot. Extents are ordered by page ID and adjacent ranges are merged.
 
 A page removed by a COW rewrite is first placed in the candidate generation's retired state. It may
 be promoted to reusable only while constructing a later generation whose fallback metadata no longer
-references it. Allocator-list pages follow the same rule: list pages named by the old slot are
-retired rather than overwritten in place.
+references it, and only when no in-flight reader can still reference it: promotion is additionally
+gated on every reader having pinned at or after the current epoch. Deferred pages stay in the
+retired set and are published with the next generation. Allocator-list pages follow the same rule:
+list pages named by the old slot are retired rather than overwritten in place.
 
 Pages allocated and released entirely inside the current transaction may be recycled locally once
 they are unreachable from the working roots. They were never reachable from a published metadata
@@ -327,6 +341,9 @@ The following invariants define correctness at the architecture boundary:
 - a reader observes one immutable root for its transaction lifetime
 - a writer publishes all bucket changes in one metadata switch
 - an old published page is not reused before the fallback generation stops referencing it
+- a page is not reused while an in-flight reader can still reference it
+- the reader epoch advances exactly once per shared snapshot install, so the promotion gate
+  compares against the true generation boundary
 - every allocated physical page has exactly one published ownership class
 - cache state cannot alter durable meaning
 - a format change cannot be silently interpreted as the old format

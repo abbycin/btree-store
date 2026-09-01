@@ -102,3 +102,87 @@ fn test_exec_rollback_no_leak() {
         })
         .unwrap();
 }
+
+/// A long-lived view pins its snapshot: pages it references stay quarantined
+/// across many commits (no corruption, no premature reuse), the file keeps
+/// growing while the view is active, and once the view quiesces the engine
+/// resumes promotion and the file stops growing.
+#[test]
+fn long_view_keeps_snapshot_and_recovers_after_quiescence() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("long-view.db");
+    let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("data", false).unwrap();
+
+    // one data set is 1000 keys with 2-byte values; the COW rewrite footprint
+    // is ~22 pages (~90KB) per commit, well above allocator-list churn
+    let seed_data = |tree: &BTree, val: &[u8]| {
+        tree.exec("data", |txn| {
+            for i in 0..1000u32 {
+                txn.put(format!("k{i:04}").as_bytes(), val).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+    };
+    seed_data(&tree, b"v0");
+    let size_before_view = fs::metadata(&db_path).unwrap().len();
+
+    let ready = Arc::new(Barrier::new(2));
+    let done = Arc::new(Barrier::new(2));
+    let reader_tree = tree.clone();
+    let r_ready = ready.clone();
+    let r_done = done.clone();
+    let reader = thread::spawn(move || {
+        reader_tree
+            .view("data", |txn| {
+                r_ready.wait();
+                r_done.wait();
+                for i in 0..1000u32 {
+                    let k = format!("k{i:04}");
+                    assert_eq!(txn.get(k.as_bytes()).unwrap(), b"v0");
+                }
+                Ok::<_, btree_store::Error>(())
+            })
+            .unwrap();
+    });
+
+    ready.wait();
+    // many commits under the long view: the v0 pages stay quarantined, so each
+    // commit allocates fresh pages and the file keeps growing
+    for v in [
+        b"v1".as_slice(),
+        b"v2".as_slice(),
+        b"v3".as_slice(),
+        b"v4".as_slice(),
+    ] {
+        seed_data(&tree, v);
+    }
+    let size_while_view = fs::metadata(&db_path).unwrap().len();
+    assert!(
+        size_while_view > size_before_view + 64 * 1024,
+        "file must keep growing while the view pins its snapshot"
+    );
+    done.wait();
+    reader.join().unwrap();
+
+    // after quiescence the engine resumes promotion: the next commit reuses
+    // the quarantined pages and the file stops growing
+    seed_data(&tree, b"v5");
+    let size_after_v5 = fs::metadata(&db_path).unwrap().len();
+    seed_data(&tree, b"v6");
+    let size_after_v6 = fs::metadata(&db_path).unwrap().len();
+    assert!(
+        size_after_v6 <= size_after_v5 + 64 * 1024,
+        "file must stop growing after the view quiesces"
+    );
+    tree.view("data", |txn| {
+        assert_eq!(txn.get(b"k0000").unwrap(), b"v6");
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(tree.pending_pages(), (0, 0));
+}

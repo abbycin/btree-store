@@ -11,12 +11,15 @@ use std::{
     },
 };
 
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock};
+
+use crate::epoch::EpochGuard;
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("btree-store requires a little-endian target");
 
 pub(crate) mod cache;
+pub(crate) mod epoch;
 pub(crate) mod node;
 pub(crate) mod store;
 
@@ -1509,7 +1512,7 @@ impl<'read> ReadOnlyTree<'read> {
 /// duration of the callback that receives it.
 pub struct ReadOnlyTxn<'a> {
     pub(crate) tree: ReadOnlyTree<'a>,
-    pub(crate) _guard: RwLockReadGuard<'a, ()>,
+    pub(crate) _guard: EpochGuard<'a>,
 }
 
 impl<'a> ReadOnlyTxn<'a> {
@@ -2073,7 +2076,7 @@ impl BucketMetadata {
 pub struct BTree {
     pub(crate) store: Arc<Store>,
     runtime: Arc<BTreeRuntime>,
-    pub(crate) writer_lock: Arc<RwLock<()>>,
+    pub(crate) writer_lock: Arc<Mutex<()>>,
     read: TreeReadContext,
     pending_counts: Arc<PendingPageCounts>,
     pub(crate) start_seq: Arc<AtomicU64>,
@@ -2167,7 +2170,7 @@ impl BTree {
         let instance = Self {
             store: store.clone(),
             runtime,
-            writer_lock: Arc::new(RwLock::new(())),
+            writer_lock: Arc::new(Mutex::new(())),
             read,
             pending_counts: Arc::new(PendingPageCounts {
                 snapshot: AtomicU64::new(0),
@@ -2208,19 +2211,23 @@ impl BTree {
     /// domain-specific error can map the returned `Error` after this boundary.
     ///
     /// # Warning
-    /// Nested calls to `exec` or `view` on the same `BTree` instance are NOT supported
-    /// and may lead to deadlocks or undefined behavior.
+    /// Nested calls on the same `BTree` instance are NOT supported. Writer
+    /// methods (`exec`, `exec_multi`, `commit`, `new_bucket`, `del_bucket`)
+    /// called from inside another writer closure deadlock on the writer
+    /// mutex. A `view` called from inside a writer closure does not deadlock
+    /// but observes the last published generation — the enclosing
+    /// transaction's uncommitted writes are not visible.
     pub fn exec<F, R>(&self, bucket: &str, f: F) -> Result<R>
     where
         F: FnOnce(&mut Txn) -> Result<R>,
     {
         validate_bucket_input(bucket)?;
 
-        let _lock = self.writer_lock.write();
+        let _lock = self.writer_lock.lock();
 
         // Refresh to the latest published shared generation before starting a
         // new transaction when this handle's snapshot is stale.
-        physical_value(self.refresh_internal(), "BTree::exec refresh");
+        physical_value(self.refresh_internal(true), "BTree::exec refresh");
         let mut core = TxnCore::new(self);
         let origin = core.checkpoint();
 
@@ -2264,9 +2271,9 @@ impl BTree {
     pub fn new_bucket(&self, name: &str, enable_prefix_encoding: bool) -> Result<()> {
         validate_bucket_input(name)?;
 
-        let _lock = self.writer_lock.write();
+        let _lock = self.writer_lock.lock();
 
-        physical_value(self.refresh_internal(), "BTree::new_bucket refresh");
+        physical_value(self.refresh_internal(true), "BTree::new_bucket refresh");
         let mut core = TxnCore::new(self);
 
         let name_bytes = name.as_bytes();
@@ -2293,13 +2300,21 @@ impl BTree {
     ///
     /// The callback and this method use [`Result`] directly. Callers that need a
     /// domain-specific error can map the returned `Error` after this boundary.
+    ///
+    /// # Warning
+    /// Nested calls on the same `BTree` instance are NOT supported. Writer
+    /// methods (`exec`, `exec_multi`, `commit`, `new_bucket`, `del_bucket`)
+    /// called from inside this closure deadlock on the writer mutex. A `view`
+    /// called from inside this closure does not deadlock but observes the last
+    /// published generation — this transaction's uncommitted writes are not
+    /// visible.
     pub fn exec_multi<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut MultiTxn) -> Result<R>,
     {
-        let _lock = self.writer_lock.write();
+        let _lock = self.writer_lock.lock();
 
-        physical_value(self.refresh_internal(), "BTree::exec_multi refresh");
+        physical_value(self.refresh_internal(true), "BTree::exec_multi refresh");
         let core = TxnCore::new(self);
         let origin = core.checkpoint();
 
@@ -2367,22 +2382,38 @@ impl BTree {
     /// Executes a read-only transaction on the specified bucket.
     ///
     /// # Warning
-    /// Nested calls to `exec` or `view` on the same `BTree` instance are NOT supported
-    /// and may lead to deadlocks or undefined behavior.
+    /// Nested calls on the same `BTree` instance are NOT supported. A `view`
+    /// called from inside an `exec`/`exec_multi` closure observes the last
+    /// published generation — the enclosing transaction's uncommitted writes
+    /// are not visible. Writer methods (`exec`, `exec_multi`, `commit`,
+    /// `new_bucket`, `del_bucket`) called from inside a `view` closure are
+    /// outside the contract.
+    ///
+    /// # Resource note
+    /// The view pins its snapshot for the whole closure: pages it references
+    /// are not reused until the view ends. Keep views short-lived — a long or
+    /// permanent view delays page reclamation and grows the database file
+    /// (writes are never blocked, but space is retained).
     pub fn view<F, R>(&self, bucket: &str, f: F) -> Result<R>
     where
         F: FnOnce(&ReadOnlyTxn) -> Result<R>,
     {
         validate_bucket_input(bucket)?;
 
-        let lock = self.writer_lock.read();
+        // Pin the current epoch before any page read: the reader's snapshot
+        // pages stay protected from reuse for the whole closure, and the pin
+        // value being older than the refreshed snapshot only makes the
+        // allocator's promotion condition more conservative.
+        let _guard = self.store.epoch.pin();
 
         // Refresh only when the shared published sequence is newer than this
         // handle's snapshot, then keep the selected root fixed for the view.
         let (latest_seq, mut latest_root) = self.store.shared_snapshot();
         let seq_changed = latest_seq != self.start_seq.load(Ordering::Acquire);
         if seq_changed {
-            let snapshot = physical_value(self.store.refresh_sb(), "BTree::view refresh");
+            // readers never install a disk-newer generation into the shared
+            // snapshot (see Store::refresh_sb)
+            let snapshot = physical_value(self.store.refresh_sb(false), "BTree::view refresh");
             latest_root = snapshot.catalog_root;
             self.runtime.clear_cache();
             self.apply_handle_snapshot(snapshot);
@@ -2399,7 +2430,7 @@ impl BTree {
         let read = read.with_layout(bucket_layout);
 
         let tree = ReadOnlyTree::new(&read, bucket_root);
-        let txn = ReadOnlyTxn { tree, _guard: lock };
+        let txn = ReadOnlyTxn { tree, _guard };
         f(&txn)
     }
 
@@ -2411,10 +2442,10 @@ impl BTree {
         let name = name.as_ref();
         validate_bucket_input(name)?;
 
-        let _lock = self.writer_lock.write();
+        let _lock = self.writer_lock.lock();
 
         // ensure we are operating on the latest state
-        physical_value(self.refresh_internal(), "BTree::del_bucket refresh");
+        physical_value(self.refresh_internal(true), "BTree::del_bucket refresh");
 
         let name_bytes = name.as_bytes();
         let mut core = TxnCore::new(self);
@@ -2508,14 +2539,19 @@ impl BTree {
     /// refresh the handle to the latest on-disk state before attempting the
     /// commit. A sequence mismatch is an engine invariant violation because all
     /// compatible handles share the same writer lock.
+    ///
+    /// # Warning
+    /// Must not be called from inside an [`BTree::exec`] or
+    /// [`BTree::exec_multi`] closure on the same instance: the writer mutex is
+    /// not reentrant and the call deadlocks.
     pub fn commit(&self) -> Result<()> {
-        let _lock = self.writer_lock.write();
+        let _lock = self.writer_lock.lock();
         let core = TxnCore::new(self);
         physical_value(self.commit_internal(&core), "BTree::commit");
         Ok(())
     }
 
-    fn refresh_internal(&self) -> StoreResult<()> {
+    fn refresh_internal(&self, allow_install: bool) -> StoreResult<()> {
         // fast path: snapshot version unchanged, so current in-memory roots and node cache are valid
         let (latest_seq, _) = self.store.shared_snapshot();
         if latest_seq == self.start_seq.load(Ordering::Acquire) {
@@ -2524,7 +2560,7 @@ impl BTree {
 
         self.runtime.clear_cache();
 
-        let snapshot = self.store.refresh_sb()?;
+        let snapshot = self.store.refresh_sb(allow_install)?;
         self.apply_local_snapshot(snapshot);
         Ok(())
     }
@@ -2535,11 +2571,13 @@ impl BTree {
     }
 
     fn buckets_internal(&self) -> StoreResult<Vec<String>> {
-        let _lock = self.writer_lock.read();
+        let _guard = self.store.epoch.pin();
 
         // Same-process handles share the published sequence, so avoid rereading
         // both superblock pages when the local snapshot is already current.
-        self.refresh_internal()?;
+        // readers never install a disk-newer generation into the shared
+        // snapshot (see Store::refresh_sb)
+        self.refresh_internal(false)?;
         let snapshot = self.store.cached_snapshot();
         let read = TreeReadContext::new(self.runtime.clone());
 

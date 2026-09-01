@@ -15,7 +15,9 @@ use std::{
 use crate::{
     CorruptionReport, DataPid, FORMAT_VERSION, FatalReason, IdSpace, IoFault, MAGIC, MetaNode,
     OpenError, OpenIoError, OpenOptions, OpenResult, PageId, StoreFault as Error,
-    StoreResult as Result, SyncMode, abort_store_fault, fatal,
+    StoreResult as Result, SyncMode, abort_store_fault,
+    epoch::EpochRegistry,
+    fatal,
     node::{AlignedPage, Node, PAGE_SIZE},
     physical_value,
 };
@@ -23,6 +25,21 @@ use crate::{
 pub(crate) trait PageReuseObserver: Send + Sync {
     fn invalidate(&self, page_id: PageId);
 }
+
+/// Test-only synchronization hook: when armed for a specific thread, a commit
+/// on that thread waits here after the epoch scan decides promotion and before
+/// the promotion loop runs. Lets a deterministic test place a reader inside
+/// the scan-to-publish window without affecting commits on other threads
+/// (tests run in parallel within one binary).
+#[cfg(test)]
+pub(crate) struct AfterOldestScanHook {
+    thread_id: std::thread::ThreadId,
+    reached: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+pub(crate) static AFTER_OLDEST_SCAN: Mutex<Option<Arc<AfterOldestScanHook>>> = Mutex::new(None);
 
 #[cfg(test)]
 pub(crate) struct NoopPageReuseObserver;
@@ -1276,6 +1293,9 @@ pub(crate) struct Store {
     file: LiveStore,
     sb: Mutex<MetaNode>,
     shared: SharedMeta,
+    /// Reader epoch registry: pins, oldest-active tracking, and the epoch
+    /// counter advanced at each generation publication.
+    pub(crate) epoch: EpochRegistry,
     reusable: Mutex<ExtentSet>,
     retired: Mutex<ExtentSet>,
     reusable_pages: Mutex<Vec<PageId>>,
@@ -1340,6 +1360,7 @@ impl Store {
             file,
             sb: Mutex::new(sb),
             shared: SharedMeta::new(sb.seq, sb.catalog_root),
+            epoch: EpochRegistry::new(),
             reusable: Mutex::new(ExtentSet::from_extents(reusable)),
             retired: Mutex::new(ExtentSet::from_extents(retired)),
             reusable_pages: Mutex::new(reusable_pages),
@@ -1554,6 +1575,10 @@ impl Store {
         self.sync_publication()?;
         self.file.set_generation(sb.seq);
         self.shared.update(sb.catalog_root, sb.seq);
+        // Publication ordering: the new generation must be visible to readers
+        // before the epoch advances, so a reader acquiring the new epoch value
+        // subsequently observes the new shared snapshot.
+        self.epoch.advance();
         Ok(())
     }
 
@@ -1655,15 +1680,44 @@ impl Store {
             for &pid in deferred_alloc {
                 next_retired.add(pid, 1);
             }
-            // Move the current generation's retired extents to reusable state
-            // while constructing the next generation.
-            for extent in retired.iter() {
-                journal.add(
-                    ExtentSetKind::Reusable,
-                    &mut reusable,
-                    extent.page_id,
-                    extent.nr_pages,
-                );
+            // Move the current generation's retired extents to reusable state while
+            // constructing the next generation, unless an in-flight reader pinned
+            // before the current epoch can still reference them. Deferred extents
+            // stay quarantined and are published with the next generation instead.
+            // Promotion is safe only while no in-flight reader can still
+            // reference the retired pages. The Relaxed slot scan is ordered by
+            // the SharedMeta RwLock + writer-mutex happens-before chain (see
+            // EpochRegistry::oldest_active_reader_epoch), so every reader
+            // pinned before the current epoch is observed here.
+            let promotable = self.epoch.oldest_active_reader_epoch() >= self.epoch.current();
+            #[cfg(test)]
+            {
+                let hook = AFTER_OLDEST_SCAN.lock().clone();
+                if let Some(hook) = hook
+                    && std::thread::current().id() == hook.thread_id
+                {
+                    hook.reached
+                        .send(())
+                        .expect("window test receiver must remain alive");
+                    hook.resume
+                        .lock()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("window test reader must release the writer within 10 seconds");
+                }
+            }
+            if promotable {
+                for extent in retired.iter() {
+                    journal.add(
+                        ExtentSetKind::Reusable,
+                        &mut reusable,
+                        extent.page_id,
+                        extent.nr_pages,
+                    );
+                }
+            } else {
+                for extent in retired.iter() {
+                    next_retired.add(extent.page_id, extent.nr_pages);
+                }
             }
             let (new_reusable_pages, new_retired_pages) = self.write_allocator_state(
                 &mut sb,
@@ -1995,7 +2049,17 @@ impl Store {
         }
     }
 
-    pub(crate) fn refresh_sb(&self) -> Result<MetaSnapshot> {
+    /// Refresh the in-memory superblock and allocator state from disk.
+    ///
+    /// `allow_install` is true only for writer paths (which hold the writer
+    /// mutex): they may adopt a disk-newer generation left by a failed
+    /// publication. Readers pass false: a reader must never install a
+    /// disk-newer generation into the shared snapshot, because that would
+    /// advance the shared state mid-exec and trip the writer's
+    /// `COMMIT_SEQUENCE_CONFLICT` check (and the failed generation's allocator
+    /// state is inconsistent with a concurrent writer's transaction). A reader
+    /// refresh always returns the current (shared) generation.
+    pub(crate) fn refresh_sb(&self, allow_install: bool) -> Result<MetaSnapshot> {
         let sb0 = self.read_current_meta_candidate(0)?;
         let sb1 = self.read_current_meta_candidate(PAGE_SIZE as u64)?;
 
@@ -2013,7 +2077,7 @@ impl Store {
         };
 
         let current_seq = self.sb.lock().seq;
-        if sb.seq > current_seq {
+        if allow_install && sb.seq > current_seq {
             let (reusable, reusable_pages, retired, retired_pages) = self
                 .read_allocator_state_from_disk(
                     sb.reusable_root,
@@ -2025,6 +2089,11 @@ impl Store {
                 *current_sb = sb;
                 self.file.set_generation(current_sb.seq);
                 self.shared.update(current_sb.catalog_root, current_sb.seq);
+                // Adopting a disk-newer generation is also a shared snapshot
+                // install. Keep the epoch counter in one-to-one correspondence
+                // with SharedMeta updates, using the same visibility order as
+                // normal generation publication.
+                self.epoch.advance();
                 let mut reusable_guard = self.reusable.lock();
                 *reusable_guard = reusable;
                 let mut retired_guard = self.retired.lock();
@@ -2469,6 +2538,246 @@ mod tests {
         assert_empty_store_allocator_complete(&store);
         let reused = store.alloc_pages(1).unwrap();
         assert!(retired_pids.contains(&reused[0]));
+    }
+
+    #[test]
+    fn deferred_promotion_holds_pages_until_reader_quiesces() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("deferred-promotion.db");
+        let options = crate::OpenOptions::default();
+
+        let store = reopen_test_store(&path, &options);
+        // A reader pinned before any publication holds epoch 0. The epoch+1
+        // slot encoding must keep it visible (regression for the encoding gap:
+        // storing the raw epoch 0 would look idle and let the writer promote).
+        let guard = store.epoch.pin();
+        assert_eq!(store.epoch.current(), 0);
+        assert_eq!(store.epoch.oldest_active_reader_epoch(), 0);
+        assert_eq!(store.epoch.active_reader_count(), 1);
+
+        let retired_pids = store.alloc_pages(3).unwrap();
+        assert_eq!(retired_pids, vec![2, 3, 4]);
+        store
+            .commit_roots_with_pending_alloc(
+                0,
+                &[(retired_pids[0], retired_pids.len() as u32)],
+                &HashSet::new(),
+            )
+            .unwrap();
+        // first publication advanced the epoch 0 -> 1 while the reader is pinned at 0
+        assert!(store.epoch.current() >= 1);
+        assert!(
+            retired_pids
+                .iter()
+                .all(|pid| extent_contains(&store.retired.lock(), *pid))
+        );
+
+        // A second publication must NOT promote while the epoch-0 reader is
+        // still active: the retired pages stay quarantined.
+        store
+            .commit_roots_with_pending_alloc(0, &[], &HashSet::new())
+            .unwrap();
+        assert!(
+            retired_pids
+                .iter()
+                .all(|pid| extent_contains(&store.retired.lock(), *pid))
+        );
+        assert!(
+            retired_pids
+                .iter()
+                .all(|pid| !extent_contains(&store.reusable.lock(), *pid))
+        );
+        assert_empty_store_allocator_complete(&store);
+
+        // Once the reader quiesces, the next publication promotes and the
+        // pages become reusable again.
+        drop(guard);
+        store
+            .commit_roots_with_pending_alloc(0, &[], &HashSet::new())
+            .unwrap();
+        assert_empty_store_allocator_complete(&store);
+        let reused = store.alloc_pages(1).unwrap();
+        assert!(retired_pids.contains(&reused[0]));
+    }
+
+    /// A reader refresh must never install a disk-newer generation into the
+    /// shared snapshot: doing so would advance the shared state mid-exec and
+    /// trip the writer's COMMIT_SEQUENCE_CONFLICT abort. A writer refresh, by
+    /// contrast, adopts the failed generation (pre-existing behavior). The
+    /// forged slot is written through the store's own file handle so the test
+    /// works on Windows, where the engine's file lock blocks external writers.
+    #[test]
+    fn reader_refresh_never_installs_disk_newer_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("reader-refresh-unit.db");
+        let store = reopen_test_store(&path, &crate::OpenOptions::default());
+        store
+            .commit_roots_with_pending_alloc(0, &[], &HashSet::new())
+            .unwrap();
+        let current_seq = store.sb.lock().seq;
+
+        // forge a valid seq+1 slot at the other double-buffer offset, through
+        // the store's own file handle (no second handle: Windows-safe)
+        let other_offset = if current_seq % 2 == 0 { 0 } else { PAGE_SIZE as u64 };
+        let mut forged = *store.sb.lock();
+        forged.seq += 1;
+        forged.update_checksum();
+        store
+            .file
+            .pwrite_all(forged.as_page_slice(), other_offset)
+            .unwrap();
+
+        // reader refresh (allow_install=false) must NOT install
+        let snapshot = store.refresh_sb(false).unwrap();
+        assert_eq!(snapshot.seq, current_seq);
+        assert_eq!(
+            store.sb.lock().seq,
+            current_seq,
+            "a reader refresh must not install a disk-newer (failed) generation"
+        );
+
+        // writer refresh (allow_install=true) adopts the failed generation
+        let snapshot = store.refresh_sb(true).unwrap();
+        assert_eq!(snapshot.seq, current_seq + 1);
+        assert_eq!(store.sb.lock().seq, current_seq + 1);
+
+        // the writer can commit over the adopted generation
+        store
+            .commit_roots_with_pending_alloc(0, &[], &HashSet::new())
+            .unwrap();
+        assert_eq!(store.sb.lock().seq, current_seq + 2);
+    }
+
+    #[test]
+    fn window_reader_between_oldest_scan_and_publish_sees_consistent_snapshot() {
+        use std::sync::{Barrier, mpsc};
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("window-test.db");
+        let tree = reopen_test_tree(&path);
+        tree.new_bucket("window", false).unwrap();
+        tree.exec("window", |txn| {
+            for i in 0..64u32 {
+                txn.put(format!("k{i:03}").as_bytes(), b"v0").unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // arm the hook for the writer thread only: the writer parks after the
+        // oldest() scan and before the promotion loop, so the reader lands
+        // exactly inside the window the linearization argument covers.
+        struct WindowHookGuard;
+        impl Drop for WindowHookGuard {
+            fn drop(&mut self) {
+                *AFTER_OLDEST_SCAN.lock() = None;
+            }
+        }
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (id_tx, id_rx) = mpsc::channel();
+        let start = Arc::new(Barrier::new(2));
+
+        let writer_tree = tree.clone();
+        let start_w = start.clone();
+        let writer = std::thread::spawn(move || {
+            id_tx.send(std::thread::current().id()).unwrap();
+            start_w.wait();
+            writer_tree
+                .exec("window", |txn| {
+                    for i in 0..64u32 {
+                        txn.put(format!("k{i:03}").as_bytes(), b"v2").unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        });
+
+        let writer_id = id_rx.recv().unwrap();
+        *AFTER_OLDEST_SCAN.lock() = Some(Arc::new(AfterOldestScanHook {
+            thread_id: writer_id,
+            reached: reached_tx,
+            resume: Mutex::new(resume_rx),
+        }));
+        let _hook_guard = WindowHookGuard;
+        start.wait();
+        reached_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("writer must reach the epoch-scan hook within 10 seconds");
+
+        let reader_tree = tree.clone();
+        let reader = std::thread::spawn(move || {
+            // if the reader panics before releasing the writer, release it on
+            // unwind so the writer thread cannot strand at the hook
+            struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+            impl ReleaseOnDrop {
+                fn release(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            impl Drop for ReleaseOnDrop {
+                fn drop(&mut self) {
+                    self.release();
+                }
+            }
+            let mut release = ReleaseOnDrop(Some(resume_tx));
+            reader_tree
+                .view("window", |txn| {
+                    // the writer is parked before publication: the view must
+                    // observe the pre-publication snapshot
+                    let first = txn.get(b"k000").unwrap();
+                    assert_eq!(first, b"v0");
+                    // release the writer: it promotes and publishes while this
+                    // reader keeps traversing its fixed snapshot
+                    release.release();
+                    for i in 0..64u32 {
+                        let v = txn.get(format!("k{i:03}").as_bytes()).unwrap();
+                        assert_eq!(v, b"v0", "reader must keep its fixed snapshot");
+                    }
+                    Ok::<_, crate::Error>(())
+                })
+                .unwrap();
+        });
+
+        // join the reader first: if it panicked, the ReleaseOnDrop guard has
+        // already released the writer, so the writer join cannot hang
+        reader.join().unwrap();
+        writer.join().unwrap();
+        // the writer's commit is visible to a later view
+        tree.view("window", |txn| {
+            assert_eq!(txn.get(b"k000").unwrap(), b"v2");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn writer_adoption_advances_epoch_with_shared_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = reopen_test_store(&dir.path().join("adopt-epoch.db"), &OpenOptions::default());
+        let current = *store.sb.lock();
+        let counter_before = store.epoch.current();
+
+        // Model a complete meta-slot write whose publication failed before
+        // the in-memory shared snapshot was updated.
+        let mut disk_newer = current;
+        disk_newer.seq += 1;
+        disk_newer.update_checksum();
+        let write_offset = if disk_newer.seq.is_multiple_of(2) {
+            PAGE_SIZE as u64
+        } else {
+            0
+        };
+        store
+            .file
+            .pwrite_all(disk_newer.as_page_slice(), write_offset)
+            .unwrap();
+
+        let adopted = store.refresh_sb(true).unwrap();
+        assert_eq!(adopted.seq, disk_newer.seq);
+        assert_eq!(store.shared.snapshot().0, disk_newer.seq);
+        assert_eq!(store.epoch.current(), counter_before + 1);
     }
 
     #[test]

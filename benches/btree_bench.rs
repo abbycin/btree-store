@@ -1,8 +1,12 @@
 use btree_store::BTree;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::Rng;
-use std::sync::{Arc, Barrier};
+use std::sync::{
+    Arc, Barrier,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
+use std::time::Instant;
 use tempfile::TempDir;
 
 fn bench_insert(c: &mut Criterion) {
@@ -445,6 +449,125 @@ fn bench_bucket_ops(c: &mut Criterion) {
     group.finish();
 }
 
+/// Concurrent read/write: a writer commits continuously while reader threads
+/// run views. Measures reader latency under sustained write pressure — the
+/// headline property of the MVCC model (reads are not blocked by writes).
+fn bench_concurrent_read_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_read_write");
+    for readers in [1usize, 4, 8] {
+        group.bench_function(format!("readers_{readers}"), |b| {
+            b.iter_custom(|iters| {
+                let temp_dir = TempDir::new().unwrap();
+                let db_path = temp_dir.path().join("rw.db");
+                let btree = BTree::open(&db_path).unwrap();
+                btree.new_bucket("b", false).unwrap();
+                btree
+                    .exec("b", |txn| {
+                        for i in 0..1000u32 {
+                            txn.put(format!("k{i:05}").as_bytes(), b"v0").unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+
+                let stop = Arc::new(AtomicBool::new(false));
+                let writer_tree = btree.clone();
+                let writer_stop = stop.clone();
+                let writer = thread::spawn(move || {
+                    let mut i = 0u32;
+                    while !writer_stop.load(Ordering::Relaxed) {
+                        // overwrite a bounded key set so the tree stays small
+                        let k = format!("w{:05}", i % 1000);
+                        writer_tree
+                            .exec("b", |txn| txn.put(k.as_bytes(), b"v"))
+                            .unwrap();
+                        i += 1;
+                    }
+                });
+
+                let start = Instant::now();
+                let mut handles = Vec::new();
+                for _ in 0..readers {
+                    let tree = btree.clone();
+                    handles.push(thread::spawn(move || {
+                        for _ in 0..iters {
+                            tree.view("b", |txn| {
+                                let _ = txn.get(b"k00000");
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.join().unwrap();
+                }
+                let elapsed = start.elapsed();
+                stop.store(true, Ordering::Relaxed);
+                writer.join().unwrap();
+                elapsed
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Pin/unpin scalability: view entry/exit cost at 1/8/64/256 concurrent
+/// readers, compared against a plain `RwLock::read()` baseline. Verifies the
+/// sharded free list does not introduce superlinear contention.
+fn bench_pin_unpin_scalability(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pin_unpin");
+    let baseline = Arc::new(parking_lot::RwLock::new(()));
+    for readers in [1usize, 8, 64, 256] {
+        group.bench_function(format!("epoch_pin_{readers}"), |b| {
+            b.iter_custom(|iters| {
+                let temp_dir = TempDir::new().unwrap();
+                let db_path = temp_dir.path().join("pin.db");
+                let btree = BTree::open(&db_path).unwrap();
+                btree.new_bucket("b", false).unwrap();
+                btree.exec("b", |txn| txn.put(b"k", b"v")).unwrap();
+                let start = Instant::now();
+                let mut handles = Vec::new();
+                for _ in 0..readers {
+                    let tree = btree.clone();
+                    handles.push(thread::spawn(move || {
+                        for _ in 0..iters {
+                            tree.view("b", |txn| {
+                                let _ = txn.get(b"k");
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.join().unwrap();
+                }
+                start.elapsed()
+            });
+        });
+        group.bench_function(format!("rwlock_read_{readers}"), |b| {
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                let mut handles = Vec::new();
+                for _ in 0..readers {
+                    let lock = baseline.clone();
+                    handles.push(thread::spawn(move || {
+                        for _ in 0..iters {
+                            let _g = lock.read();
+                        }
+                    }));
+                }
+                for h in handles {
+                    h.join().unwrap();
+                }
+                start.elapsed()
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert,
@@ -453,6 +576,8 @@ criterion_group!(
     bench_delete,
     bench_exec_multi,
     bench_prefix_encoding_compare,
-    bench_bucket_ops
+    bench_bucket_ops,
+    bench_concurrent_read_write,
+    bench_pin_unpin_scalability
 );
 criterion_main!(benches);

@@ -225,3 +225,78 @@ fn data_sync_publication_reopens_allocator_state_and_continues() {
     })
     .unwrap();
 }
+
+/// Deferred promotion must survive a crash: pages held in the retired set by
+/// an in-flight reader are persisted with the generation, reopen restores a
+/// valid allocator, and the pages become reusable again.
+#[test]
+fn deferred_promotion_survives_crash_and_reopen() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("deferred-crash.db");
+    let tree = BTree::open(&db_path).unwrap();
+    tree.new_bucket("data", false).unwrap();
+
+    let seed = |tree: &BTree, val: &[u8]| {
+        tree.exec("data", |txn| {
+            for i in 0..1000u32 {
+                txn.put(format!("k{i:04}").as_bytes(), val).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+    };
+    seed(&tree, b"v0");
+
+    // a reader pins the v0 snapshot; the next commits must defer promotion
+    let ready = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let reader_tree = tree.clone();
+    let r_ready = ready.clone();
+    let r_release = release.clone();
+    let reader = thread::spawn(move || {
+        reader_tree
+            .view("data", |txn| {
+                assert_eq!(txn.get(b"k0000").unwrap(), b"v0");
+                r_ready.wait();
+                r_release.wait();
+                Ok::<_, btree_store::Error>(())
+            })
+            .unwrap();
+    });
+
+    ready.wait();
+    seed(&tree, b"v1");
+    seed(&tree, b"v2");
+    release.wait();
+    reader.join().unwrap();
+
+    // crash: drop the live handle without a clean shutdown, then reopen
+    drop(tree);
+    let reopened = BTree::open(&db_path).unwrap();
+    reopened
+        .view("data", |txn| {
+            assert_eq!(txn.get(b"k0000").unwrap(), b"v2");
+            Ok(())
+        })
+        .unwrap();
+
+    // the restored retired set is promoted and reused: the file stops growing
+    seed(&reopened, b"v3");
+    let size_after_v3 = fs::metadata(&db_path).unwrap().len();
+    seed(&reopened, b"v4");
+    let size_after_v4 = fs::metadata(&db_path).unwrap().len();
+    assert!(
+        size_after_v4 <= size_after_v3 + 64 * 1024,
+        "restored retired pages must be reusable after reopen"
+    );
+    reopened
+        .view("data", |txn| {
+            assert_eq!(txn.get(b"k0000").unwrap(), b"v4");
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(reopened.pending_pages(), (0, 0));
+}

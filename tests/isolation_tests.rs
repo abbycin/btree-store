@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[test]
-fn test_view_isolation_blocks_writer() {
+fn test_view_isolation_without_blocking_writer() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("isolation.db");
     let tree = BTree::open(&db_path).unwrap();
@@ -41,8 +41,9 @@ fn test_view_isolation_blocks_writer() {
                 // Signal writer to start
                 barrier_clone.wait();
 
-                // Sleep to hold the lock for a significant time
-                // This forces the writer to wait because view holds writer_lock.read()
+                // Hold the view for a significant time. Snapshot isolation is
+                // provided by the pinned fixed root, so the writer must be
+                // able to commit concurrently instead of waiting for us.
                 thread::sleep(Duration::from_millis(500));
 
                 // Continue reading to verify isolation
@@ -60,7 +61,7 @@ fn test_view_isolation_blocks_writer() {
 
     // 3. Writer Thread
     let writer_handle = thread::spawn(move || {
-        // Wait for reader to start and grab lock
+        // Wait for reader to start and grab its snapshot
         barrier.wait();
 
         // Give reader a tiny bit of time to enter sleep
@@ -68,7 +69,8 @@ fn test_view_isolation_blocks_writer() {
 
         let start = Instant::now();
 
-        // This EXEC should be BLOCKED because View holds the global read lock.
+        // This EXEC must NOT be blocked: the reader holds only an epoch-pinned
+        // snapshot, never the writer lock.
         tree_clone_writer
             .exec(bucket_name, |txn| {
                 txn.put(b"new_key", b"new_value").unwrap();
@@ -84,13 +86,15 @@ fn test_view_isolation_blocks_writer() {
 
     // 4. Verifications
 
-    // Consistency: Reader must see exactly the original 100 items.
+    // Consistency: Reader must see exactly the original 100 items (its fixed
+    // snapshot predates the writer's commit).
     assert_eq!(reader_count, 100, "Reader should see all original items");
 
-    // Isolation: Writer must have been blocked.
+    // Isolation is snapshot-based, not exclusion-based: the writer must not be
+    // blocked by the in-flight reader.
     assert!(
-        writer_duration > Duration::from_millis(200),
-        "Writer should be blocked by Reader's lock. Actual duration: {:?}",
+        writer_duration < Duration::from_millis(200),
+        "Writer should not be blocked by a concurrent Reader. Actual duration: {:?}",
         writer_duration
     );
 

@@ -1,13 +1,13 @@
 [package]
 name = "btree-store"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
 readme = "README.md"
 homepage = "https://github.com/abbycin/btree-store"
 repository = "https://github.com/abbycin/btree-store"
-description = "A persistent, embedded key-value storage engine in Rust featuring a Copy-On-Write (COW) B-Tree, ACID compliance, and crash safety with multi-bucket support"
+description = "A persistent, embedded key-value database in Rust featuring a Copy-On-Write (COW) B-Tree, ACID compliance, and crash safety with multi-bucket support"
 license = "MIT"
 keywords = ["database", "kv", "btree", "boltdb", "lmdb"]
 categories = ["database-implementations", "data-structures"]

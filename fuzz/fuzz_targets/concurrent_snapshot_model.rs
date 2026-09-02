@@ -3,7 +3,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
 };
 
@@ -158,19 +161,23 @@ impl<'a> Arbitrary<'a> for ReaderPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReaderMode {
     StaleClone,
     CloneAtRead,
     SamePathOpen,
+    /// Holds one view open across the writer commits and re-reads from the
+    /// same fixed snapshot afterwards (MVCC read/write non-blocking).
+    HeldView,
 }
 
 impl<'a> Arbitrary<'a> for ReaderMode {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=2u8)? {
+        match u.int_in_range(0..=3u8)? {
             0 => Ok(Self::StaleClone),
             1 => Ok(Self::CloneAtRead),
-            _ => Ok(Self::SamePathOpen),
+            2 => Ok(Self::SamePathOpen),
+            _ => Ok(Self::HeldView),
         }
     }
 }
@@ -361,12 +368,14 @@ impl ConcurrentHarness {
         let stale = self.db().clone();
         let path = self.path.clone();
         let barrier = Arc::new(Barrier::new(writers.len() + readers.len() + 1));
+        let completed = Arc::new(AtomicUsize::new(0));
 
         thread::scope(|scope| {
             for (index, writer) in writers.iter().enumerate() {
                 let writer = writer.clone();
                 let db = self.db().clone();
                 let barrier = barrier.clone();
+                let completed = completed.clone();
                 let bucket = mixed_writer_bucket(index);
                 let expected_result = expected[index].clone();
                 scope.spawn(move || {
@@ -391,6 +400,7 @@ impl ConcurrentHarness {
                             expect_db_err(actual, expected_err, "mixed concurrent writer rollback");
                         }
                     }
+                    completed.fetch_add(1, Ordering::Release);
                 });
             }
 
@@ -410,6 +420,7 @@ impl ConcurrentHarness {
                     .and_then(|(_, result)| result.as_ref().ok())
                     .map(|model| BucketSnapshot::from_model(model, reader.bucket.as_str()))
                     .unwrap_or_else(|| before_state.clone());
+                let completed = completed.clone();
                 scope.spawn(move || {
                     barrier.wait();
                     let handle = match reader.mode {
@@ -418,17 +429,35 @@ impl ConcurrentHarness {
                         ReaderMode::SamePathOpen => {
                             expect_open_ok(BTree::open(&path), "same-path open during mixed race")
                         }
+                        ReaderMode::HeldView => base.clone(),
                     };
-                    let actual = expect_db_ok(
-                        read_bucket_snapshot(&handle, reader.bucket.as_str()),
-                        "read mixed bucket",
-                    );
-                    assert!(
-                        actual == before_state || actual == after_state,
-                        "reader observed unexpected mixed snapshot: actual={actual:?} before={before_state:?} after={after_state:?} mode={:?} bucket={:?}",
-                        reader.mode,
-                        reader.bucket
-                    );
+                    if reader.mode == ReaderMode::HeldView {
+                        let first = expect_db_ok(
+                            read_bucket_snapshot_held(
+                                &handle,
+                                reader.bucket.as_str(),
+                                &completed,
+                                writers.len(),
+                            ),
+                            "held view read",
+                        );
+                        assert!(
+                            first == before_state || first == after_state,
+                            "held view observed unexpected snapshot: actual={first:?} before={before_state:?} after={after_state:?} bucket={:?}",
+                            reader.bucket
+                        );
+                    } else {
+                        let actual = expect_db_ok(
+                            read_bucket_snapshot(&handle, reader.bucket.as_str()),
+                            "read mixed bucket",
+                        );
+                        assert!(
+                            actual == before_state || actual == after_state,
+                            "reader observed unexpected mixed snapshot: actual={actual:?} before={before_state:?} after={after_state:?} mode={:?} bucket={:?}",
+                            reader.mode,
+                            reader.bucket
+                        );
+                    }
                 });
             }
 
@@ -455,6 +484,7 @@ impl ConcurrentHarness {
         let stale = self.db().clone();
         let path = self.path.clone();
         let barrier = Arc::new(Barrier::new(readers.len() + 1));
+        let completed = Arc::new(AtomicUsize::new(0));
 
         thread::scope(|scope| {
             for reader in readers {
@@ -468,6 +498,7 @@ impl ConcurrentHarness {
                     .as_ref()
                     .map(|model| BucketSnapshot::from_model(model, reader.bucket.as_str()))
                     .unwrap_or_else(|_| before_state.clone());
+                let completed = completed.clone();
                 scope.spawn(move || {
                     barrier.wait();
                     let handle = match reader.mode {
@@ -476,15 +507,35 @@ impl ConcurrentHarness {
                         ReaderMode::SamePathOpen => {
                             expect_open_ok(BTree::open(&path), "same-path open during race")
                         }
+                        ReaderMode::HeldView => base.clone(),
                     };
-                    let actual =
-                        expect_db_ok(read_bucket_snapshot(&handle, reader.bucket.as_str()), "read raced bucket");
-                    assert!(
-                        actual == before_state || actual == after_state,
-                        "reader observed unexpected bucket snapshot: actual={actual:?} before={before_state:?} after={after_state:?} mode={:?} bucket={:?}",
-                        reader.mode,
-                        reader.bucket
-                    );
+                    if reader.mode == ReaderMode::HeldView {
+                        let first = expect_db_ok(
+                            read_bucket_snapshot_held(
+                                &handle,
+                                reader.bucket.as_str(),
+                                &completed,
+                                1,
+                            ),
+                            "held view read",
+                        );
+                        assert!(
+                            first == before_state || first == after_state,
+                            "held view observed unexpected snapshot: actual={first:?} before={before_state:?} after={after_state:?} bucket={:?}",
+                            reader.bucket
+                        );
+                    } else {
+                        let actual = expect_db_ok(
+                            read_bucket_snapshot(&handle, reader.bucket.as_str()),
+                            "read raced bucket",
+                        );
+                        assert!(
+                            actual == before_state || actual == after_state,
+                            "reader observed unexpected bucket snapshot: actual={actual:?} before={before_state:?} after={after_state:?} mode={:?} bucket={:?}",
+                            reader.mode,
+                            reader.bucket
+                        );
+                    }
                 });
             }
 
@@ -512,6 +563,7 @@ impl ConcurrentHarness {
                     );
                 }
             }
+            completed.fetch_add(1, Ordering::Release);
         });
 
         if let Ok(next) = expected {
@@ -526,6 +578,7 @@ impl ConcurrentHarness {
         let stale = self.db().clone();
         let path = self.path.clone();
         let barrier = Arc::new(Barrier::new(readers.len() + 1));
+        let completed = Arc::new(AtomicUsize::new(0));
 
         thread::scope(|scope| {
             for reader in readers {
@@ -539,6 +592,7 @@ impl ConcurrentHarness {
                     .as_ref()
                     .map(|model| BucketSnapshot::from_model(model, reader.bucket.as_str()))
                     .unwrap_or_else(|_| before_state.clone());
+                let completed = completed.clone();
                 scope.spawn(move || {
                     barrier.wait();
                     let handle = match reader.mode {
@@ -547,15 +601,35 @@ impl ConcurrentHarness {
                         ReaderMode::SamePathOpen => {
                             expect_open_ok(BTree::open(&path), "same-path open during multi race")
                         }
+                        ReaderMode::HeldView => base.clone(),
                     };
-                    let actual =
-                        expect_db_ok(read_bucket_snapshot(&handle, reader.bucket.as_str()), "read raced multi bucket");
-                    assert!(
-                        actual == before_state || actual == after_state,
-                        "reader observed unexpected multi-bucket snapshot: actual={actual:?} before={before_state:?} after={after_state:?} mode={:?} bucket={:?}",
-                        reader.mode,
-                        reader.bucket
-                    );
+                    if reader.mode == ReaderMode::HeldView {
+                        let first = expect_db_ok(
+                            read_bucket_snapshot_held(
+                                &handle,
+                                reader.bucket.as_str(),
+                                &completed,
+                                1,
+                            ),
+                            "held view read",
+                        );
+                        assert!(
+                            first == before_state || first == after_state,
+                            "held view observed unexpected snapshot: actual={first:?} before={before_state:?} after={after_state:?} bucket={:?}",
+                            reader.bucket
+                        );
+                    } else {
+                        let actual = expect_db_ok(
+                            read_bucket_snapshot(&handle, reader.bucket.as_str()),
+                            "read raced multi bucket",
+                        );
+                        assert!(
+                            actual == before_state || actual == after_state,
+                            "reader observed unexpected multi-bucket snapshot: actual={actual:?} before={before_state:?} after={after_state:?} mode={:?} bucket={:?}",
+                            reader.mode,
+                            reader.bucket
+                        );
+                    }
                 });
             }
 
@@ -593,6 +667,7 @@ impl ConcurrentHarness {
                     );
                 }
             }
+            completed.fetch_add(1, Ordering::Release);
         });
 
         if let Ok(next) = expected {
@@ -639,27 +714,89 @@ fn multi_step_bucket(step: &MultiStep) -> &str {
     }
 }
 
-fn read_bucket_snapshot(db: &BTree, bucket: &str) -> DbResult<BucketSnapshot> {
-    match db.view(bucket, |txn| {
-        let mut iter = txn.iter();
-        let mut key_buf = Vec::new();
-        let mut val_buf = Vec::new();
-        let mut epoch = None;
-        let mut entries = BTreeMap::new();
-        while iter.next_ref(&mut key_buf, &mut val_buf) {
-            if key_buf == EPOCH_KEY {
-                if val_buf.len() != std::mem::size_of::<u64>() {
-                    panic!("epoch value has invalid length {}", val_buf.len());
-                }
-                epoch = Some(u64::from_le_bytes(val_buf.as_slice().try_into().unwrap()));
-            } else {
-                entries.insert(key_buf.clone(), val_buf.clone());
+fn snapshot_from_txn(txn: &btree_store::ReadOnlyTxn<'_>) -> BucketSnapshot {
+    let mut iter = txn.iter();
+    let mut key_buf = Vec::new();
+    let mut val_buf = Vec::new();
+    let mut epoch = None;
+    let mut entries = BTreeMap::new();
+    while iter.next_ref(&mut key_buf, &mut val_buf) {
+        if key_buf == EPOCH_KEY {
+            if val_buf.len() != std::mem::size_of::<u64>() {
+                panic!("epoch value has invalid length {}", val_buf.len());
             }
+            epoch = Some(u64::from_le_bytes(val_buf.as_slice().try_into().unwrap()));
+        } else {
+            entries.insert(key_buf.clone(), val_buf.clone());
         }
-        Ok(BucketSnapshot::Present {
-            epoch: epoch.unwrap_or(0),
-            entries,
-        })
+    }
+    BucketSnapshot::Present {
+        epoch: epoch.unwrap_or(0),
+        entries,
+    }
+}
+
+fn read_bucket_snapshot(db: &BTree, bucket: &str) -> DbResult<BucketSnapshot> {
+    match db.view(bucket, |txn| Ok(snapshot_from_txn(txn))) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(Error::BucketNotFound) => Ok(BucketSnapshot::Missing),
+        Err(err) => Err(err),
+    }
+}
+
+/// Probe keys read per interleaved pass while a held view spans writer
+/// commits: a bounded deterministic spread over the fixed snapshot's key set.
+const HELD_VIEW_PROBE_KEYS: usize = 8;
+/// Minimum interleaved passes even when the writers finish immediately, so
+/// the reader always touches the fixed snapshot more than twice.
+const HELD_VIEW_MIN_PROBES: usize = 4;
+
+/// Reads a bucket snapshot, then holds the same view open while writers
+/// publish new generations (tracked by `completed`) and repeatedly probes a
+/// deterministic key spread: the fixed snapshot must not change at any point,
+/// which catches premature page reuse (an epoch-gate violation) far more
+/// often than a single before/after comparison. Writers increment `completed`
+/// only after their exec, so the final full read is ordered after every
+/// commit; the probes land inside the scan-to-publish / promotion windows.
+fn read_bucket_snapshot_held(
+    db: &BTree,
+    bucket: &str,
+    completed: &AtomicUsize,
+    writer_count: usize,
+) -> DbResult<BucketSnapshot> {
+    match db.view(bucket, |txn| {
+        let first = snapshot_from_txn(txn);
+        let probe_pairs: Vec<(Vec<u8>, Vec<u8>)> = match &first {
+            BucketSnapshot::Present { entries, .. } => {
+                entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            }
+            BucketSnapshot::Missing => Vec::new(),
+        };
+        let mut offset = 0usize;
+        let mut probes = 0usize;
+        while completed.load(Ordering::Acquire) < writer_count || probes < HELD_VIEW_MIN_PROBES {
+            if !probe_pairs.is_empty() {
+                for _ in 0..HELD_VIEW_PROBE_KEYS {
+                    let (key, expected) = &probe_pairs[offset % probe_pairs.len()];
+                    offset = offset.wrapping_add(1);
+                    let actual = txn
+                        .get(key)
+                        .unwrap_or_else(|_| panic!("held view lost key {key:?}"));
+                    assert_eq!(
+                        actual, *expected,
+                        "held view must keep its fixed snapshot across the writer commit"
+                    );
+                }
+            }
+            probes += 1;
+            thread::yield_now();
+        }
+        let final_read = snapshot_from_txn(txn);
+        assert_eq!(
+            first, final_read,
+            "held view must keep its fixed snapshot across the writer commit"
+        );
+        Ok(first)
     }) {
         Ok(snapshot) => Ok(snapshot),
         Err(Error::BucketNotFound) => Ok(BucketSnapshot::Missing),

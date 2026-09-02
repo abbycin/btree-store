@@ -2,6 +2,15 @@
 
 All notable changes to the **btree-store** project will be documented in this file.
 
+## [1.1.0] - 2026-09-02
+
+### Added
+- **Read/Write Non-Blocking Concurrency**: Readers pin an epoch snapshot instead of taking the
+  writer lock, so a view never blocks a writer and a writer never blocks a view's traversal.
+  Retired pages are promoted to reusable only while no in-flight reader can still reference them;
+  deferred pages stay quarantined and are published with the next generation. The on-disk format
+  is unchanged and existing databases open as before.
+
 ## [1.0.0] - 2026-08-08
 
 ### Added

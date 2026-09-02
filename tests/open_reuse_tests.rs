@@ -5,12 +5,15 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[test]
-fn test_reopen_same_path_shares_writer_lock() {
+fn test_reopen_same_path_shares_live_instance() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("reuse.db");
 
-    // Same-process opens reuse the registry entry and therefore the shared
-    // writer lock that the timing assertion below exercises.
+    // Same-process opens reuse the registry entry and therefore share the live
+    // Store: one writer serialization, one shared snapshot, one allocator.
+    // Under the MVCC model a reader on one handle must not block a writer on
+    // the other, and the writer's commit must be visible through the other
+    // handle (shared published snapshot).
     let handle_a = Arc::new(BTree::open(&db_path).unwrap());
     let handle_b = Arc::new(BTree::open(&db_path).unwrap());
     handle_a.new_bucket("reuse", false).unwrap();
@@ -55,13 +58,15 @@ fn test_reopen_same_path_shares_writer_lock() {
     };
 
     reader.join().unwrap();
-    let blocked = writer.join().unwrap();
+    let elapsed = writer.join().unwrap();
     assert!(
-        blocked > Duration::from_millis(200),
-        "writer should be blocked by reader on reused handle; actual: {:?}",
-        blocked
+        elapsed < Duration::from_millis(200),
+        "writer on a reused handle should not be blocked by a reader on the other handle; actual: {:?}",
+        elapsed
     );
 
+    // Shared published snapshot: the commit through handle_b is visible on
+    // handle_a, and the shared pending-count state is drained.
     handle_a
         .view("reuse", |txn| {
             assert_eq!(txn.get(b"k1").unwrap(), b"v1".to_vec());
@@ -140,14 +145,23 @@ fn test_same_path_open_is_instance_reuse_not_true_reopen() {
             Ok(())
         })
         .unwrap();
-    let blocked = start.elapsed();
+    let elapsed = start.elapsed();
 
     reader.join().unwrap();
     assert!(
-        blocked > Duration::from_millis(200),
-        "same-path open should reuse the live instance instead of performing a true reopen; actual: {:?}",
-        blocked
+        elapsed < Duration::from_millis(200),
+        "same-path open should reuse the live instance instead of performing a true reopen; the writer must not be blocked by a reader on the pre-existing handle; actual: {:?}",
+        elapsed
     );
+
+    // Shared published snapshot: the commit through the reopened handle is
+    // visible on the pre-existing handle.
+    handle_a
+        .view("reuse", |txn| {
+            assert_eq!(txn.get(b"k1").unwrap(), b"v1".to_vec());
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]

@@ -4,17 +4,17 @@
 [![Crates.io](https://img.shields.io/crates/v/btree-store.svg)](https://crates.io/crates/btree-store)
 [![License](https://img.shields.io/crates/l/btree-store.svg)](./LICENSE)
 
-**btree-store** is a persistent, embedded key-value storage engine written in Rust, built on a Copy-On-Write (COW) B+ Tree for data integrity, crash safety, and efficient concurrent access.
+**btree-store** is a persistent, embedded key-value database written in Rust, built on a Copy-On-Write (COW) B+ Tree for data integrity, crash safety, and efficient concurrent access.
 
 ## Features
 
 *   **Copy-on-Write B+ Tree:** Atomic commits without in-place updates.
 *   **Snapshot Transactions:** Closure-based read/write transactions with automatic refresh, rollback, and snapshot-bound iteration.
+*   **MVCC Read/Write Non-Blocking:** Views pin an epoch snapshot for their whole lifetime instead of taking the writer lock — a long view never blocks a commit, and a commit never blocks a view's traversal. Writers serialize on a shared mutex; readers traverse lock-free on a fixed snapshot.
 *   **Multi-Bucket Atomicity:** Named buckets share one database file; `exec_multi` commits updates across buckets in one generation.
 *   **Prefix Encoding:** Optional per-bucket key-prefix compression, persisted as part of the bucket layout policy.
 *   **Crash Safety:** Double-buffered metadata publication and recovery from the newest complete generation.
-*   **Concurrent Access:** One serialized writer with concurrent snapshot readers and shared runtime caching.
-*   **Durable Reclamation:** Reusable and quarantined pages are persisted and recovered with the database generation.
+*   **Durable, Reader-Gated Reclamation:** Reusable and quarantined pages are persisted and recovered with the database generation; retired pages are promoted to reusable only while no in-flight reader can still reference them. Long-lived views delay reclamation and grow the file, but writes are never blocked.
 
 > **Warning:** Multi-process concurrent access is not supported. A competing process receives `OpenError::DatabaseBusy` if the exclusive file lock remains held after the bounded open wait.
 >

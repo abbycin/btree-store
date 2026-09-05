@@ -2091,8 +2091,12 @@ impl BTree {
     }
 
     fn apply_handle_snapshot(&self, snapshot: MetaSnapshot) {
+        let mut local = self.local_snapshot.write();
+        if snapshot.seq < local.seq {
+            return;
+        }
         self.start_seq.store(snapshot.seq, Ordering::Release);
-        *self.local_snapshot.write() = snapshot;
+        *local = snapshot;
     }
 
     fn sync_local_snapshot_from_store(&self) {
@@ -2554,7 +2558,8 @@ impl BTree {
     fn refresh_internal(&self, allow_install: bool) -> StoreResult<()> {
         // fast path: snapshot version unchanged, so current in-memory roots and node cache are valid
         let (latest_seq, _) = self.store.shared_snapshot();
-        if latest_seq == self.start_seq.load(Ordering::Acquire) {
+        let start_seq = self.start_seq.load(Ordering::Acquire);
+        if latest_seq == start_seq {
             return Ok(());
         }
 
@@ -2578,7 +2583,7 @@ impl BTree {
         // readers never install a disk-newer generation into the shared
         // snapshot (see Store::refresh_sb)
         self.refresh_internal(false)?;
-        let snapshot = self.store.cached_snapshot();
+        let snapshot = *self.local_snapshot.read();
         let read = TreeReadContext::new(self.runtime.clone());
 
         let mut iter = Tree::iterator(
@@ -2645,6 +2650,42 @@ mod tests {
 
     fn test_runtime(store: Arc<Store>) -> Arc<BTreeRuntime> {
         BTreeRuntime::new(store, OpenOptions::default().cache_capacity)
+    }
+
+    #[test]
+    fn reader_refresh_does_not_adopt_unpublished_cached_meta() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("tree.db")).unwrap();
+        tree.new_bucket("bucket", false).unwrap();
+
+        let published_seq = tree.store.shared_snapshot().0;
+        tree.start_seq
+            .store(published_seq.saturating_sub(1), Ordering::Release);
+        tree.store.forge_cached_seq_for_test(published_seq + 1);
+
+        tree.view("bucket", |_| Ok(())).unwrap();
+
+        assert_eq!(
+            tree.start_seq.load(Ordering::Acquire),
+            published_seq,
+            "a reader must not adopt the writer's unpublished cached sequence"
+        );
+    }
+
+    #[test]
+    fn stale_reader_snapshot_cannot_regress_handle_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("tree.db")).unwrap();
+        tree.new_bucket("bucket", false).unwrap();
+
+        let published = *tree.local_snapshot.read();
+        let mut newer = published;
+        newer.seq += 1;
+        tree.apply_handle_snapshot(newer);
+        tree.apply_handle_snapshot(published);
+
+        assert_eq!(tree.start_seq.load(Ordering::Acquire), newer.seq);
+        assert_eq!(*tree.local_snapshot.read(), newer);
     }
 
     fn alloc_and_write_node(store: &Store, node: &mut Node) -> DataPid {

@@ -537,21 +537,21 @@ impl LiveStore {
 }
 
 struct SharedMeta {
-    state: RwLock<(u64, PageId)>,
+    state: RwLock<MetaSnapshot>,
 }
 
 impl SharedMeta {
-    fn new(seq: u64, root: PageId) -> Self {
+    fn new(snapshot: MetaSnapshot) -> Self {
         Self {
-            state: RwLock::new((seq, root)),
+            state: RwLock::new(snapshot),
         }
     }
 
-    fn update(&self, root: PageId, seq: u64) {
-        *self.state.write() = (seq, root);
+    fn update(&self, snapshot: MetaSnapshot) {
+        *self.state.write() = snapshot;
     }
 
-    fn snapshot(&self) -> (u64, PageId) {
+    fn snapshot(&self) -> MetaSnapshot {
         *self.state.read()
     }
 }
@@ -1359,7 +1359,13 @@ impl Store {
         let store = Self {
             file,
             sb: Mutex::new(sb),
-            shared: SharedMeta::new(sb.seq, sb.catalog_root),
+            shared: SharedMeta::new(MetaSnapshot {
+                catalog_root: sb.catalog_root,
+                next_page_id: sb.next_page_id,
+                reusable_root: sb.reusable_root,
+                retired_root: sb.retired_root,
+                seq: sb.seq,
+            }),
             epoch: EpochRegistry::new(),
             reusable: Mutex::new(ExtentSet::from_extents(reusable)),
             retired: Mutex::new(ExtentSet::from_extents(retired)),
@@ -1574,7 +1580,13 @@ impl Store {
         self.file.pwrite_all(sb.as_page_slice(), write_offset)?;
         self.sync_publication()?;
         self.file.set_generation(sb.seq);
-        self.shared.update(sb.catalog_root, sb.seq);
+        self.shared.update(MetaSnapshot {
+            catalog_root: sb.catalog_root,
+            next_page_id: sb.next_page_id,
+            reusable_root: sb.reusable_root,
+            retired_root: sb.retired_root,
+            seq: sb.seq,
+        });
         // Publication ordering: the new generation must be visible to readers
         // before the epoch advances, so a reader acquiring the new epoch value
         // subsequently observes the new shared snapshot.
@@ -1750,7 +1762,8 @@ impl Store {
     }
 
     pub(crate) fn shared_snapshot(&self) -> (u64, PageId) {
-        self.shared.snapshot()
+        let snapshot = self.shared.snapshot();
+        (snapshot.seq, snapshot.catalog_root)
     }
 
     #[cfg(test)]
@@ -2049,6 +2062,11 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn forge_cached_seq_for_test(&self, seq: u64) {
+        self.sb.lock().seq = seq;
+    }
+
     /// Refresh the in-memory superblock and allocator state from disk.
     ///
     /// `allow_install` is true only for writer paths (which hold the writer
@@ -2088,7 +2106,13 @@ impl Store {
             if sb.seq > current_sb.seq {
                 *current_sb = sb;
                 self.file.set_generation(current_sb.seq);
-                self.shared.update(current_sb.catalog_root, current_sb.seq);
+                self.shared.update(MetaSnapshot {
+                    catalog_root: current_sb.catalog_root,
+                    next_page_id: current_sb.next_page_id,
+                    reusable_root: current_sb.reusable_root,
+                    retired_root: current_sb.retired_root,
+                    seq: current_sb.seq,
+                });
                 // Adopting a disk-newer generation is also a shared snapshot
                 // install. Keep the epoch counter in one-to-one correspondence
                 // with SharedMeta updates, using the same visibility order as
@@ -2110,6 +2134,10 @@ impl Store {
                     seq: current_sb.seq,
                 });
             }
+        }
+
+        if !allow_install {
+            return Ok(self.shared.snapshot());
         }
 
         let sb = self.sb.lock();
@@ -2618,7 +2646,11 @@ mod tests {
 
         // forge a valid seq+1 slot at the other double-buffer offset, through
         // the store's own file handle (no second handle: Windows-safe)
-        let other_offset = if current_seq % 2 == 0 { 0 } else { PAGE_SIZE as u64 };
+        let other_offset = if current_seq % 2 == 0 {
+            0
+        } else {
+            PAGE_SIZE as u64
+        };
         let mut forged = *store.sb.lock();
         forged.seq += 1;
         forged.update_checksum();
@@ -2776,7 +2808,7 @@ mod tests {
 
         let adopted = store.refresh_sb(true).unwrap();
         assert_eq!(adopted.seq, disk_newer.seq);
-        assert_eq!(store.shared.snapshot().0, disk_newer.seq);
+        assert_eq!(store.shared.snapshot().seq, disk_newer.seq);
         assert_eq!(store.epoch.current(), counter_before + 1);
     }
 

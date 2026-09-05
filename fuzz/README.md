@@ -18,6 +18,8 @@ and checks these invariants after successful operations:
   observed epoch; it does not require readers to see the latest writer commit.
   The concurrent target also starts multiple writer threads together, so the
   reader checks run while independent `exec` calls contend on the writer lock.
+  Some reader cases use the original `BTree` handle directly, exercising
+  concurrent access to the handle's local snapshot state as well as cloned handles.
 
 The model is intentionally limited to the public bucket/key/value contract. It
 does not invent a logical page namespace or assert physical PID stability:
@@ -50,7 +52,7 @@ without making each fuzz iteration too expensive.
   missing-bucket checks, and reopen validation.
 - `concurrent_snapshot_model`: one-writer/many-reader and multiple-writer/
   many-reader races where readers use a stale handle, `clone()`, or same-path
-  `open()` and must observe either the full pre-commit snapshot or the full
+  `open()`, or the shared original handle, and must observe either the full pre-commit snapshot or the full
   post-commit snapshot for a bucket. The mixed phase gives each writer a
   distinct bucket, starts all writers and readers behind one barrier, and
   includes `update(false)` key/value no-ops, real writes, deletes, and rollback

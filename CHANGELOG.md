@@ -2,6 +2,14 @@
 
 All notable changes to the **btree-store** project will be documented in this file.
 
+## [1.1.1] - 2026-09-05
+
+### Fixed
+- **Published Snapshot Refresh**: Prevented concurrent readers from adopting a writer's unpublished in-memory superblock while a generation is being persisted, which could advance a handle's sequence and trigger `COMMIT_SEQUENCE_CONFLICT` during a valid serialized commit.
+- **Monotonic Handle Snapshots**: Prevented a reader holding an older published snapshot from regressing a shared handle after a writer has published a newer generation, eliminating the resulting `COMMIT_SEQUENCE_CONFLICT` on the next commit.
+- **Snapshot Enumeration**: `BTree::buckets` now traverses the handle's published metadata snapshot instead of the mutable store cache.
+- **Regression Coverage**: Added a test for reader refresh during the unpublished superblock window.
+
 ## [1.1.0] - 2026-09-02
 
 ### Added

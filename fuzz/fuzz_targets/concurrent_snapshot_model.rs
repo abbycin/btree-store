@@ -166,6 +166,8 @@ enum ReaderMode {
     StaleClone,
     CloneAtRead,
     SamePathOpen,
+    /// Uses the harness's original handle so reader and writer share start_seq.
+    SharedHandle,
     /// Holds one view open across the writer commits and re-reads from the
     /// same fixed snapshot afterwards (MVCC read/write non-blocking).
     HeldView,
@@ -173,11 +175,26 @@ enum ReaderMode {
 
 impl<'a> Arbitrary<'a> for ReaderMode {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=3u8)? {
+        match u.int_in_range(0..=4u8)? {
             0 => Ok(Self::StaleClone),
             1 => Ok(Self::CloneAtRead),
             2 => Ok(Self::SamePathOpen),
-            _ => Ok(Self::HeldView),
+            3 => Ok(Self::HeldView),
+            _ => Ok(Self::SharedHandle),
+        }
+    }
+}
+
+enum ReaderHandle<'a> {
+    Owned(BTree),
+    Shared(&'a BTree),
+}
+
+impl ReaderHandle<'_> {
+    fn as_ref(&self) -> &BTree {
+        match self {
+            Self::Owned(tree) => tree,
+            Self::Shared(tree) => tree,
         }
     }
 }
@@ -366,6 +383,7 @@ impl ConcurrentHarness {
             })
             .collect();
         let stale = self.db().clone();
+        let shared_handle = self.db();
         let path = self.path.clone();
         let barrier = Arc::new(Barrier::new(writers.len() + readers.len() + 1));
         let completed = Arc::new(AtomicUsize::new(0));
@@ -424,17 +442,18 @@ impl ConcurrentHarness {
                 scope.spawn(move || {
                     barrier.wait();
                     let handle = match reader.mode {
-                        ReaderMode::StaleClone => stale,
-                        ReaderMode::CloneAtRead => base.clone(),
-                        ReaderMode::SamePathOpen => {
-                            expect_open_ok(BTree::open(&path), "same-path open during mixed race")
-                        }
-                        ReaderMode::HeldView => base.clone(),
+                        ReaderMode::StaleClone => ReaderHandle::Owned(stale),
+                        ReaderMode::CloneAtRead => ReaderHandle::Owned(base.clone()),
+                        ReaderMode::SamePathOpen => ReaderHandle::Owned(
+                            expect_open_ok(BTree::open(&path), "same-path open during mixed race"),
+                        ),
+                        ReaderMode::HeldView => ReaderHandle::Owned(base.clone()),
+                        ReaderMode::SharedHandle => ReaderHandle::Shared(shared_handle),
                     };
                     if reader.mode == ReaderMode::HeldView {
                         let first = expect_db_ok(
                             read_bucket_snapshot_held(
-                                &handle,
+                                handle.as_ref(),
                                 reader.bucket.as_str(),
                                 &completed,
                                 writers.len(),
@@ -448,7 +467,7 @@ impl ConcurrentHarness {
                         );
                     } else {
                         let actual = expect_db_ok(
-                            read_bucket_snapshot(&handle, reader.bucket.as_str()),
+                            read_bucket_snapshot(handle.as_ref(), reader.bucket.as_str()),
                             "read mixed bucket",
                         );
                         assert!(
@@ -482,6 +501,7 @@ impl ConcurrentHarness {
         let before = self.model.clone();
         let expected = before.apply_single(bucket.as_str(), steps);
         let stale = self.db().clone();
+        let shared_handle = self.db();
         let path = self.path.clone();
         let barrier = Arc::new(Barrier::new(readers.len() + 1));
         let completed = Arc::new(AtomicUsize::new(0));
@@ -502,17 +522,18 @@ impl ConcurrentHarness {
                 scope.spawn(move || {
                     barrier.wait();
                     let handle = match reader.mode {
-                        ReaderMode::StaleClone => stale,
-                        ReaderMode::CloneAtRead => base.clone(),
-                        ReaderMode::SamePathOpen => {
-                            expect_open_ok(BTree::open(&path), "same-path open during race")
-                        }
-                        ReaderMode::HeldView => base.clone(),
+                        ReaderMode::StaleClone => ReaderHandle::Owned(stale),
+                        ReaderMode::CloneAtRead => ReaderHandle::Owned(base.clone()),
+                        ReaderMode::SamePathOpen => ReaderHandle::Owned(
+                            expect_open_ok(BTree::open(&path), "same-path open during race"),
+                        ),
+                        ReaderMode::HeldView => ReaderHandle::Owned(base.clone()),
+                        ReaderMode::SharedHandle => ReaderHandle::Shared(shared_handle),
                     };
                     if reader.mode == ReaderMode::HeldView {
                         let first = expect_db_ok(
                             read_bucket_snapshot_held(
-                                &handle,
+                                handle.as_ref(),
                                 reader.bucket.as_str(),
                                 &completed,
                                 1,
@@ -526,7 +547,7 @@ impl ConcurrentHarness {
                         );
                     } else {
                         let actual = expect_db_ok(
-                            read_bucket_snapshot(&handle, reader.bucket.as_str()),
+                            read_bucket_snapshot(handle.as_ref(), reader.bucket.as_str()),
                             "read raced bucket",
                         );
                         assert!(
@@ -576,6 +597,7 @@ impl ConcurrentHarness {
         let before = self.model.clone();
         let expected = before.apply_multi(steps);
         let stale = self.db().clone();
+        let shared_handle = self.db();
         let path = self.path.clone();
         let barrier = Arc::new(Barrier::new(readers.len() + 1));
         let completed = Arc::new(AtomicUsize::new(0));
@@ -596,17 +618,18 @@ impl ConcurrentHarness {
                 scope.spawn(move || {
                     barrier.wait();
                     let handle = match reader.mode {
-                        ReaderMode::StaleClone => stale,
-                        ReaderMode::CloneAtRead => base.clone(),
-                        ReaderMode::SamePathOpen => {
-                            expect_open_ok(BTree::open(&path), "same-path open during multi race")
-                        }
-                        ReaderMode::HeldView => base.clone(),
+                        ReaderMode::StaleClone => ReaderHandle::Owned(stale),
+                        ReaderMode::CloneAtRead => ReaderHandle::Owned(base.clone()),
+                        ReaderMode::SamePathOpen => ReaderHandle::Owned(
+                            expect_open_ok(BTree::open(&path), "same-path open during multi race"),
+                        ),
+                        ReaderMode::HeldView => ReaderHandle::Owned(base.clone()),
+                        ReaderMode::SharedHandle => ReaderHandle::Shared(shared_handle),
                     };
                     if reader.mode == ReaderMode::HeldView {
                         let first = expect_db_ok(
                             read_bucket_snapshot_held(
-                                &handle,
+                                handle.as_ref(),
                                 reader.bucket.as_str(),
                                 &completed,
                                 1,
@@ -620,7 +643,7 @@ impl ConcurrentHarness {
                         );
                     } else {
                         let actual = expect_db_ok(
-                            read_bucket_snapshot(&handle, reader.bucket.as_str()),
+                            read_bucket_snapshot(handle.as_ref(), reader.bucket.as_str()),
                             "read raced multi bucket",
                         );
                         assert!(

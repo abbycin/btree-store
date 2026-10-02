@@ -17,7 +17,6 @@ fn test_smo_stress() {
     let num_ops = 5000;
     let mut keys: Vec<Vec<u8>> = Vec::new();
 
-    // Phase 1: Random Insertions
     btree
         .exec("stress", |txn| {
             for i in 0..num_ops {
@@ -32,7 +31,6 @@ fn test_smo_stress() {
         })
         .expect("commit failed");
 
-    // Verification
     btree
         .view("stress", |txn| {
             for (k, v) in &expected {
@@ -43,7 +41,6 @@ fn test_smo_stress() {
         })
         .unwrap();
 
-    // Phase 2: Random Deletions and Overwrites
     keys.shuffle(&mut rng);
     let (to_delete, to_overwrite) = keys.split_at(keys.len() / 2);
 
@@ -68,14 +65,12 @@ fn test_smo_stress() {
         })
         .expect("commit failed");
 
-    // Final Verification
     btree
         .view("stress", |txn| {
             for (k, v) in &expected {
                 let res = txn.get(k).expect("get failed");
                 assert_eq!(res, *v);
             }
-            // Ensure deleted keys are gone
             for k in to_delete {
                 match txn.get(k) {
                     Err(Error::KeyNotFound) => {}
@@ -95,7 +90,6 @@ fn test_sequential_split_stress() {
     let btree = BTree::open(&db_path).expect("failed to open btree");
     btree.new_bucket("seq", false).unwrap();
 
-    // Sequential keys often trigger edge cases in splitting
     btree
         .exec("seq", |txn| {
             for i in 0..10000 {

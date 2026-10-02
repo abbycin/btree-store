@@ -3,11 +3,8 @@ use tempfile::TempDir;
 
 #[test]
 fn test_cross_instance_automatic_visibility() {
-    assert_eq!(btree_store::FORMAT_VERSION, 1);
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("visibility_test.db");
-    // Refresh installs one coherent root and allocator generation before the
-    // second handle observes the first handle's commit.
 
     let bt1 = BTree::open(&db_path).unwrap();
     let bt2 = BTree::open(&db_path).unwrap();
@@ -50,7 +47,6 @@ fn test_cross_instance_sequential_execution() {
 
     let bt2 = BTree::open(&db_path).unwrap();
 
-    // bt1 commits change
     bt1.exec("test", |txn| {
         txn.put(b"k", b"v1").unwrap();
         Ok(())

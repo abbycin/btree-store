@@ -13,9 +13,9 @@ use std::{
 };
 
 use crate::{
-    CorruptionReport, DataPid, FORMAT_VERSION, FatalReason, IdSpace, IoFault, MAGIC, MetaNode,
-    OpenError, OpenIoError, OpenOptions, OpenResult, PageId, StoreFault as Error,
-    StoreResult as Result, SyncMode, abort_store_fault,
+    CorruptionReport, CorruptionSite, DataPid, FORMAT_VERSION, FatalReason, IdSpace, IoFault,
+    MAGIC, MetaNode, OpenError, OpenIoError, OpenOptions, OpenResult, PageId, Snapshot,
+    StoreFault as Error, StoreResult as Result, SyncMode, abort_store_fault,
     epoch::EpochRegistry,
     fatal,
     node::{AlignedPage, Node, PAGE_SIZE},
@@ -40,6 +40,27 @@ pub(crate) struct AfterOldestScanHook {
 
 #[cfg(test)]
 pub(crate) static AFTER_OLDEST_SCAN: Mutex<Option<Arc<AfterOldestScanHook>>> = Mutex::new(None);
+
+/// Test-only publication-point hook (modelled on `AFTER_OLDEST_SCAN`): invoked with
+/// the live high-water mark, the live file length, the sequence being published and the meta slot's
+/// byte offset immediately **before** the meta slot is written, so a test can assert the
+/// dense-length invariant at exactly that instant — and, from the slot's on-disk bytes, that the
+/// publication is not durable yet. The values are passed in rather than read by the hook, because
+/// the caller already holds the superblock lock.
+#[cfg(test)]
+type Mtx = Mutex<Option<Arc<dyn Fn(PublicationPoint) + Send + Sync>>>;
+#[cfg(test)]
+pub(crate) static BEFORE_META_SLOT_WRITE: Mtx = Mutex::new(None);
+
+/// What `BEFORE_META_SLOT_WRITE` reports about the publication it is about to make durable.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PublicationPoint {
+    pub(crate) next_page_id: PageId,
+    pub(crate) file_len: u64,
+    pub(crate) seq: u64,
+    pub(crate) write_offset: u64,
+}
 
 #[cfg(test)]
 pub(crate) struct NoopPageReuseObserver;
@@ -197,7 +218,7 @@ const OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 const OPEN_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 #[cfg(test)]
-const TEST_LIVE_FAULT_ENV: &str = "BTREE_STORE_TEST_LIVE_FAULT";
+pub(crate) const TEST_LIVE_FAULT_ENV: &str = "BTREE_STORE_TEST_LIVE_FAULT";
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -240,11 +261,14 @@ impl TestFault {
 }
 
 impl RawFile {
-    fn open(path: &Path) -> OpenResult<(Self, bool)> {
+    /// Opens the file: read-only handles ask for no write permission, never
+    /// create the file, and take a shared lock so that several readers can
+    /// coexist without excluding each other.
+    fn open(path: &Path, read_only: bool) -> OpenResult<(Self, bool)> {
         let file = FileOpenOptions::new()
             .read(true)
-            .write(true)
-            .create(true)
+            .write(!read_only)
+            .create(!read_only)
             .truncate(false)
             .open(path)
             .map_err(|source| {
@@ -259,7 +283,12 @@ impl RawFile {
 
         let deadline = Instant::now() + OPEN_LOCK_TIMEOUT;
         loop {
-            match file.try_lock() {
+            let attempt = if read_only {
+                file.try_lock_shared()
+            } else {
+                file.try_lock()
+            };
+            match attempt {
                 Ok(()) => break,
                 Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(OPEN_LOCK_RETRY_INTERVAL);
@@ -320,8 +349,8 @@ struct OpeningStore {
 }
 
 impl OpeningStore {
-    fn open(path: &Path) -> OpenResult<(Self, bool)> {
-        let (raw, is_new) = RawFile::open(path)?;
+    fn open(path: &Path, read_only: bool) -> OpenResult<(Self, bool)> {
+        let (raw, is_new) = RawFile::open(path, read_only)?;
         Ok((Self { raw }, is_new))
     }
 
@@ -401,23 +430,13 @@ impl OpeningStore {
             .map_err(|source| self.io_error("sync_parent_dir", None, None, source))
     }
 
-    fn corruption(
+    fn corruption_site(
         &self,
-        code: &'static str,
+        site: CorruptionSite,
         generation: Option<u64>,
         page_kind: &'static str,
-        pid: Option<PageId>,
-        check: &'static str,
     ) -> OpenError {
-        OpenError::Corruption(CorruptionReport {
-            code,
-            generation,
-            page_kind,
-            pid,
-            check,
-            expected: None,
-            actual: None,
-        })
+        OpenError::Corruption(site.report(generation, page_kind))
     }
 
     fn read_extent(
@@ -430,9 +449,7 @@ impl OpeningStore {
             root,
             next_page_id,
             |current, buf| self.pread_exact(buf, current as u64 * PAGE_SIZE as u64),
-            |code, current, check| {
-                self.corruption(code, Some(generation), "extent", Some(current), check)
-            },
+            |site| self.corruption_site(site, Some(generation), "extent"),
         )
     }
 
@@ -451,7 +468,7 @@ impl OpeningStore {
             &reusable_pages,
             &retired,
             &retired_pages,
-            |code, pid, check| self.corruption(code, Some(generation), "extent", Some(pid), check),
+            |site| self.corruption_site(site, Some(generation), "extent"),
         )?;
         Ok((reusable, reusable_pages, retired, retired_pages))
     }
@@ -559,6 +576,9 @@ impl SharedMeta {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ExtentHeader {
+    /// CRC32C of the whole page with this field read as zero; first field, like
+    /// every other page header in the format (see `crate::page`).
+    checksum: u32,
     next: PageId,
     count: u32,
 }
@@ -1067,7 +1087,12 @@ impl AllocatorMutationJournal {
 
 const EXTENT_HEADER_SIZE: usize = std::mem::size_of::<ExtentHeader>();
 const EXTENT_SIZE: usize = std::mem::size_of::<Extent>();
-const EXTENT_PER_PAGE: usize = (PAGE_SIZE - EXTENT_HEADER_SIZE) / EXTENT_SIZE;
+/// Capacity check for the extent page: the header plus the entry slots it can
+/// hold must fit. The checksum covers the whole page, so the entry slots an
+/// extent leaves unused - and the rest of the page - are zeroed by the writer.
+const EXTENT_ENTRIES_END: usize = PAGE_SIZE;
+const EXTENT_PER_PAGE: usize = (EXTENT_ENTRIES_END - EXTENT_HEADER_SIZE) / EXTENT_SIZE;
+const _: () = assert!(EXTENT_HEADER_SIZE + EXTENT_PER_PAGE * EXTENT_SIZE <= EXTENT_ENTRIES_END);
 
 fn validate_allocator_page_id<E, C>(
     pid: PageId,
@@ -1077,10 +1102,10 @@ fn validate_allocator_page_id<E, C>(
     corruption: &mut C,
 ) -> std::result::Result<(), E>
 where
-    C: FnMut(&'static str, PageId, &'static str) -> E,
+    C: FnMut(CorruptionSite) -> E,
 {
     if !(2..next_page_id).contains(&pid) {
-        return Err(corruption(code, pid, check));
+        return Err(corruption(CorruptionSite::structure(pid, code, check)));
     }
     Ok(())
 }
@@ -1091,7 +1116,7 @@ fn validate_extent_pages_disjoint<E, C>(
     mut corruption: C,
 ) -> std::result::Result<(), E>
 where
-    C: FnMut(&'static str, PageId, &'static str) -> E,
+    C: FnMut(CorruptionSite) -> E,
 {
     for extent in extents {
         let start = u64::from(extent.page_id);
@@ -1100,11 +1125,11 @@ where
             .iter()
             .any(|page_id| start <= u64::from(*page_id) && u64::from(*page_id) < end)
         {
-            return Err(corruption(
-                "ALLOCATOR_STATE_OVERLAP",
+            return Err(corruption(CorruptionSite::structure(
                 extent.page_id,
+                "ALLOCATOR_STATE_OVERLAP",
                 "allocator extents must not cover allocator list pages",
-            ));
+            )));
         }
     }
     Ok(())
@@ -1118,7 +1143,7 @@ fn validate_allocator_sets<E, C>(
     mut corruption: C,
 ) -> std::result::Result<(), E>
 where
-    C: FnMut(&'static str, PageId, &'static str) -> E,
+    C: FnMut(CorruptionSite) -> E,
 {
     let mut intervals = Vec::with_capacity(
         reusable.len() + retired.len() + reusable_pages.len() + retired_pages.len(),
@@ -1142,11 +1167,11 @@ where
         if let Some((_, previous_end, _)) = previous
             && start < previous_end
         {
-            return Err(corruption(
-                "ALLOCATOR_STATE_OVERLAP",
+            return Err(corruption(CorruptionSite::structure(
                 pid,
+                "ALLOCATOR_STATE_OVERLAP",
                 "allocator ownership classes must be disjoint",
-            ));
+            )));
         }
         previous = Some((start, end, pid));
     }
@@ -1161,7 +1186,7 @@ fn read_extent_pages<E, R, C>(
 ) -> std::result::Result<(Vec<Extent>, Vec<PageId>), E>
 where
     R: FnMut(PageId, &mut [u8; PAGE_SIZE]) -> std::result::Result<(), E>,
-    C: FnMut(&'static str, PageId, &'static str) -> E,
+    C: FnMut(CorruptionSite) -> E,
 {
     if root == 0 {
         return Ok((Vec::new(), Vec::new()));
@@ -1182,59 +1207,71 @@ where
             &mut corruption,
         )?;
         if !visited.insert(current) {
-            return Err(corruption(
-                "EXTENT_CYCLE",
+            return Err(corruption(CorruptionSite::structure(
                 current,
+                "EXTENT_CYCLE",
                 "extent chain must be acyclic",
-            ));
+            )));
         }
         pages.push(current);
 
         let mut buf = [0u8; PAGE_SIZE];
         read_page(current, &mut buf)?;
-
+        // Verify the checksum before interpreting the header.
+        if let Err(mismatch) =
+            crate::page::verify_page(&buf, crate::page::HEADER_CRC_OFFSET, current)
+        {
+            return Err(corruption(CorruptionSite::crc(
+                current,
+                "PAGE_CRC_MISMATCH",
+                "crc32c over the whole page",
+                mismatch.expected,
+                mismatch.actual,
+            )));
+        }
+        // An out-of-range count is a structural failure, not a checksum mismatch.
         let header = ExtentHeader::from_slice(&buf);
         if header.count as usize > EXTENT_PER_PAGE {
-            return Err(corruption(
-                "INVALID_EXTENT_COUNT",
+            return Err(corruption(CorruptionSite::structure(
                 current,
+                "INVALID_EXTENT_COUNT",
                 "extent count exceeds page capacity",
-            ));
+            )));
         }
 
         let mut offset = EXTENT_HEADER_SIZE;
         for _ in 0..header.count {
             let entry = Extent::from_slice(&buf[offset..offset + EXTENT_SIZE]);
             if entry.page_id == 0 || entry.nr_pages == 0 {
-                return Err(corruption(
-                    "INVALID_EXTENT_ENTRY",
+                return Err(corruption(CorruptionSite::structure(
                     current,
+                    "INVALID_EXTENT_ENTRY",
                     "extent entry page and length must be non-zero",
-                ));
+                )));
             }
             let start = u64::from(entry.page_id);
             let end = start
                 .checked_add(u64::from(entry.nr_pages))
                 .ok_or_else(|| {
-                    corruption(
-                        "EXTENT_OUT_OF_RANGE",
+                    corruption(CorruptionSite::structure(
                         entry.page_id,
+                        "EXTENT_OUT_OF_RANGE",
                         "extent end must use checked arithmetic within next_page_id",
-                    )
+                    ))
                 })?;
             if start < 2 || end > u64::from(next_page_id) {
-                return Err(corruption(
-                    "EXTENT_OUT_OF_RANGE",
+                return Err(corruption(CorruptionSite::structure(
                     entry.page_id,
+                    "EXTENT_OUT_OF_RANGE",
                     "extent range must stay within [2, next_page_id)",
-                ));
+                )));
             }
             if previous_end.is_some_and(|prev_end| start < prev_end) {
-                return Err(corruption(
-                    "ALLOCATOR_STATE_OVERLAP",
+                return Err(corruption(CorruptionSite::structure(
                     entry.page_id,
+                    "ALLOCATOR_STATE_OVERLAP",
                     "allocator extents within one list must be sorted and disjoint",
-                ));
+                )));
             }
             if let Some(previous) = extents.last_mut() {
                 if previous.end() == start {
@@ -1255,14 +1292,80 @@ where
     Ok((extents, pages))
 }
 
-fn parse_current_meta(buf: &[u8]) -> Result<Option<MetaNode>> {
-    let Ok(s) = MetaNode::decode(buf) else {
-        return Ok(None);
+#[derive(Clone, Copy, Debug)]
+enum MetaCandidate {
+    /// Checksum, magic and format version are valid for this binary.
+    Supported(MetaNode),
+    /// Checksum and magic are valid, but the format version is not one this
+    /// binary may interpret. This is its own outcome, never "invalid slot", so
+    /// a mixed or newer file is rejected instead of silently falling back to
+    /// the other slot.
+    UnsupportedVersion(u32),
+    /// Torn write, all-zero page, wrong magic or bad checksum.
+    Invalid,
+}
+
+enum MetaSelection {
+    Selected(MetaNode),
+    /// No slot is usable at all (both torn/all-zero/bad magic/bad checksum).
+    None,
+    /// At least one slot carries a valid checksum under an unsupported version.
+    UnsupportedVersion {
+        found: u32,
+    },
+    /// One slot is supported while another valid slot disagrees on the version.
+    MixedVersions {
+        found: u32,
+    },
+}
+
+fn meta_candidate(buf: &[u8]) -> MetaCandidate {
+    let Ok(meta) = MetaNode::decode(buf) else {
+        return MetaCandidate::Invalid;
     };
-    Ok(
-        (s.validate().is_ok() && s.magic == MAGIC && s.format_version == FORMAT_VERSION)
-            .then_some(s),
-    )
+    if meta.validate().is_err() || meta.magic != MAGIC {
+        return MetaCandidate::Invalid;
+    }
+    if meta.format_version == FORMAT_VERSION {
+        MetaCandidate::Supported(meta)
+    } else {
+        MetaCandidate::UnsupportedVersion(meta.format_version)
+    }
+}
+
+/// Selects the generation to use, or reports why no generation may be used.
+///
+/// Same version: highest `seq`, ties keep slot A (the existing recovery rule).
+/// Any checksum-valid slot under a different version: refuse, never downgrade
+/// to the other slot and never interpret the file with the wrong capacities.
+fn select_meta(slots: [MetaCandidate; 2]) -> MetaSelection {
+    let mut supported = Vec::new();
+    let mut unsupported = Vec::new();
+    for slot in slots {
+        match slot {
+            MetaCandidate::Supported(meta) => supported.push(meta),
+            MetaCandidate::UnsupportedVersion(found) => unsupported.push(found),
+            MetaCandidate::Invalid => {}
+        }
+    }
+
+    if let Some(found) = unsupported.first().copied() {
+        return if supported.is_empty() {
+            MetaSelection::UnsupportedVersion { found }
+        } else {
+            MetaSelection::MixedVersions { found }
+        };
+    }
+
+    let Some(mut chosen) = supported.first().copied() else {
+        return MetaSelection::None;
+    };
+    for candidate in &supported[1..] {
+        if candidate.seq > chosen.seq {
+            chosen = *candidate;
+        }
+    }
+    MetaSelection::Selected(chosen)
 }
 
 fn open_meta_corruption(
@@ -1281,12 +1384,297 @@ fn open_meta_corruption(
     })
 }
 
-fn parse_open_meta(buf: &[u8]) -> Option<MetaNode> {
-    let Ok(meta) = MetaNode::decode(buf) else {
-        return None;
-    };
-    (meta.validate().is_ok() && meta.magic == MAGIC && meta.format_version == FORMAT_VERSION)
-        .then_some(meta)
+fn open_meta_corruption_with(
+    code: &'static str,
+    generation: Option<u64>,
+    check: &'static str,
+    expected: Option<String>,
+    actual: Option<String>,
+) -> OpenError {
+    OpenError::Corruption(CorruptionReport {
+        code,
+        generation,
+        page_kind: "meta",
+        pid: None,
+        check,
+        expected: expected.map(Into::into),
+        actual: actual.map(Into::into),
+    })
+}
+
+/// Compares open handles, so replacing a pathname cannot change either identity.
+fn same_file_handles(a: &std::fs::File, b: &std::fs::File) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = a.metadata()?;
+        let b = b.metadata()?;
+        Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        #[derive(Default)]
+        struct FileInformation {
+            attributes: u32,
+            creation_time: [u32; 2],
+            access_time: [u32; 2],
+            write_time: [u32; 2],
+            volume: u32,
+            size_high: u32,
+            size_low: u32,
+            links: u32,
+            index_high: u32,
+            index_low: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileInformationByHandle(
+                handle: *mut std::ffi::c_void,
+                information: *mut FileInformation,
+            ) -> i32;
+        }
+        let identity = |file: &std::fs::File| -> io::Result<(u32, u32, u32)> {
+            let mut information = FileInformation::default();
+            // The borrowed handle stays open and the output has the Win32 structure layout.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((
+                information.volume,
+                information.index_high,
+                information.index_low,
+            ))
+        };
+        Ok(identity(a)? == identity(b)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (a, b);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file identity is unavailable",
+        ))
+    }
+}
+
+/// A snapshot must reject aliases too: a hard link would truncate its source.
+fn is_same_file(
+    dst_file: &std::fs::File,
+    source: &std::fs::File,
+    dst: &Path,
+    _source_path: &Path,
+) -> OpenResult<bool> {
+    same_file_handles(dst_file, source)
+        .map_err(|error| snapshot_io_error("file identity", dst, error))
+}
+
+/// Test-only node-class event stream: `alloc` at the PID hand-out,
+/// `write` at the single `write_physical_page` production call site, `read` at the
+/// `read_node_pages` exit. Events are sequenced so a write can be attributed to its
+/// **incarnation** — the PID's most recent preceding `alloc` — because `merge_pending` returns
+/// a freed PID to `reusable` inside the same transaction and the next allocation can hand the
+/// same PID out again; a bare PID cannot tell those two legitimate writes apart.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct NodeIoLog {
+    events: Mutex<Vec<NodeIoEvent>>,
+    flushes: Mutex<Vec<FlushStats>>,
+    cover_calls: Mutex<usize>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FlushStats {
+    pub(crate) dirty_pages: usize,
+    pub(crate) runs: usize,
+    /// The PIDs the flush handed over, so a test can assert the `Dirty` tier it observed is a subset
+    /// of what actually reached the disk.
+    pub(crate) pids: Vec<PageId>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NodeIoKind {
+    Alloc,
+    Write,
+    Read,
+    Cover,
+    /// Shared-cache backfill. Tests assert zero of these for a transaction's own
+    /// pages, which is the observable form of "transaction-private pages never enter the cache".
+    CachePut,
+    /// A read answered from a resident overlay entry (an overlay hit).
+    /// Recorded separately from a shared-cache hit, so a warmed `NodeCache` can never be mistaken
+    /// for overlay residency.
+    OverlayHit,
+    Release,
+    OverlayMiss,
+    /// Page-class events, counted separately so the `strace` total is
+    /// decomposable into classes: `Write`/`Read` above stay **node-only**, while
+    /// these carry the other classes and never merge into them.
+    ValueWrite,
+    IndirectWrite,
+    AllocatorWrite,
+    MetaWrite,
+    ValueRead,
+    IndirectRead,
+    MetaRead,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NodeIoEvent {
+    pub(crate) kind: NodeIoKind,
+    pub(crate) pid: PageId,
+}
+
+#[cfg(test)]
+impl NodeIoLog {
+    fn record(&self, kind: NodeIoKind, pid: PageId) {
+        self.events.lock().push(NodeIoEvent { kind, pid });
+    }
+
+    pub(crate) fn record_alloc(&self, pid: PageId) {
+        self.record(NodeIoKind::Alloc, pid);
+    }
+
+    pub(crate) fn record_write(&self, pid: PageId) {
+        self.record(NodeIoKind::Write, pid);
+    }
+
+    pub(crate) fn record_read(&self, pid: PageId) {
+        self.record(NodeIoKind::Read, pid);
+    }
+
+    /// Dense-coverage zero-page write. It is recorded with the PID whose slot it
+    /// fills so a report can name the offset, but it never counts as a node write.
+    pub(crate) fn record_cover(&self, pid: PageId) {
+        self.record(NodeIoKind::Cover, pid);
+    }
+
+    pub(crate) fn covers(&self) -> Vec<PageId> {
+        self.class_pids(NodeIoKind::Cover)
+    }
+
+    /// Records a shared-cache backfill at the point *before* `cache.put`.
+    pub(crate) fn record_cache_put(&self, pid: PageId) {
+        self.record(NodeIoKind::CachePut, pid);
+    }
+
+    pub(crate) fn cache_puts(&self) -> Vec<PageId> {
+        self.class_pids(NodeIoKind::CachePut)
+    }
+
+    /// Records a released PID (the third event class, at the `drop_overlay_pages`
+    /// choke point every leaving point goes through).
+    pub(crate) fn record_release(&self, pid: PageId) {
+        self.record(NodeIoKind::Release, pid);
+    }
+
+    pub(crate) fn releases(&self) -> Vec<PageId> {
+        self.class_pids(NodeIoKind::Release)
+    }
+
+    /// Records a whole page class at once (per-class evidence).
+    pub(crate) fn record_many(&self, kind: NodeIoKind, pids: &[PageId]) {
+        for pid in pids {
+            self.record(kind, *pid);
+        }
+    }
+
+    /// Every PID recorded for one class, in order.
+    pub(crate) fn class_pids(&self, kind: NodeIoKind) -> Vec<PageId> {
+        self.events()
+            .into_iter()
+            .filter(|event| event.kind == kind)
+            .map(|event| event.pid)
+            .collect()
+    }
+
+    /// Records an overlay miss on a transaction-owned PID.
+    pub(crate) fn record_overlay_miss(&self, pid: PageId) {
+        self.record(NodeIoKind::OverlayMiss, pid);
+    }
+
+    /// Records a read answered from a resident overlay entry.
+    pub(crate) fn record_overlay_hit(&self, pid: PageId) {
+        self.record(NodeIoKind::OverlayHit, pid);
+    }
+
+    pub(crate) fn overlay_hits(&self) -> Vec<PageId> {
+        self.class_pids(NodeIoKind::OverlayHit)
+    }
+
+    /// Records one commit flush's shape.
+    pub(crate) fn record_flush(&self, stats: FlushStats) {
+        self.flushes.lock().push(stats);
+    }
+
+    pub(crate) fn flushes(&self) -> Vec<FlushStats> {
+        self.flushes.lock().clone()
+    }
+
+    /// Counts a call to the dense-coverage step, whether or not its gate triggered — asserts
+    /// "called once per publication, wrote a zero page only when the gate was true".
+    pub(crate) fn record_cover_call(&self) {
+        *self.cover_calls.lock() += 1;
+    }
+
+    pub(crate) fn cover_calls(&self) -> usize {
+        *self.cover_calls.lock()
+    }
+
+    pub(crate) fn events(&self) -> Vec<NodeIoEvent> {
+        self.events.lock().clone()
+    }
+
+    pub(crate) fn writes(&self) -> Vec<PageId> {
+        self.class_pids(NodeIoKind::Write)
+    }
+
+    pub(crate) fn reads(&self) -> Vec<PageId> {
+        self.class_pids(NodeIoKind::Read)
+    }
+
+    /// Largest number of writes attributed to one `(PID, incarnation)`: the
+    /// incarnation is identified by the sequence slot of the PID's most recent preceding
+    /// `alloc` event, so a PID that was released and handed out again starts a fresh count.
+    pub(crate) fn max_writes_per_incarnation(&self) -> usize {
+        let mut current: std::collections::HashMap<PageId, usize> =
+            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<(PageId, usize), usize> =
+            std::collections::HashMap::new();
+        let mut max = 0;
+        for (slot, event) in self.events().into_iter().enumerate() {
+            match event.kind {
+                NodeIoKind::Alloc => {
+                    current.insert(event.pid, slot);
+                }
+                NodeIoKind::Write => {
+                    if let Some(&incarnation) = current.get(&event.pid) {
+                        let count = counts.entry((event.pid, incarnation)).or_default();
+                        *count += 1;
+                        max = max.max(*count);
+                    }
+                }
+                NodeIoKind::Read
+                | NodeIoKind::Cover
+                | NodeIoKind::CachePut
+                | NodeIoKind::OverlayHit
+                | NodeIoKind::OverlayMiss
+                | NodeIoKind::Release
+                | NodeIoKind::ValueWrite
+                | NodeIoKind::IndirectWrite
+                | NodeIoKind::AllocatorWrite
+                | NodeIoKind::MetaWrite
+                | NodeIoKind::ValueRead
+                | NodeIoKind::IndirectRead
+                | NodeIoKind::MetaRead => {}
+            }
+        }
+        max
+    }
 }
 
 pub(crate) struct Store {
@@ -1302,14 +1690,69 @@ pub(crate) struct Store {
     retired_pages: Mutex<Vec<PageId>>,
     file_extended: AtomicBool,
     sync_mode: SyncMode,
+    /// Serializes snapshots of this database.
+    snapshot_lock: Mutex<()>,
+    /// Test-only node-class I/O log.
+    #[cfg(test)]
+    pub(crate) node_io: NodeIoLog,
+}
+
+/// Copy chunk for `Store::take_snapshot`: one buffer per call, reused per chunk.
+const SNAPSHOT_COPY_CHUNK: usize = 1 << 20;
+
+/// Value I/O staging cap: one buffer per batch operation, reused across the runs
+/// of that operation, holding at most this many physical pages (1 MiB).
+///
+/// The cap bounds the peak memory of one value operation; the buffer itself is
+/// allocated once per operation and sized to the pages that operation actually
+/// touches, so a small value never pays for the cap.
+pub(crate) const VALUE_STAGING_PAGES: usize = (1 << 20) / PAGE_SIZE;
+const _: () = assert!(VALUE_STAGING_PAGES * PAGE_SIZE == 1 << 20);
+
+/// Pages of staging one value operation needs: what it touches, capped by
+/// [`VALUE_STAGING_PAGES`] so a large value is still copied in bounded chunks.
+///
+/// Never zero: `chunks` needs a non-zero chunk size, and an empty page list (a
+/// zero-length value) simply never uses the buffer.
+fn staging_pages(page_count: usize) -> usize {
+    page_count.clamp(1, VALUE_STAGING_PAGES)
+}
+
+fn snapshot_io_error(operation: &'static str, path: &Path, source: io::Error) -> OpenError {
+    OpenError::Io(OpenIoError {
+        operation,
+        path: path.to_path_buf(),
+        offset: None,
+        length: None,
+        source,
+    })
 }
 
 impl Store {
+    pub(crate) fn path_is_same_file(&self, path: &Path) -> io::Result<bool> {
+        let named = std::fs::File::open(path)?;
+        same_file_handles(&self.file.raw.file, &named)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pread_exact(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.file.raw.file.pread_exact(buf, offset)
+    }
+
     pub(crate) fn open<P: AsRef<Path>>(path: P, options: &OpenOptions) -> OpenResult<Self> {
         let path = path.as_ref();
-        let (opening, is_new) = OpeningStore::open(path)?;
+        let (opening, is_new) = OpeningStore::open(path, options.read_only)?;
 
         let sb = if is_new {
+            if options.read_only {
+                // A zero-length file has no meta page to serve, and read-only
+                // opens must not turn it into a new database.
+                return Err(open_meta_corruption(
+                    "NO_VALID_META",
+                    None,
+                    "read-only open of an empty file",
+                ));
+            }
             let mut sb = MetaNode::new();
             opening.reserve_meta_pages()?;
             opening.pwrite_all(sb.as_page_slice(), 0)?;
@@ -1321,29 +1764,39 @@ impl Store {
             sb
         } else {
             let sb0 = match opening.read_meta_page(0)? {
-                Some(buf) => parse_open_meta(&buf),
-                None => None,
+                Some(buf) => meta_candidate(&buf),
+                None => MetaCandidate::Invalid,
             };
             let sb1 = match opening.read_meta_page(PAGE_SIZE as u64)? {
-                Some(buf) => parse_open_meta(&buf),
-                None => None,
+                Some(buf) => meta_candidate(&buf),
+                None => MetaCandidate::Invalid,
             };
 
-            match (sb0, sb1) {
-                (Some(s0), Some(s1)) => {
-                    if s0.seq >= s1.seq {
-                        s0
-                    } else {
-                        s1
-                    }
-                }
-                (Some(s0), _) => s0,
-                (_, Some(s1)) => s1,
-                _ => {
+            match select_meta([sb0, sb1]) {
+                MetaSelection::Selected(meta) => meta,
+                MetaSelection::None => {
                     return Err(open_meta_corruption(
                         "NO_VALID_META",
                         None,
                         "neither meta page is valid",
+                    ));
+                }
+                MetaSelection::UnsupportedVersion { found } => {
+                    return Err(open_meta_corruption_with(
+                        "UNSUPPORTED_FORMAT_VERSION",
+                        None,
+                        "the file's format version is not supported by this build",
+                        Some(FORMAT_VERSION.to_string()),
+                        Some(found.to_string()),
+                    ));
+                }
+                MetaSelection::MixedVersions { found } => {
+                    return Err(open_meta_corruption_with(
+                        "MIXED_FORMAT_VERSIONS",
+                        None,
+                        "meta slots disagree on the format version",
+                        Some(FORMAT_VERSION.to_string()),
+                        Some(found.to_string()),
                     ));
                 }
             }
@@ -1373,6 +1826,9 @@ impl Store {
             retired_pages: Mutex::new(retired_pages),
             file_extended: AtomicBool::new(false),
             sync_mode: options.sync_mode,
+            snapshot_lock: Mutex::new(()),
+            #[cfg(test)]
+            node_io: NodeIoLog::default(),
         };
         Ok(store)
     }
@@ -1387,26 +1843,30 @@ impl Store {
             reusable_root,
             next_page_id,
             |current, buf| {
+                #[cfg(test)]
+                self.node_io.record(NodeIoKind::MetaRead, current);
                 self.file
                     .pread_exact(buf, current as u64 * PAGE_SIZE as u64)
             },
-            |_, _, _| Error::Corruption,
+            |site| self.abort_site(site, "extent"),
         )?;
         let (retired, retired_pages) = read_extent_pages(
             retired_root,
             next_page_id,
             |current, buf| {
+                #[cfg(test)]
+                self.node_io.record(NodeIoKind::MetaRead, current);
                 self.file
                     .pread_exact(buf, current as u64 * PAGE_SIZE as u64)
             },
-            |_, _, _| Error::Corruption,
+            |site| self.abort_site(site, "extent"),
         )?;
         validate_allocator_sets(
             &reusable,
             &reusable_pages,
             &retired,
             &retired_pages,
-            |_, _, _| Error::Corruption,
+            |site| self.abort_site(site, "extent"),
         )?;
         Ok((
             ExtentSet::from_extents(reusable),
@@ -1476,11 +1936,15 @@ impl Store {
         if EXTENT_PER_PAGE == 0 {
             return Err(Error::Corruption);
         }
+        #[cfg(test)]
+        self.node_io
+            .record_many(NodeIoKind::AllocatorWrite, page_ids);
 
         let mut extents = extents.into_iter();
         let mut page = [0u8; PAGE_SIZE];
         for (i, &pid) in page_ids.iter().enumerate() {
             let mut header = ExtentHeader {
+                checksum: 0,
                 next: if i + 1 < page_ids.len() {
                     page_ids[i + 1]
                 } else {
@@ -1502,6 +1966,7 @@ impl Store {
 
             header.count = count as u32;
             page[..EXTENT_HEADER_SIZE].copy_from_slice(header.as_slice());
+            crate::page::seal_page(&mut page, crate::page::HEADER_CRC_OFFSET, pid);
 
             self.file.pwrite_all(&page, pid as u64 * PAGE_SIZE as u64)?;
             if i + 1 < page_ids.len() {
@@ -1527,22 +1992,12 @@ impl Store {
         observer: &dyn PageReuseObserver,
         journal: &mut AllocatorMutationJournal,
     ) -> Result<(Vec<PageId>, Vec<PageId>)> {
-        // Allocator-list pages are dependencies of the new generation. Allocate
-        // them through the normal allocator and write them before publishing
-        // their roots.
         let mut pages = Vec::new();
         const MAX_ROUND: u32 = 32;
-        // Allocating list pages consumes reusable extents, which can reduce the
-        // number of encoded extent entries. Recompute the layout after each
-        // allocation; the bound is only a non-convergence guard, not a page
-        // count limit.
         for _ in 0..MAX_ROUND {
             let needed = Self::extent_pages_needed(reusable.len())
                 + Self::extent_pages_needed(retired.len());
             if pages.len() >= needed {
-                // Keep already reserved pages as empty reusable-list pages when
-                // the extent count shrank, rather than leaving their PIDs
-                // without an ownership class.
                 let reusable_count = Self::extent_pages_needed(reusable.len())
                     .max(pages.len() - Self::extent_pages_needed(retired.len()));
                 let retired_pages = pages.split_off(reusable_count);
@@ -1577,6 +2032,25 @@ impl Store {
         } else {
             0
         };
+        // The last instant before the meta slot becomes durable state, where a
+        // publication must already cover the id space it is about to declare.
+        #[cfg(test)]
+        {
+            let hook = BEFORE_META_SLOT_WRITE.lock().clone();
+            if let Some(hook) = hook {
+                hook(PublicationPoint {
+                    next_page_id: sb.next_page_id,
+                    file_len: self.live_file_len(),
+                    seq: sb.seq,
+                    write_offset,
+                });
+            }
+        }
+        #[cfg(test)]
+        self.node_io.record(
+            NodeIoKind::MetaWrite,
+            (write_offset / PAGE_SIZE as u64) as PageId,
+        );
         self.file.pwrite_all(sb.as_page_slice(), write_offset)?;
         self.sync_publication()?;
         self.file.set_generation(sb.seq);
@@ -1659,9 +2133,10 @@ impl Store {
 
         let result = (|| {
             // A generation-only publication keeps the outer transaction's
-            // unpublished allocations quarantined. A normal commit adopts
-            // those pages into the new roots instead. In both cases remove
-            // them from any allocator extent before the new lists are built.
+            // unpublished allocations quarantined. A normal commit adopts them
+            // into the new roots, and both an adopting commit and a deferred
+            // one remove those pages from the old allocator extents before the
+            // new lists are built.
             for &pid in adopted_alloc {
                 journal.remove(ExtentSetKind::Reusable, &mut reusable, pid, 1);
                 journal.remove(ExtentSetKind::Retired, &mut retired, pid, 1);
@@ -1671,8 +2146,6 @@ impl Store {
                 journal.remove(ExtentSetKind::Retired, &mut retired, pid, 1);
             }
 
-            // Generation g+1 may reuse the prior generation's quarantine, but all
-            // allocator pages reachable from g remain quarantined until g+1 commits.
             let mut next_retired = ExtentSet::default();
             for &(pid, nr) in pending_free {
                 next_retired.add(pid, nr);
@@ -1693,7 +2166,6 @@ impl Store {
                 next_retired.add(pid, 1);
             }
             // Move the current generation's retired extents to reusable state while
-            // constructing the next generation, unless an in-flight reader pinned
             // before the current epoch can still reference them. Deferred extents
             // stay quarantined and are published with the next generation instead.
             // Promotion is safe only while no in-flight reader can still
@@ -1764,6 +2236,129 @@ impl Store {
     pub(crate) fn shared_snapshot(&self) -> (u64, PageId) {
         let snapshot = self.shared.snapshot();
         (snapshot.seq, snapshot.catalog_root)
+    }
+
+    /// Writes a snapshot of the current published state to `dst`.
+    ///
+    /// `dst` is used exactly as given: it is created if missing and truncated if
+    /// present, and a failed call can leave a partial file behind. The snapshot
+    /// equals the generation named by the returned `seq`: its page bytes are
+    /// pinned while they are read, so commits running meanwhile are neither
+    /// blocked nor included.
+    pub(crate) fn take_snapshot(&self, dst: &Path) -> OpenResult<Snapshot> {
+        let _serial = self.snapshot_lock.lock();
+
+        let (snapshot, dst_file) = {
+            let _pin = self.epoch.pin();
+            let snapshot = self.shared.snapshot();
+            let source = &self.file.raw.file;
+            let source_path: &Path = self.file.raw.path.as_ref();
+            let len = source
+                .metadata()
+                .map_err(|error| snapshot_io_error("metadata", source_path, error))?
+                .len();
+
+            let dst_file = FileOpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dst)
+                .map_err(|error| snapshot_io_error("create", dst, error))?;
+            if is_same_file(&dst_file, &self.file.raw.file, dst, source_path)? {
+                return Err(snapshot_io_error(
+                    "open",
+                    dst,
+                    io::Error::other("destination is this store's own file"),
+                ));
+            }
+            // Truncate by hand, after the identity check above: opening with
+            // `truncate(true)` would destroy the store before we could reject
+            // it, and a mistyped backup path must never truncate the live
+            // database. Whatever the caller left at the destination therefore
+            // starts from empty, so a failed copy leaves a partial file rather
+            // than a mix of old and new contents.
+            dst_file
+                .set_len(0)
+                .map_err(|error| snapshot_io_error("set_len", dst, error))?;
+
+            let mut buffer = vec![0u8; SNAPSHOT_COPY_CHUNK];
+            let mut offset = 0u64;
+            while offset < len {
+                let count = (len - offset).min(SNAPSHOT_COPY_CHUNK as u64) as usize;
+                let chunk = &mut buffer[..count];
+                FileIO::pread_exact(source, chunk, offset)
+                    .map_err(|error| snapshot_io_error("pread", source_path, error))?;
+                FileIO::pwrite_all(&dst_file, chunk, offset)
+                    .map_err(|error| snapshot_io_error("pwrite", dst, error))?;
+                offset += count as u64;
+            }
+            (snapshot, dst_file)
+        };
+
+        // slots can name a newer generation whose pages this snapshot does not hold.
+        let mut meta = MetaNode {
+            magic: MAGIC,
+            seq: snapshot.seq,
+            format_version: FORMAT_VERSION,
+            catalog_root: snapshot.catalog_root,
+            next_page_id: snapshot.next_page_id,
+            reusable_root: snapshot.reusable_root,
+            retired_root: snapshot.retired_root,
+            checksum: 0,
+        };
+        meta.update_checksum();
+        for slot in [0u64, PAGE_SIZE as u64] {
+            FileIO::pwrite_all(&dst_file, meta.as_page_slice(), slot)
+                .map_err(|error| snapshot_io_error("pwrite", dst, error))?;
+        }
+        // The source only grows, so the copy can carry bytes past the frozen
+        // `next_page_id` (pages appended after the freeze). They sit outside the
+        // snapshot's page-id space and would be dead weight forever, so the file
+        // is cut back to that id space: the snapshot is never grown beyond its
+        // frozen `next_page_id`, so nothing past it is carried over.
+        let id_space = u64::from(snapshot.next_page_id) * PAGE_SIZE as u64;
+        let copied_len = dst_file
+            .metadata()
+            .map_err(|error| snapshot_io_error("metadata", dst, error))?
+            .len();
+        if copied_len > id_space {
+            dst_file
+                .set_len(id_space)
+                .map_err(|error| snapshot_io_error("set_len", dst, error))?;
+        }
+        dst_file
+            .sync_all()
+            .map_err(|error| snapshot_io_error("sync_all", dst, error))?;
+        // Make the destination's directory entry durable too, so an `Ok` snapshot
+        // survives a crash of the machine, not only of this process.
+        sync_parent_dir(dst).map_err(|error| snapshot_io_error("sync_dir", dst, error))?;
+
+        Ok(Snapshot {
+            seq: snapshot.seq,
+            path: dst.to_path_buf(),
+        })
+    }
+
+    /// Pages this generation can hand out again: reusable extents, retired
+    /// extents (quarantined, promoted later), and the allocator list pages that
+    /// describe them.
+    #[cfg(test)]
+    pub(crate) fn free_page_count_for_test(&self) -> usize {
+        let reusable = self.reusable.lock();
+        let retired = self.retired.lock();
+        let reusable_pages = self.reusable_pages.lock();
+        let retired_pages = self.retired_pages.lock();
+        reusable
+            .iter()
+            .map(|extent| extent.nr_pages as usize)
+            .sum::<usize>()
+            + retired
+                .iter()
+                .map(|extent| extent.nr_pages as usize)
+                .sum::<usize>()
+            + reusable_pages.len()
+            + retired_pages.len()
     }
 
     #[cfg(test)]
@@ -1902,10 +2497,11 @@ impl Store {
 
         let mut reusable = self.reusable.lock();
         let mut retired = self.retired.lock();
-        // A page allocated by an outer transaction may have been placed in
-        // durable quarantine by an intermediate nested-rollback publication.
-        // Releasing that outer transaction removes the reservation from the
-        // in-memory projection before returning the page to reusable space.
+        // A page allocated by an outer transaction may have been placed in durable
+        // quarantine by an intermediate nested-rollback publication. Releasing that
+        // outer transaction removes the reservation from the in-memory projection
+        // before returning the page to reusable space; both sets are mutex-guarded
+        // and no I/O happens here, so nothing observes an intermediate state.
         retired.remove(page_id, nr_pages);
         reusable.add(page_id, nr_pages);
 
@@ -1929,37 +2525,118 @@ impl Store {
     }
 
     pub(crate) fn read_node(&self, id: DataPid, mut page: AlignedPage) -> Result<Arc<Node>> {
-        self.read_data(&[id.get()], page.as_mut_slice())?;
+        self.read_node_pages(&[id.get()], page.as_mut_slice())?;
         Ok(self.decode_live_node(id, page))
     }
 
     pub(crate) fn read_node_without_cache(&self, id: DataPid) -> Arc<Node> {
-        // Read directly into an aligned node page for the uncached iterator path.
         let mut page = AlignedPage::new();
         physical_value(
-            self.read_data(&[id.get()], page.as_mut_slice()),
+            self.read_node_pages(&[id.get()], page.as_mut_slice()),
             "physical page load",
         );
         self.decode_live_node(id, page)
     }
 
+    /// Loads an *indirect* page (an overflow index page) and verifies its whole
+    /// page: it carries no count, so nothing but its own bytes and the expected
+    /// page id enter the check.
     pub(crate) fn load_page(&self, id: DataPid) -> Vec<u8> {
+        #[cfg(test)]
+        self.node_io.record(NodeIoKind::IndirectRead, id.get());
         let mut buf = vec![0u8; PAGE_SIZE];
-        if let Err(e) = self.read_data(&[id.get()], &mut buf) {
-            abort_store_fault(e, "physical page load")
-        } else {
-            buf
+        if let Err(e) = self.read_page_runs([id.get()], &mut buf) {
+            abort_store_fault(e, "physical page load");
         }
+        if let Err(mismatch) =
+            crate::page::verify_page(&buf, crate::page::TRAILER_CRC_OFFSET, id.get())
+        {
+            self.abort_crc_mismatch(mismatch, id.get(), "indirect");
+        }
+        buf
     }
 
+    /// Physical node-page-array read: `buf` must hold exactly one `PAGE_SIZE` per
+    /// PID, every node page must verify its header checksum against its own PID,
+    /// and nothing may be silently dropped. A mismatch records the diagnostic here
+    /// (expected and actual CRC, PID) and terminates: the live boundary.
+    ///
+    /// Node pages only: the header checksum rule ([`crate::page::HEADER_CRC_OFFSET`])
+    /// is fixed here, so another page class has to go through its own loader
+    /// ([`Self::load_page`], [`Self::load_data_pids`]).
+    pub(crate) fn read_node_pages(&self, pages: &[PageId], buf: &mut [u8]) -> Result<()> {
+        if buf.len() != pages.len() * PAGE_SIZE {
+            self.corrupt_page(
+                "PAGE_ARRAY_LENGTH",
+                None,
+                "physical read length must be an exact page multiple",
+            );
+        }
+        self.read_page_runs(pages.iter().copied(), buf)?;
+        for (index, &pid) in pages.iter().enumerate() {
+            let page = &buf[index * PAGE_SIZE..(index + 1) * PAGE_SIZE];
+            if let Err(mismatch) =
+                crate::page::verify_page(page, crate::page::HEADER_CRC_OFFSET, pid)
+            {
+                self.abort_crc_mismatch(mismatch, pid, "node");
+            }
+        }
+        #[cfg(test)]
+        {
+            for &pid in pages {
+                self.node_io.record_read(pid);
+            }
+        }
+        Ok(())
+    }
+
+    /// Logical value read.
+    ///
+    /// `pages` must be exactly `ceil(len / TRAILER_CONTENT_SIZE)` physical pages
+    /// (zero pages for a zero-length value). Every page is read in full and
+    /// verified before its valid prefix is copied out, so media damage inside a
+    /// page's content is caught even when the caller only wants the last bytes.
+    /// The unused tail of the final page is covered by the checksum, so it must be
+    /// the writer's zeroed, deterministic tail: a writer that sealed a page it never
+    /// fully initialized would make every read of it a checksum failure.
     pub(crate) fn load_data_pids(&self, pages: &[DataPid], len: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
-        self.read_page_runs(pages.iter().map(|page_id| page_id.get()), &mut buf)?;
-        Ok(buf)
-    }
+        let expected_pages = len.div_ceil(crate::page::TRAILER_CONTENT_SIZE);
+        if pages.len() != expected_pages {
+            self.corrupt_page(
+                "VALUE_PAGE_COUNT",
+                pages.first().map(|page| page.get()),
+                "value page count must equal ceil(len / TRAILER_CONTENT_SIZE)",
+            );
+        }
 
-    pub(crate) fn read_data(&self, pages: &[PageId], buf: &mut [u8]) -> Result<()> {
-        self.read_page_runs(pages.iter().copied(), buf)
+        let mut buf = vec![0u8; len];
+        let staging_pages = staging_pages(pages.len());
+        let mut staging = vec![0u8; staging_pages * PAGE_SIZE];
+        let mut copied = 0usize;
+
+        for chunk in pages.chunks(staging_pages) {
+            let span = chunk.len() * PAGE_SIZE;
+            let staging = &mut staging[..span];
+            #[cfg(test)]
+            self.node_io.record_many(
+                NodeIoKind::ValueRead,
+                &chunk.iter().map(|page| page.get()).collect::<Vec<_>>(),
+            );
+            self.read_page_runs(chunk.iter().map(|page| page.get()), staging)?;
+
+            for (index, page_id) in chunk.iter().enumerate() {
+                let page = &staging[index * PAGE_SIZE..(index + 1) * PAGE_SIZE];
+                let take = (len - copied).min(crate::page::TRAILER_CONTENT_SIZE);
+                if let Err(mismatch) =
+                    crate::page::verify_page(page, crate::page::TRAILER_CRC_OFFSET, page_id.get())
+                {
+                    self.abort_crc_mismatch(mismatch, page_id.get(), "value");
+                }
+                buf[copied..copied + take].copy_from_slice(&page[..take]);
+                copied += take;
+            }
+        }
+        Ok(buf)
     }
 
     fn read_page_runs<I>(&self, pages: I, buf: &mut [u8]) -> Result<()>
@@ -1969,12 +2646,17 @@ impl Store {
         let mut run_start = None;
         let mut run_buf_start = 0usize;
         let mut run_len = 0usize;
+        let mut count = 0usize;
 
         for (page_index, page_id) in pages.into_iter().enumerate() {
-            let start = page_index * PAGE_SIZE;
-            if start >= buf.len() {
-                break;
+            if (page_index + 1) * PAGE_SIZE > buf.len() {
+                self.corrupt_page(
+                    "PAGE_ARRAY_COUNT",
+                    Some(page_id),
+                    "physical read has more pages than the buffer holds",
+                );
             }
+            count += 1;
 
             let contiguous = run_start
                 .is_some_and(|first| u64::from(page_id) == u64::from(first) + run_len as u64);
@@ -1993,6 +2675,13 @@ impl Store {
         if let Some(first) = run_start {
             self.read_page_run(first, run_buf_start, run_len, buf)?;
         }
+        if count * PAGE_SIZE != buf.len() {
+            self.corrupt_page(
+                "PAGE_ARRAY_COUNT",
+                None,
+                "physical read has fewer pages than the buffer expects",
+            );
+        }
         Ok(())
     }
 
@@ -2004,27 +2693,33 @@ impl Store {
         buf: &mut [u8],
     ) -> Result<()> {
         let start = first_buf_page * PAGE_SIZE;
-        let end = std::cmp::min(start + nr_pages * PAGE_SIZE, buf.len());
+        let end = start + nr_pages * PAGE_SIZE;
         self.file
             .pread_exact(&mut buf[start..end], first_page as u64 * PAGE_SIZE as u64)
     }
 
-    pub(crate) fn write_data(&self, pages: &[PageId], data: &[u8]) -> Result<()> {
+    /// Physical page-array write. Every page must already carry its CRC trailer
+    /// for the PID it is written as; the caller seals it (see
+    /// [`Self::write_physical_page`] and [`Self::write_physical_pages`]).
+    fn write_page_runs(&self, pages: &[PageId], buf: &[u8]) -> Result<()> {
+        if buf.len() != pages.len() * PAGE_SIZE {
+            self.corrupt_page(
+                "PAGE_ARRAY_LENGTH",
+                None,
+                "physical write length must be an exact page multiple",
+            );
+        }
+
         let mut run_start = None;
         let mut run_data_page = 0usize;
         let mut run_len = 0usize;
 
         for (page_index, &page_id) in pages.iter().enumerate() {
-            let start = page_index * PAGE_SIZE;
-            if start >= data.len() {
-                break;
-            }
-
             let contiguous = run_start
                 .is_some_and(|first| u64::from(page_id) == u64::from(first) + run_len as u64);
             if !contiguous {
                 if let Some(first) = run_start {
-                    self.write_page_run(first, run_data_page, run_len, data)?;
+                    self.write_page_run(first, run_data_page, run_len, buf)?;
                 }
                 run_start = Some(page_id);
                 run_data_page = page_index;
@@ -2035,20 +2730,189 @@ impl Store {
         }
 
         if let Some(first) = run_start {
-            self.write_page_run(first, run_data_page, run_len, data)?;
+            self.write_page_run(first, run_data_page, run_len, buf)?;
         }
         Ok(())
     }
 
-    pub(crate) fn write_page_result(&self, page_id: PageId, data: &[u8]) -> Result<()> {
-        self.write_data(&[page_id], data)
-    }
-
-    pub(crate) fn write_page(&self, id: DataPid, data: &[u8]) {
+    /// Writes one sealed physical page (node write path). The page buffer is
+    /// sealed in place with `id`, so no copy of the 4096 bytes is made.
+    pub(crate) fn write_physical_page(&self, id: DataPid, page: &mut [u8]) {
+        crate::page::seal_page(page, crate::node::PLAIN_CHECKSUM_OFFSET, id.get());
         physical_value(
-            self.write_page_result(id.get(), data),
+            self.write_page_runs(&[id.get()], page),
             "physical page write",
         );
+    }
+
+    /// Commit flush (step 1): `pages` must already be sorted by PID. Each contiguous
+    /// run is copied into a staging buffer, sealed there with its final PID, and written in one
+    /// `pwrite_all`; the resident entries are **not** mutated, so a Clean entry's in-memory bytes
+    /// differ from disk only in the checksum field, which no read path checks
+    /// implementation note.
+    ///
+    /// This is the flush-path node-write accounting point: value/indirect pages
+    /// never come through here, so `write_page_runs` stays free of node-only counters.
+    pub(crate) fn write_node_runs(&self, pages: &[(PageId, Arc<crate::node::Node>)]) -> Result<()> {
+        let mut staging: Vec<u8> = Vec::new();
+        let mut index = 0usize;
+        #[cfg(test)]
+        let mut runs = 0usize;
+        while index < pages.len() {
+            let mut end = index + 1;
+            while end < pages.len() && pages[end].0 == pages[end - 1].0 + 1 {
+                end += 1;
+            }
+            let run_len = end - index;
+            #[cfg(test)]
+            {
+                runs += 1;
+            }
+            staging.resize(run_len * PAGE_SIZE, 0);
+            for (slot, (pid, node)) in pages[index..end].iter().enumerate() {
+                let start = slot * PAGE_SIZE;
+                let target = &mut staging[start..start + PAGE_SIZE];
+                target.copy_from_slice(node.finalize());
+                crate::page::seal_page(target, crate::node::PLAIN_CHECKSUM_OFFSET, *pid);
+            }
+            let run: Vec<PageId> = pages[index..end].iter().map(|(pid, _)| *pid).collect();
+            // Exactly this run's bytes: the buffer is reused across runs and never shrinks, so
+            self.write_page_runs(&run, &staging[..run_len * PAGE_SIZE])?;
+            #[cfg(test)]
+            for pid in &run {
+                self.node_io.record_write(*pid);
+            }
+            index = end;
+        }
+        #[cfg(test)]
+        self.node_io.record_flush(FlushStats {
+            dirty_pages: pages.len(),
+            runs,
+            pids: pages.iter().map(|(pid, _)| *pid).collect(),
+        });
+        Ok(())
+    }
+
+    /// Live file length in bytes. The dense-coverage gate must read the **live** file — never a
+    /// snapshot target, never a cached or derived value — and `FileIO` has no
+    /// length accessor, so this is the thin method the cover step needs. A failing `metadata`
+    /// call is an I/O fault like any other on the live path.
+    pub(crate) fn live_file_len(&self) -> u64 {
+        match self.file.raw.file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(source) => self.file.io_fault("metadata", None, None, source),
+        }
+    }
+
+    /// Dense coverage: when the live file is shorter than the id space,
+    /// write one 4 KiB all-zero page at the highest allocated slot so the length covers
+    /// `next_page_id * PAGE_SIZE` again. It is a real data write, so the growth is durable through
+    /// the ordinary dependency sync; `file_extended` is set exactly as the allocator's monotonic
+    /// branch does, which is what upgrades that sync under `SyncMode::Adaptive`.
+    pub(crate) fn cover_id_space(&self, next_page_id: PageId) {
+        #[cfg(test)]
+        self.node_io.record_cover_call();
+        if next_page_id == 0 {
+            return;
+        }
+        let high_water = u64::from(next_page_id) * PAGE_SIZE as u64;
+        if self.live_file_len() >= high_water {
+            return;
+        }
+        let last = next_page_id - 1;
+        physical_value(
+            self.file
+                .pwrite_all(&[0u8; PAGE_SIZE], u64::from(last) * PAGE_SIZE as u64),
+            "dense coverage write",
+        );
+        self.file_extended.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        self.node_io.record_cover(last);
+    }
+
+    /// Writes several physical pages. This only writes: every caller seals each
+    /// page over its whole 4096 bytes first, the indirect chain builder doing it
+    /// with the page's own PID and its never-filled id slots left zero. A page
+    /// handed over unsealed would not verify on read, so there is no such caller.
+    pub(crate) fn write_physical_pages(&self, pages: &[PageId], buf: &mut [u8]) -> Result<()> {
+        if buf.len() != pages.len() * PAGE_SIZE {
+            self.corrupt_page(
+                "PAGE_ARRAY_LENGTH",
+                None,
+                "physical write length must be an exact page multiple",
+            );
+        }
+        self.write_page_runs(pages, buf)
+    }
+
+    /// Logical value write.
+    ///
+    /// Packs `value` into exactly `ceil(len / TRAILER_CONTENT_SIZE)` pages, seals
+    /// each over its whole page and writes the run. The bytes a page does not use are
+    /// zeroed, so the covered page is deterministic instead of carrying a reused
+    /// staging buffer's leftovers. The staging buffer is bounded (see
+    /// [`VALUE_STAGING_PAGES`]).
+    pub(crate) fn write_value_pages(&self, pages: &[PageId], value: &[u8]) -> Result<()> {
+        let expected_pages = value.len().div_ceil(crate::page::TRAILER_CONTENT_SIZE);
+        if pages.len() != expected_pages {
+            self.corrupt_page(
+                "VALUE_PAGE_COUNT",
+                pages.first().copied(),
+                "value page count must equal ceil(len / TRAILER_CONTENT_SIZE)",
+            );
+        }
+
+        let staging_pages = staging_pages(pages.len());
+        let mut staging = vec![0u8; staging_pages * PAGE_SIZE];
+        let mut written = 0usize;
+        for chunk in pages.chunks(staging_pages) {
+            let span = chunk.len() * PAGE_SIZE;
+            let staging = &mut staging[..span];
+            for (index, pid) in chunk.iter().enumerate() {
+                let page = &mut staging[index * PAGE_SIZE..(index + 1) * PAGE_SIZE];
+                let take = (value.len() - written).min(crate::page::TRAILER_CONTENT_SIZE);
+                page[..take].copy_from_slice(&value[written..written + take]);
+                written += take;
+                // Zero what this page does not use: the checksum covers the whole
+                // page and the staging buffer is reused across chunks, so without
+                // it the previous chunk's leftover bytes would reach both the
+                // file and the checksum.
+                page[take..crate::page::TRAILER_CONTENT_SIZE].fill(0);
+                crate::page::seal_page(page, crate::page::TRAILER_CRC_OFFSET, *pid);
+            }
+            self.write_page_runs(chunk, staging)?;
+        }
+        Ok(())
+    }
+
+    /// Records a page-level failure at its detection site and terminates: the
+    /// live boundary for every page load.
+    fn abort_site(&self, site: CorruptionSite, page_kind: &'static str) -> ! {
+        fatal(FatalReason::Corruption(
+            site.report(Some(self.get_seq()), page_kind),
+        ))
+    }
+
+    fn abort_crc_mismatch(
+        &self,
+        mismatch: crate::page::CrcMismatch,
+        pid: PageId,
+        page_kind: &'static str,
+    ) -> ! {
+        self.abort_site(
+            CorruptionSite::crc(
+                pid,
+                "PAGE_CRC_MISMATCH",
+                "crc32c over the whole page",
+                mismatch.expected,
+                mismatch.actual,
+            ),
+            page_kind,
+        )
+    }
+
+    fn corrupt_page(&self, code: &'static str, pid: Option<PageId>, check: &'static str) -> ! {
+        self.abort_site(CorruptionSite::buffer_shape(code, pid, check), "page")
     }
 
     pub(crate) fn cached_snapshot(&self) -> MetaSnapshot {
@@ -2081,17 +2945,31 @@ impl Store {
         let sb0 = self.read_current_meta_candidate(0)?;
         let sb1 = self.read_current_meta_candidate(PAGE_SIZE as u64)?;
 
-        let sb = match (sb0, sb1) {
-            (Some(s0), Some(s1)) => {
-                if s0.seq >= s1.seq {
-                    s0
-                } else {
-                    s1
-                }
-            }
-            (Some(s0), None) => s0,
-            (None, Some(s1)) => s1,
-            (None, None) => return Err(Error::Corruption),
+        // actual version) and terminates, exactly like a page-level failure; it
+        // never escapes as a user-level error.
+        let sb = match select_meta([sb0, sb1]) {
+            MetaSelection::Selected(meta) => meta,
+            MetaSelection::None => self.abort_meta(
+                "NO_VALID_META",
+                None,
+                "neither meta page is valid",
+                None,
+                None,
+            ),
+            MetaSelection::UnsupportedVersion { found } => self.abort_meta(
+                "UNSUPPORTED_FORMAT_VERSION",
+                None,
+                "the file's format version is not supported by this build",
+                Some(FORMAT_VERSION.to_string()),
+                Some(found.to_string()),
+            ),
+            MetaSelection::MixedVersions { found } => self.abort_meta(
+                "MIXED_FORMAT_VERSIONS",
+                None,
+                "meta slots disagree on the format version",
+                Some(FORMAT_VERSION.to_string()),
+                Some(found.to_string()),
+            ),
         };
 
         let current_seq = self.sb.lock().seq;
@@ -2113,10 +2991,6 @@ impl Store {
                     retired_root: current_sb.retired_root,
                     seq: current_sb.seq,
                 });
-                // Adopting a disk-newer generation is also a shared snapshot
-                // install. Keep the epoch counter in one-to-one correspondence
-                // with SharedMeta updates, using the same visibility order as
-                // normal generation publication.
                 self.epoch.advance();
                 let mut reusable_guard = self.reusable.lock();
                 *reusable_guard = reusable;
@@ -2172,78 +3046,48 @@ impl Store {
         data: &[u8],
     ) -> Result<()> {
         let start = first_data_page * PAGE_SIZE;
-        let end = std::cmp::min(start + nr_pages * PAGE_SIZE, data.len());
+        let end = start + nr_pages * PAGE_SIZE;
         self.file
             .pwrite_all(&data[start..end], first_page as u64 * PAGE_SIZE as u64)
     }
 
-    fn read_current_meta_candidate(&self, offset: u64) -> Result<Option<MetaNode>> {
+    fn read_current_meta_candidate(&self, offset: u64) -> Result<MetaCandidate> {
+        #[cfg(test)]
+        self.node_io
+            .record(NodeIoKind::MetaRead, (offset / PAGE_SIZE as u64) as PageId);
         let mut buf = [0u8; PAGE_SIZE];
         self.file.pread_exact(&mut buf, offset)?;
-        parse_current_meta(&buf)
+        Ok(meta_candidate(&buf))
+    }
+
+    fn abort_meta(
+        &self,
+        code: &'static str,
+        generation: Option<u64>,
+        check: &'static str,
+        expected: Option<String>,
+        actual: Option<String>,
+    ) -> ! {
+        fatal(FatalReason::Corruption(CorruptionReport {
+            code,
+            generation,
+            page_kind: "meta",
+            pid: None,
+            check,
+            expected: expected.map(Into::into),
+            actual: actual.map(Into::into),
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use crate::test_support::child_test_command;
 
     const LIVE_FAULT_CHILD_ENV: &str = "BTREE_STORE_LIVE_FAULT_CHILD";
     const GENERATION_FAULT_CHILD_PATH: &str = "BTREE_STORE_GENERATION_FAULT_CHILD_PATH";
-
-    fn parse_runner(value: &str) -> Vec<String> {
-        value
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    }
-
-    fn detect_cargo_runner() -> Option<Vec<String>> {
-        let arch = std::env::consts::ARCH
-            .to_ascii_uppercase()
-            .replace('-', "_");
-        let mut preferred = Vec::new();
-        let mut all = Vec::new();
-
-        for (key, value) in std::env::vars() {
-            if !key.starts_with("CARGO_TARGET_") || !key.ends_with("_RUNNER") {
-                continue;
-            }
-            if value.trim().is_empty() {
-                continue;
-            }
-
-            all.push((key.clone(), value.clone()));
-            if key.contains(&format!("_{arch}_")) {
-                preferred.push((key, value));
-            }
-        }
-
-        preferred.sort_by(|a, b| a.0.cmp(&b.0));
-        all.sort_by(|a, b| a.0.cmp(&b.0));
-
-        if let Some((_, value)) = preferred.into_iter().next() {
-            return Some(parse_runner(&value)).filter(|parts| !parts.is_empty());
-        }
-        if all.len() == 1 {
-            return Some(parse_runner(&all[0].1)).filter(|parts| !parts.is_empty());
-        }
-        None
-    }
-
-    fn child_test_command(exe: &Path) -> Command {
-        match detect_cargo_runner() {
-            Some(parts) => {
-                let mut it = parts.into_iter();
-                let mut cmd = Command::new(it.next().expect("runner must not be empty"));
-                cmd.args(it);
-                cmd.arg(exe);
-                cmd
-            }
-            None => Command::new(exe),
-        }
-    }
+    const LIVE_FAULT_CHILD_DIR: &str = "BTREE_STORE_LIVE_FAULT_CHILD_DIR";
 
     fn extent_contains(extents: &ExtentSet, pid: PageId) -> bool {
         extents.contains(pid)
@@ -2268,10 +3112,13 @@ mod tests {
         }
     }
 
-    fn encode_extent_page(next: PageId, extents: &[Extent]) -> [u8; PAGE_SIZE] {
+    /// Test-only encoder. Mirrors the production writer: content laid out,
+    /// padding left zero, CRC trailer sealed for `pid`.
+    fn encode_extent_page(pid: PageId, next: PageId, extents: &[Extent]) -> [u8; PAGE_SIZE] {
         assert!(extents.len() <= EXTENT_PER_PAGE);
         let mut page = [0u8; PAGE_SIZE];
         let header = ExtentHeader {
+            checksum: 0,
             next,
             count: extents.len() as u32,
         };
@@ -2281,6 +3128,7 @@ mod tests {
             page[offset..offset + EXTENT_SIZE].copy_from_slice(extent.as_slice());
             offset += EXTENT_SIZE;
         }
+        crate::page::seal_page(&mut page, crate::page::HEADER_CRC_OFFSET, pid);
         page
     }
 
@@ -2360,9 +3208,25 @@ mod tests {
         assert!(!file_extended.load(Ordering::Relaxed));
     }
 
+    /// Capacity boundary of the extent page: 510 entries plus the 12-byte header
+    /// fit; the checksum field covers the rest of the page.
+    #[test]
+    fn extent_page_capacity_is_510_entries() {
+        assert_eq!(EXTENT_PER_PAGE, 510);
+        assert_eq!(EXTENT_ENTRIES_END, PAGE_SIZE);
+        const { assert!(EXTENT_HEADER_SIZE + EXTENT_PER_PAGE * EXTENT_SIZE <= EXTENT_ENTRIES_END) };
+        assert_eq!(Store::extent_pages_needed(0), 0);
+        assert_eq!(Store::extent_pages_needed(1), 1);
+        assert_eq!(Store::extent_pages_needed(510), 1);
+        assert_eq!(Store::extent_pages_needed(511), 2);
+        assert_eq!(Store::extent_pages_needed(1020), 2);
+        assert_eq!(Store::extent_pages_needed(1021), 3);
+    }
+
     #[test]
     fn read_extent_pages_merges_adjacent_extents_while_streaming() {
         let page = encode_extent_page(
+            2,
             0,
             &[
                 Extent {
@@ -2388,7 +3252,13 @@ mod tests {
                 *buf = page;
                 Ok::<_, (&'static str, PageId, &'static str)>(())
             },
-            |code, pid, check| (code, pid, check),
+            |site| {
+                (
+                    site.code,
+                    site.pid.expect("page-level failure must name its page"),
+                    site.check,
+                )
+            },
         )
         .unwrap();
 
@@ -2411,6 +3281,7 @@ mod tests {
     #[test]
     fn read_extent_pages_rejects_unsorted_extents() {
         let page = encode_extent_page(
+            2,
             0,
             &[
                 Extent {
@@ -2431,7 +3302,13 @@ mod tests {
                 *buf = page;
                 Ok::<_, (&'static str, PageId, &'static str)>(())
             },
-            |code, pid, check| (code, pid, check),
+            |site| {
+                (
+                    site.code,
+                    site.pid.expect("page-level failure must name its page"),
+                    site.check,
+                )
+            },
         )
         .unwrap_err();
 
@@ -2448,13 +3325,14 @@ mod tests {
     #[test]
     fn read_extent_pages_rejects_extent_covering_later_allocator_page() {
         let root_page = encode_extent_page(
+            2,
             5,
             &[Extent {
                 page_id: 4,
                 nr_pages: 2,
             }],
         );
-        let next_page = encode_extent_page(0, &[]);
+        let next_page = encode_extent_page(5, 0, &[]);
 
         let err = read_extent_pages(
             2,
@@ -2467,7 +3345,13 @@ mod tests {
                 };
                 Ok::<_, (&'static str, PageId, &'static str)>(())
             },
-            |code, pid, check| (code, pid, check),
+            |site| {
+                (
+                    site.code,
+                    site.pid.expect("page-level failure must name its page"),
+                    site.check,
+                )
+            },
         )
         .unwrap_err();
 
@@ -2499,7 +3383,7 @@ mod tests {
             drop(holder);
         });
 
-        let (raw, is_new) = RawFile::open(&path).unwrap();
+        let (raw, is_new) = RawFile::open(&path, false).unwrap();
         assert!(is_new);
         drop(raw);
         release.join().unwrap();
@@ -2617,7 +3501,6 @@ mod tests {
         );
         assert_empty_store_allocator_complete(&store);
 
-        // Once the reader quiesces, the next publication promotes and the
         // pages become reusable again.
         drop(guard);
         store
@@ -2644,9 +3527,7 @@ mod tests {
             .unwrap();
         let current_seq = store.sb.lock().seq;
 
-        // forge a valid seq+1 slot at the other double-buffer offset, through
-        // the store's own file handle (no second handle: Windows-safe)
-        let other_offset = if current_seq % 2 == 0 {
+        let other_offset = if current_seq.is_multiple_of(2) {
             0
         } else {
             PAGE_SIZE as u64
@@ -2668,12 +3549,10 @@ mod tests {
             "a reader refresh must not install a disk-newer (failed) generation"
         );
 
-        // writer refresh (allow_install=true) adopts the failed generation
         let snapshot = store.refresh_sb(true).unwrap();
         assert_eq!(snapshot.seq, current_seq + 1);
         assert_eq!(store.sb.lock().seq, current_seq + 1);
 
-        // the writer can commit over the adopted generation
         store
             .commit_roots_with_pending_alloc(0, &[], &HashSet::new())
             .unwrap();
@@ -2696,8 +3575,7 @@ mod tests {
         .unwrap();
 
         // arm the hook for the writer thread only: the writer parks after the
-        // oldest() scan and before the promotion loop, so the reader lands
-        // exactly inside the window the linearization argument covers.
+        // oldest scan and before the promotion loop, so the reader lands
         struct WindowHookGuard;
         impl Drop for WindowHookGuard {
             fn drop(&mut self) {
@@ -2772,8 +3650,6 @@ mod tests {
                 .unwrap();
         });
 
-        // join the reader first: if it panicked, the ReleaseOnDrop guard has
-        // already released the writer, so the writer join cannot hang
         reader.join().unwrap();
         writer.join().unwrap();
         // the writer's commit is visible to a later view
@@ -2976,12 +3852,8 @@ mod tests {
         }
     }
 
-    fn raw_file_with_fault(
-        operation: &'static str,
-        raw_os_error: i32,
-    ) -> (tempfile::TempDir, RawFile) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("fault.db");
+    fn raw_file_with_fault_at(dir: &Path, operation: &'static str, raw_os_error: i32) -> RawFile {
+        let path = dir.join("fault.db");
         let file = FileOpenOptions::new()
             .read(true)
             .write(true)
@@ -2989,18 +3861,24 @@ mod tests {
             .truncate(false)
             .open(&path)
             .unwrap();
-        (
-            dir,
-            RawFile {
-                file,
-                path: Arc::new(path),
-                fault: Some(TestFault {
-                    operation,
-                    raw_os_error,
-                    remaining: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-                }),
-            },
-        )
+        RawFile {
+            file,
+            path: Arc::new(path),
+            fault: Some(TestFault {
+                operation,
+                raw_os_error,
+                remaining: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            }),
+        }
+    }
+
+    fn raw_file_with_fault(
+        operation: &'static str,
+        raw_os_error: i32,
+    ) -> (tempfile::TempDir, RawFile) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let raw = raw_file_with_fault_at(dir.path(), operation, raw_os_error);
+        (dir, raw)
     }
 
     #[test]
@@ -3044,7 +3922,12 @@ mod tests {
         } else {
             5
         };
-        let (_dir, raw) = raw_file_with_fault(operation, raw_os_error);
+        // The parent owns the directory: this process is about to abort, and a
+        // temporary directory of its own would never be removed.
+        let Ok(dir) = std::env::var(LIVE_FAULT_CHILD_DIR) else {
+            return;
+        };
+        let raw = raw_file_with_fault_at(Path::new(&dir), operation, raw_os_error);
         let live = LiveStore {
             raw,
             generation: AtomicU64::new(41),
@@ -3071,6 +3954,9 @@ mod tests {
     #[test]
     fn live_io_faults_abort_with_diagnostics_and_cannot_unwind() {
         for operation in ["pread", "pwrite", "sync_all", "sync_data"] {
+            // One directory per child, dropped with the iteration, so an aborted
+            // child leaves nothing for the parent to collect.
+            let dir = tempfile::TempDir::new().unwrap();
             let output = child_test_command(&std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -3079,6 +3965,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(LIVE_FAULT_CHILD_ENV, operation)
+                .env(LIVE_FAULT_CHILD_DIR, dir.path())
                 .output()
                 .unwrap();
 

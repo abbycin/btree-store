@@ -7,8 +7,6 @@ fn test_bucket_iterator() {
     let db_path = temp_dir.path().join("iterator.db");
     let tree = BTree::open(&db_path).unwrap();
     tree.new_bucket("my_bucket", false).unwrap();
-    // Iterator construction must retain one published physical snapshot while
-    // both cached and uncached traversal use the same generation.
 
     let mut expected = std::collections::BTreeMap::new();
     tree.exec("my_bucket", |txn| {
@@ -45,19 +43,6 @@ fn test_bucket_iterator() {
         }
         assert_eq!(actual, expected_reverse);
 
-        let mut uncached = txn.iter_uncached();
-        actual.clear();
-        while uncached.next_ref(&mut key_buf, &mut val_buf) {
-            actual.push((key_buf.clone(), val_buf.clone()));
-        }
-        assert_eq!(actual, expected.clone().into_iter().collect::<Vec<_>>());
-
-        let mut uncached_reverse = txn.iter_uncached();
-        actual.clear();
-        while uncached_reverse.prev_ref(&mut key_buf, &mut val_buf) {
-            actual.push((key_buf.clone(), val_buf.clone()));
-        }
-        assert_eq!(actual, expected_reverse);
         Ok(())
     })
     .unwrap();

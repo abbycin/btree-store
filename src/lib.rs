@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     hash::Hasher,
     io::{self, Write},
@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -19,18 +19,36 @@ use crate::epoch::EpochGuard;
 compile_error!("btree-store requires a little-endian target");
 
 pub(crate) mod cache;
+pub(crate) mod check;
 pub(crate) mod epoch;
+pub(crate) mod instance_local;
 pub(crate) mod node;
+pub(crate) mod page;
 pub(crate) mod store;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_support;
+
+pub use check::{
+    BucketStats, CheckDiagnostic, CheckError, CheckOptions, CheckReport, CheckReportWithSpace,
+    CheckResult, CheckSpaceStats, CheckStatus, DiagnosticSeverity, MetaSlot, check_path,
+    check_path_with_options, check_path_with_space,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    /// A mutating call was made on a read-only handle.
+    ReadOnly,
     KeyNotFound,
     BucketNotFound,
     BucketExists,
     InvalidKey(KeyError),
     InvalidBucket(BucketError),
-    ValueTooLarge { len: usize, max: usize },
+    ValueTooLarge {
+        len: usize,
+        max: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,12 +94,92 @@ pub struct CorruptionReport {
     pub actual: Option<Box<str>>,
 }
 
+/// A page-level validation failure, recorded where it is detected.
+///
+/// The detection site owns the diagnostic: it knows the expected physical page
+/// id and, for a checksum failure, both CRC values. Boundaries only decide how
+/// the process exits (abort on a live path, `OpenError` when opening), so the
+/// report never degrades into empty `pid`/`expected`/`actual` fields.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CorruptionSite {
+    pub(crate) code: &'static str,
+    /// The page the failure is about, when there is one. Buffer-shape checks
+    /// (a length or count that does not match the call) name no single page;
+    /// reporting an invented id there would point operators at a page that was
+    /// never involved.
+    pub(crate) pid: Option<PageId>,
+    pub(crate) check: &'static str,
+    /// `(expected, actual)` CRC32C when the failure is a checksum mismatch.
+    pub(crate) crc: Option<(u32, u32)>,
+}
+
+impl CorruptionSite {
+    pub(crate) fn crc(
+        pid: PageId,
+        code: &'static str,
+        check: &'static str,
+        expected: u32,
+        actual: u32,
+    ) -> Self {
+        Self {
+            code,
+            pid: Some(pid),
+            check,
+            crc: Some((expected, actual)),
+        }
+    }
+
+    pub(crate) fn structure(pid: PageId, code: &'static str, check: &'static str) -> Self {
+        Self {
+            code,
+            pid: Some(pid),
+            check,
+            crc: None,
+        }
+    }
+
+    /// A failure about the shape of a page buffer rather than one page's
+    /// content; `pid` is only set when the check happens to know the page.
+    pub(crate) fn buffer_shape(
+        code: &'static str,
+        pid: Option<PageId>,
+        check: &'static str,
+    ) -> Self {
+        Self {
+            code,
+            pid,
+            check,
+            crc: None,
+        }
+    }
+
+    pub(crate) fn report(
+        self,
+        generation: Option<u64>,
+        page_kind: &'static str,
+    ) -> CorruptionReport {
+        CorruptionReport {
+            code: self.code,
+            generation,
+            page_kind,
+            pid: self.pid,
+            check: self.check,
+            expected: self.crc.map(|(expected, _)| expected.to_string().into()),
+            actual: self.crc.map(|(_, actual)| actual.to_string().into()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum OpenError {
     Io(OpenIoError),
     Corruption(CorruptionReport),
     InvalidOptions(OptionsError),
-    DatabaseBusy { path: PathBuf },
+    DatabaseBusy {
+        path: PathBuf,
+    },
+    /// A mutating call was made on a read-only handle.
+    ReadOnly,
 }
 
 impl fmt::Display for Error {
@@ -126,6 +224,7 @@ impl fmt::Display for OpenError {
                     path.display()
                 )
             }
+            Self::ReadOnly => write!(f, "the database was opened read-only"),
         }
     }
 }
@@ -141,6 +240,17 @@ impl std::error::Error for OpenError {
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type OpenResult<T> = std::result::Result<T, OpenError>;
+
+/// A standalone copy of the store's persistent state as of one published generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Generation the snapshot equals (same scale as `MetaNode::seq`). It is the
+    /// generation frozen when the call started, which is not necessarily the
+    /// newest one when the call returns.
+    pub seq: u64,
+    /// The destination the snapshot was written to, exactly as it was given.
+    pub path: PathBuf,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StoreFault {
@@ -320,13 +430,16 @@ impl RootRef {
 }
 
 pub const MAGIC: u64 = 0x636f776274726565; // cowbtree
-pub const FORMAT_VERSION: u32 = 1;
-pub use crate::node::{MAX_KEY_LEN, MAX_VAL_LEN};
+pub const FORMAT_VERSION: u32 = 2;
+pub use crate::node::{
+    IDS_PER_INDIRECT_PAGE, MAX_INLINE_LEN, MAX_KEY_LEN, MAX_VAL_LEN, PAGE_SIZE, SLOT_SIZE,
+    VALUE_PAGE_CONTENT,
+};
 
 /// Runtime sync policy used after commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncMode {
-    /// Sync data by default, but upgrade to a full sync when file size changes.
+    /// Sync data normally and use a full sync when the file grows.
     #[default]
     Adaptive,
     /// Always use data-only sync.
@@ -347,6 +460,11 @@ pub struct OpenOptions {
     pub cache_capacity: usize,
     /// Sync policy used after metadata commits.
     pub sync_mode: SyncMode,
+    /// Open an **existing** database read-only: the file is not created, no byte
+    /// of it is ever written, and it is locked shared instead of exclusively
+    ///
+    /// Defaults to `false`.
+    pub read_only: bool,
 }
 
 impl Default for OpenOptions {
@@ -354,6 +472,7 @@ impl Default for OpenOptions {
         Self {
             cache_capacity: 8192,
             sync_mode: SyncMode::Adaptive,
+            read_only: false,
         }
     }
 }
@@ -477,7 +596,6 @@ impl MetaNode {
     }
 
     pub(crate) fn validate(&self) -> StoreResult<()> {
-        // Torn write detection: treat an all-zero meta page as invalid.
         if self.magic == 0 && self.seq == 0 {
             return Err(StoreFault::Corruption);
         }
@@ -525,8 +643,6 @@ pub(crate) fn validate_bucket_input(bucket: &str) -> Result<()> {
     Ok(())
 }
 
-/// Maps a persisted bucket flag word to the node-class layout used to build
-/// new nodes for that bucket. bit0 = prefix encoding.
 fn layout_from_flags(flags: u32) -> Layout {
     if flags & 1 == 1 {
         Layout::Prefix
@@ -573,19 +689,9 @@ impl BTreeRuntime {
             .take_recycled_page(id.get())
             .unwrap_or_else(AlignedPage::new);
         let node = physical_value(self.store.read_node(id, page), "physical node load");
+        #[cfg(test)]
+        self.store.node_io.record_cache_put(id.get());
         self.cache.put(id.get(), node.clone());
-        node
-    }
-
-    fn load_iterator_child(&self, id: DataPid) -> Arc<Node> {
-        if let Some(node) = self.cache.get_branch(id.get()) {
-            return node;
-        }
-
-        let node = self.store.read_node_without_cache(id);
-        if !node.is_leaf() {
-            self.cache.put(id.get(), node.clone());
-        }
         node
     }
 
@@ -601,6 +707,8 @@ impl BTreeRuntime {
         self.cache.invalidate(page_id);
     }
 
+    /// Test-only positive occupancy probe. `get` ages an entry, so a test that
+    /// merely asks whether a PID is resident needs a non-mutating read.
     #[cfg(test)]
     fn cached_node_is_leaf(&self, id: DataPid) -> Option<bool> {
         self.cache.peek(id.get()).map(|node| node.is_leaf())
@@ -657,6 +765,9 @@ impl BTreeRuntime {
 pub(crate) struct TreeReadContext {
     runtime: Arc<BTreeRuntime>,
     layout: Layout,
+    /// Transaction-private residency layer. `None` for handle-level reads,
+    /// views and read-only transactions; clones only ever propagate it.
+    overlay: Option<Arc<RwLock<TxnOverlay>>>,
 }
 
 /// Node-class selection for newly created nodes. Reads are self-describing
@@ -672,16 +783,223 @@ impl TreeReadContext {
         Self {
             runtime,
             layout: Layout::Plain,
+            overlay: None,
         }
     }
 
     /// Returns a clone that builds new nodes using `layout` (the catalog and
     /// the TxnCore base always stay plain; bucket trees override per bucket).
+    /// The residency layer is copied, never created.
     pub(crate) fn with_layout(&self, layout: Layout) -> Self {
         Self {
             runtime: self.runtime.clone(),
             layout,
+            overlay: self.overlay.clone(),
         }
+    }
+
+    /// Attaches the transaction-private residency layer. Every clone made
+    /// from this context (bucket transactions, iterators, write contexts) shares the same one.
+    pub(crate) fn with_overlay(&self, overlay: Arc<RwLock<TxnOverlay>>) -> Self {
+        Self {
+            runtime: self.runtime.clone(),
+            layout: self.layout,
+            overlay: Some(overlay),
+        }
+    }
+
+    /// Whether this write may be deferred. Turning the budget off is the *entire*
+    /// exhaustion action, and it is sticky: once off it never re-opens.
+    fn take_dirty_slot(&self) -> bool {
+        let Some(overlay) = &self.overlay else {
+            return false;
+        };
+        let mut overlay = overlay.write();
+        if overlay.may_defer() {
+            true
+        } else {
+            overlay.disable_defer();
+            false
+        }
+    }
+
+    fn insert_overlay_dirty(&self, page_id: PageId, node: Arc<Node>) {
+        if let Some(overlay) = &self.overlay {
+            overlay.write().insert_dirty(page_id, node);
+        }
+    }
+
+    fn insert_overlay_clean(&self, page_id: PageId, node: Arc<Node>) {
+        if let Some(overlay) = &self.overlay {
+            overlay.write().insert_clean(page_id, node);
+        }
+    }
+
+    /// Commit flush (step 1): write every Dirty page — sealed with its final PID —
+    /// and only after all of them are on disk degrade them to Clean. The step runs under the
+    /// overlay's write lock, and the store's live write path is fatal on I/O error, so a partial
+    /// flush is unobservable.
+    fn flush_overlay(&self) {
+        let Some(overlay) = &self.overlay else {
+            return;
+        };
+        let mut overlay = overlay.write();
+        let pages = overlay.dirty_pages_sorted();
+        if pages.is_empty() {
+            return;
+        }
+        physical_value(self.store().write_node_runs(&pages), "commit flush");
+        overlay.mark_all_dirty_clean(&pages);
+    }
+
+    /// Dense coverage (step 2): called once per publication, before any meta slot is
+    /// written, with `h` = the **live** high-water mark (never a published snapshot's).
+    fn cover_id_space(&self) {
+        let high_water = self.store().cached_snapshot().next_page_id;
+        self.store().cover_id_space(high_water);
+    }
+
+    fn drop_overlay_pages(&self, page_id: PageId, nr_pages: u32) {
+        #[cfg(test)]
+        for offset in 0..u64::from(nr_pages) {
+            self.store()
+                .node_io
+                .record_release(page_id + offset as PageId);
+        }
+        if let Some(overlay) = &self.overlay {
+            overlay.write().drop_pages(page_id, nr_pages);
+        }
+    }
+
+    fn clear_overlay(&self) {
+        if let Some(overlay) = &self.overlay {
+            overlay.write().clear();
+        }
+    }
+
+    fn overlay_has_dirty(&self) -> bool {
+        self.overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.read().has_dirty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_len(&self) -> usize {
+        self.overlay
+            .as_ref()
+            .map_or(0, |overlay| overlay.read().len())
+    }
+
+    // Ownership survives Clean eviction, so an empty residency set is insufficient.
+    pub(crate) fn overlay_is_empty(&self) -> bool {
+        self.overlay
+            .as_ref()
+            .is_none_or(|overlay| overlay.read().is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_owned_pids(&self) -> Vec<PageId> {
+        self.overlay.as_ref().map_or_else(Vec::new, |overlay| {
+            let mut pids: Vec<PageId> = overlay.read().owned.iter().copied().collect();
+            pids.sort_unstable();
+            pids
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_dirty_pids(&self) -> Vec<PageId> {
+        self.overlay.as_ref().map_or_else(Vec::new, |overlay| {
+            let mut pids: Vec<PageId> = overlay
+                .read()
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.tier == OverlayTier::Dirty)
+                .map(|(pid, _)| *pid)
+                .collect();
+            pids.sort_unstable();
+            pids
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_entry_pids(&self) -> Vec<PageId> {
+        self.overlay.as_ref().map_or_else(Vec::new, |overlay| {
+            let mut pids: Vec<PageId> = overlay.read().entries.keys().copied().collect();
+            pids.sort_unstable();
+            pids
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_tiers(&self) -> (usize, usize) {
+        self.overlay.as_ref().map_or((0, 0), |overlay| {
+            let overlay = overlay.read();
+            (overlay.dirty_count(), overlay.clean_count())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_order_len(&self) -> usize {
+        self.overlay
+            .as_ref()
+            .map_or(0, |overlay| overlay.read().order_len())
+    }
+
+    fn overlay_owns(&self, page_id: PageId) -> bool {
+        self.overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.read().owns(page_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_defer_enabled(&self) -> bool {
+        self.overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.read().defer_enabled())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_owned_peak(&self) -> usize {
+        self.overlay
+            .as_ref()
+            .map_or(0, |overlay| overlay.read().owned_peak())
+    }
+
+    /// Overlay routing:
+    /// - entry hit: answer from memory — no `pread`, no CRC check;
+    /// - owned PID whose entry was evicted: read *without* the shared cache and re-insert,
+    ///   because a transaction-private page must never enter the shared `NodeCache`;
+    /// - otherwise: `None`, and the caller takes the pre-existing path.
+    ///
+    /// A read-only transaction has no overlay at all (`view` and every read-only context build
+    /// theirs with `None`). Keeping that test in this inlined guard — and the query, whose miss path
+    /// reads a page from disk, out of line — is what leaves the read-only node load a single
+    /// predictable branch: inlining the whole body instead would put a non-inlinable call, and its
+    /// `Option<Arc<Node>>` drop glue, on every level of every `get`.
+    #[inline(always)]
+    fn overlay_lookup(&self, id: DataPid) -> Option<Arc<Node>> {
+        self.overlay.as_ref()?;
+        self.overlay_lookup_active(id)
+    }
+
+    fn overlay_lookup_active(&self, id: DataPid) -> Option<Arc<Node>> {
+        let overlay = self
+            .overlay
+            .as_ref()
+            .expect("overlay checked by the caller");
+        if let Some(node) = overlay.read().get(id.get()) {
+            #[cfg(test)]
+            self.store().node_io.record_overlay_hit(id.get());
+            return Some(node);
+        }
+        if !overlay.read().owns(id.get()) {
+            return None;
+        }
+        #[cfg(test)]
+        self.store().node_io.record_overlay_miss(id.get());
+        let node = self.runtime.load_node_uncached(id);
+        overlay.write().insert_clean(id.get(), node.clone());
+        Some(node)
     }
 
     pub(crate) fn new_leaf(&self) -> Node {
@@ -709,19 +1027,24 @@ impl TreeReadContext {
 
     #[inline(always)]
     fn load_node(&self, id: DataPid) -> Arc<Node> {
+        if let Some(node) = self.overlay_lookup(id) {
+            return node;
+        }
         self.runtime.load_node(id)
     }
 
-    fn load_iterator_child(&self, id: DataPid) -> Arc<Node> {
-        self.runtime.load_iterator_child(id)
-    }
-
     fn load_node_uncached(&self, id: DataPid) -> Arc<Node> {
+        if let Some(node) = self.overlay_lookup(id) {
+            return node;
+        }
         self.runtime.load_node_uncached(id)
     }
 
     fn alloc_data_page(&self, alloc: &mut HashSet<PageId>) -> StoreResult<DataPid> {
-        self.runtime.alloc_data_page(alloc)
+        let pid = self.runtime.alloc_data_page(alloc)?;
+        #[cfg(test)]
+        self.store().node_io.record_alloc(pid.get());
+        Ok(pid)
     }
 
     fn alloc_data_pages(
@@ -729,14 +1052,21 @@ impl TreeReadContext {
         nr_pages: u32,
         alloc: &mut HashSet<PageId>,
     ) -> StoreResult<Vec<DataPid>> {
-        self.runtime.alloc_data_pages(nr_pages, alloc)
+        let pids = self.runtime.alloc_data_pages(nr_pages, alloc)?;
+        #[cfg(test)]
+        for pid in &pids {
+            self.store().node_io.record_alloc(pid.get());
+        }
+        Ok(pids)
     }
 
     fn recycle_allocated_pages(&self, page_id: PageId, nr_pages: u32) {
+        self.drop_overlay_pages(page_id, nr_pages);
         self.runtime.recycle_allocated_pages(page_id, nr_pages);
     }
 
     fn free_pages(&self, page_id: PageId, nr_pages: u32) -> StoreResult<()> {
+        self.drop_overlay_pages(page_id, nr_pages);
         self.runtime.free_pages(page_id, nr_pages)
     }
 
@@ -777,16 +1107,45 @@ impl<'a> TreeWriteContext<'a> {
         self.read.alloc_data_pages(nr_pages, self.alloc)
     }
 
-    fn write_node(&mut self, node: &mut Node) -> StoreResult<DataPid> {
+    fn write_node(&mut self, node: Node) -> StoreResult<DataPid> {
         let pid = self.alloc_page()?;
-        let data = node.finalize();
-        self.read.store().write_page(pid, data);
+        if self.read.take_dirty_slot() {
+            self.read.insert_overlay_dirty(pid.get(), Arc::new(node));
+            return Ok(pid);
+        }
+        // With the dirty tier exhausted the page goes to disk now, sealed in place with
+        // its final PID — the 4096-byte buffer is never copied just to compute the CRC.
+        let mut node = node;
+        let page = node.finalize_mut();
+        self.read.store().write_physical_page(pid, page);
+        #[cfg(test)]
+        self.read.store().node_io.record_write(pid.get());
+        self.read.insert_overlay_clean(pid.get(), Arc::new(node));
         Ok(pid)
     }
 
-    fn write_pages(&mut self, ids: &[DataPid], data: &[u8]) -> StoreResult<()> {
+    /// Physical page-array write (indirect chains): the caller seals each page
+    /// with its own PID before calling this (the chain builder does it, leaving the
+    /// id slots it never filled zero); the store only writes.
+    fn write_physical_pages(&mut self, ids: &[DataPid], data: &mut [u8]) -> StoreResult<()> {
         let ids: Vec<PageId> = ids.iter().map(|id| id.get()).collect();
-        self.read.store().write_data(&ids, data)
+        // Indirect pages get their own class so a node-only write counter never counts them.
+        #[cfg(test)]
+        self.read
+            .store()
+            .node_io
+            .record_many(crate::store::NodeIoKind::IndirectWrite, &ids);
+        self.read.store().write_physical_pages(&ids, data)
+    }
+
+    fn write_value_pages(&mut self, ids: &[DataPid], value: &[u8]) -> StoreResult<()> {
+        let ids: Vec<PageId> = ids.iter().map(|id| id.get()).collect();
+        #[cfg(test)]
+        self.read
+            .store()
+            .node_io
+            .record_many(crate::store::NodeIoKind::ValueWrite, &ids);
+        self.read.store().write_value_pages(&ids, value)
     }
 
     /// Frees the pages referenced by `slot` (inline slots have none).
@@ -852,28 +1211,23 @@ impl Tree {
     ) -> StoreResult<RootRef> {
         let current_root_id = root.node();
 
-        // root is empty
         let Some(current_root_id) = current_root_id else {
             let mut node = read.new_leaf();
             node.put_leaf(ctx, key, value)?;
-            return Ok(RootRef::Node(ctx.write_node(&mut node)?));
+            return Ok(RootRef::Node(ctx.write_node(node)?));
         };
 
-        // 1. find target leaf node
         let root_node = read.load_node(current_root_id);
         let (mut stack, leaf_node_arc, leaf_id) =
             Self::traverse_to_leaf(read, root_node, current_root_id, key);
 
         let mut current_node = (*leaf_node_arc).clone();
 
-        // 2. modify leaf node and get split info (if any)
         let mut split_info = Self::apply_insert(ctx, &mut current_node, key, value)?;
 
-        // write new COW leaf node
-        let mut new_child_id = ctx.write_node(&mut current_node)?;
+        let mut new_child_id = ctx.write_node(current_node)?;
         ctx.free_page(leaf_id);
 
-        // 3. backtrack up the path, propagating changes and splits
         while let Some(Route {
             node: parent_arc,
             page_id: parent_id,
@@ -882,9 +1236,9 @@ impl Tree {
         {
             let mut parent = (*parent_arc).clone();
 
-            if let Some((sep, mut rhs)) = split_info.take() {
+            if let Some((sep, rhs)) = split_info.take() {
                 let expected_old = parent.child_at(pos);
-                let rhs_id = ctx.write_node(&mut rhs)?;
+                let rhs_id = ctx.write_node(rhs)?;
                 split_info = match parent.apply_branch_split_rewrite(
                     ChildPos::new(pos),
                     expected_old,
@@ -899,16 +1253,14 @@ impl Tree {
                 parent.update_child_page(ChildPos::new(pos), new_child_id);
             }
 
-            // write new COW parent node and prepare for the next level up
-            new_child_id = ctx.write_node(&mut parent)?;
+            new_child_id = ctx.write_node(parent)?;
             ctx.free_page(parent_id);
         }
 
-        // 4. handle root node split
-        if let Some((sep, mut rhs)) = split_info {
-            let rhs_id = ctx.write_node(&mut rhs)?;
-            let mut new_root = read.new_branch_root(new_child_id, sep, rhs_id);
-            Ok(RootRef::Node(ctx.write_node(&mut new_root)?))
+        if let Some((sep, rhs)) = split_info {
+            let rhs_id = ctx.write_node(rhs)?;
+            let new_root = read.new_branch_root(new_child_id, sep, rhs_id);
+            Ok(RootRef::Node(ctx.write_node(new_root)?))
         } else {
             // root did not split, simply update root pointer
             Ok(RootRef::Node(new_child_id))
@@ -940,7 +1292,7 @@ impl Tree {
 
         current_node.update_leaf_at(ctx, pos, value)?;
 
-        let mut new_child_id = ctx.write_node(&mut current_node)?;
+        let mut new_child_id = ctx.write_node(current_node)?;
         ctx.free_page(leaf_id);
 
         while let Some(Route {
@@ -951,7 +1303,7 @@ impl Tree {
         {
             let mut parent = (*parent_arc).clone();
             parent.update_child_page(ChildPos::new(pos), new_child_id);
-            new_child_id = ctx.write_node(&mut parent)?;
+            new_child_id = ctx.write_node(parent)?;
             ctx.free_page(parent_id);
         }
 
@@ -967,13 +1319,7 @@ impl Tree {
         debug_assert!(node.is_leaf());
         let r = match node.put_leaf(ctx, key, value)? {
             LeafWrite::Applied => None,
-            LeafWrite::SplitRequired => {
-                // The split routine includes the pending key when choosing
-                // the pivot, so both returned children remain leaves at the
-                // current level even when prefix re-encoding changes their
-                // storage size.
-                Some(node.split_leaf_for_insert(ctx, key, value)?)
-            }
+            LeafWrite::SplitRequired => Some(node.split_leaf_for_insert(ctx, key, value)?),
         };
         Ok(r)
     }
@@ -1027,7 +1373,6 @@ impl Tree {
             return Ok((false, root));
         };
 
-        // 1. find target leaf node
         let root_node = read.load_node(current_root_id);
         let (mut stack, leaf_arc, leaf_id) =
             Self::traverse_to_leaf(read, root_node, current_root_id, key);
@@ -1038,16 +1383,14 @@ impl Tree {
         }
         current_node.delete_leaf_key(ctx, key);
 
-        // 2. handle leaf node changes
         let mut empty = current_node.is_empty();
         let mut new_child_id = if !empty {
-            Some(ctx.write_node(&mut current_node)?)
+            Some(ctx.write_node(current_node)?)
         } else {
             None
         };
         ctx.free_page(leaf_id);
 
-        // 3. backtrack up the path, handling parent node updates or shrinks
         while let Some(Route {
             node: parent_arc,
             page_id: parent_id,
@@ -1057,7 +1400,6 @@ impl Tree {
             let mut parent = (*parent_arc).clone();
 
             if empty {
-                // if child node became empty, remove corresponding slot from parent
                 parent.remove_branch_child(ChildPos::new(pos));
             } else {
                 // if child node only changed content, update pointer in parent
@@ -1072,18 +1414,16 @@ impl Tree {
                 );
             }
 
-            // check if current parent node also becomes empty
             if parent.is_empty() {
                 empty = true;
                 new_child_id = None;
             } else {
                 empty = false;
-                new_child_id = Some(ctx.write_node(&mut parent)?);
+                new_child_id = Some(ctx.write_node(parent)?);
             }
             ctx.free_page(parent_id);
         }
 
-        // 4. root collapse optimization
         // if root is a branch node with only one child, elevate child to be the new root
         if let Some(mut promoted_id) = new_child_id {
             loop {
@@ -1110,18 +1450,13 @@ impl Tree {
         child_id: DataPid,
     ) -> StoreResult<DataPid> {
         let child = read.load_node(child_id);
-        // Both node classes keep branch slot 0 as the empty canonical sentinel,
-        // so a zero `klen` is the class-independent short-circuit. Testing the
-        // decoded full key instead would misjudge encoded branches (whose
-        // sentinel reconstructs to the shared prefix, not ""), forcing a
-        // byte-identical COW rewrite on every root collapse.
         if child.is_leaf() || child.is_empty() || child.slot_at(0).klen == 0 {
             return Ok(child_id);
         }
 
         let mut rewritten = (*child).clone();
         rewritten.canonicalize_branch_slot_zero();
-        let new_child_id = ctx.write_node(&mut rewritten)?;
+        let new_child_id = ctx.write_node(rewritten)?;
         ctx.free_page(child_id);
         Ok(new_child_id)
     }
@@ -1161,25 +1496,13 @@ impl Tree {
         }
     }
 
-    pub(crate) fn iterator(
-        read: &TreeReadContext,
-        root: RootRef,
-        mode: IteratorCacheMode,
-    ) -> TreeIterator<'_> {
-        TreeIterator::new(read.clone(), root, None, mode)
+    pub(crate) fn iterator(read: &TreeReadContext, root: RootRef) -> TreeIterator<'_> {
+        TreeIterator::new(read.clone(), root, None)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum IteratorCacheMode {
-    #[default]
-    Default,
-    ByPass,
 }
 
 pub struct TreeIterator<'txn> {
     read: TreeReadContext,
-    mode: IteratorCacheMode,
     root: RootRef,
     root_node: Option<Arc<Node>>,
     forward_initialized: bool,
@@ -1194,21 +1517,12 @@ pub struct TreeIterator<'txn> {
 impl TreeIterator<'_> {
     #[inline]
     fn load_child_node(&self, child_id: DataPid) -> Arc<Node> {
-        match self.mode {
-            IteratorCacheMode::Default => self.read.load_node(child_id),
-            IteratorCacheMode::ByPass => self.read.load_iterator_child(child_id),
-        }
+        self.read.load_node(child_id)
     }
 
-    fn new(
-        read: TreeReadContext,
-        root: RootRef,
-        root_node: Option<Arc<Node>>,
-        mode: IteratorCacheMode,
-    ) -> Self {
+    fn new(read: TreeReadContext, root: RootRef, root_node: Option<Arc<Node>>) -> Self {
         Self {
             read,
-            mode,
             root,
             root_node,
             forward_initialized: false,
@@ -1227,8 +1541,6 @@ impl TreeIterator<'_> {
             return Some(root_node.clone());
         }
 
-        // The root is part of the hot path even for an uncached scan. Only
-        // descendants use ByPass so a leaf root remains resident in NodeCache.
         let root_node = self.read.load_node(root_id);
         self.root_node = Some(root_node.clone());
         Some(root_node)
@@ -1451,15 +1763,7 @@ impl<'a> Txn<'a> {
 
     /// Returns an iterator over the current bucket in key order.
     pub fn iter(&self) -> TreeIterator<'_> {
-        Tree::iterator(&self.read, self.root, IteratorCacheMode::Default)
-    }
-
-    /// Returns an iterator over the current bucket without caching leaf nodes.
-    ///
-    /// Branch nodes may still be cached and reused so point reads and future
-    /// traversals keep their hot upper-level path.
-    pub fn iter_uncached(&self) -> TreeIterator<'_> {
-        Tree::iterator(&self.read, self.root, IteratorCacheMode::ByPass)
+        Tree::iterator(&self.read, self.root)
     }
 }
 
@@ -1498,11 +1802,8 @@ impl<'read> ReadOnlyTree<'read> {
         }
     }
 
-    pub(crate) fn iterator(&self, mode: IteratorCacheMode) -> TreeIterator<'_> {
-        let root_node = (mode == IteratorCacheMode::Default)
-            .then(|| self.root_node.clone())
-            .flatten();
-        TreeIterator::new((*self.read).clone(), self.root, root_node, mode)
+    pub(crate) fn iterator(&self) -> TreeIterator<'_> {
+        TreeIterator::new((*self.read).clone(), self.root, self.root_node.clone())
     }
 }
 
@@ -1531,18 +1832,7 @@ impl<'a> ReadOnlyTxn<'a> {
 
     /// Returns an iterator over the read-only bucket snapshot in key order.
     pub fn iter(&self) -> TreeIterator<'_> {
-        self.tree.iterator(IteratorCacheMode::Default)
-    }
-
-    /// Returns an iterator over the read-only bucket snapshot without caching
-    /// leaf nodes.
-    ///
-    /// The root may already have been loaded through the normal cache path when
-    /// [`BTree::view`] validated the snapshot, and branch nodes may still be
-    /// cached. Overflow and indirect pages are read directly because they do
-    /// not have a page cache of their own.
-    pub fn iter_uncached(&self) -> TreeIterator<'_> {
-        self.tree.iterator(IteratorCacheMode::ByPass)
+        self.tree.iterator()
     }
 }
 
@@ -1868,6 +2158,287 @@ impl PendingPageCounts {
     }
 }
 
+/// Default residency budget, in pages (4096 pages ≈ 16 MiB).
+pub(crate) const DEFAULT_RESIDENT_LIMIT: usize = 4096;
+
+/// Default dirty budget, in pages (1024 pages ≈ 4 MiB).
+pub(crate) const DEFAULT_DIRTY_LIMIT: usize = 1024;
+
+/// Residency tier of an overlay entry. A `Dirty` entry is the only copy of its
+/// page — nothing has been written to disk yet; a `Clean` entry's content is already on disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OverlayTier {
+    Dirty,
+    Clean,
+}
+
+struct OverlayEntry {
+    node: Arc<Node>,
+    tier: OverlayTier,
+}
+
+/// Transaction-private page residency layer: resident pages plus deferred (not yet written) pages.
+///
+/// A `Dirty` entry's page has not reached the disk yet: the commit flush writes it and only then
+/// degrades it to `Clean`. `Clean` entries only make the transaction's own
+/// re-reads cheaper. `owned` is the authority for "this PID belongs to this transaction";
+/// eviction never touches it (ownership outlives residency), while a PID leaving the pending set
+/// drops both.
+pub(crate) struct TxnOverlay {
+    entries: HashMap<PageId, OverlayEntry>,
+    order: VecDeque<PageId>,
+    owned: HashSet<PageId>,
+    #[cfg(test)]
+    owned_peak: usize,
+    dirty_count: usize,
+    clean_count: usize,
+    dirty_limit: usize,
+    resident_limit: usize,
+    /// Sticky: once the dirty budget is exhausted the transaction writes through
+    /// for the rest of its life; it never re-opens.
+    defer: bool,
+}
+
+impl TxnOverlay {
+    fn new(resident_limit: usize, dirty_limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            owned: HashSet::new(),
+            #[cfg(test)]
+            owned_peak: 0,
+            dirty_count: 0,
+            clean_count: 0,
+            dirty_limit,
+            resident_limit,
+            defer: true,
+        }
+    }
+
+    /// Entry count. Test-only since the checkpoint guard asks whether the
+    /// overlay is *untouched* (`is_empty`) rather than how many entries it holds.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the overlay is untouched (a checkpoint requires an *empty*
+    /// overlay). `owned` counts: with a write-through configuration (`resident_limit = 0`) a
+    /// transaction can own pages whose entries were all evicted, and `rollback_to` could not
+    /// restore a state that ownership describes.
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.owned.is_empty()
+    }
+
+    #[cfg(test)]
+    fn dirty_count(&self) -> usize {
+        self.dirty_count
+    }
+
+    #[cfg(test)]
+    fn clean_count(&self) -> usize {
+        self.clean_count
+    }
+
+    #[cfg(test)]
+    fn order_len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn may_defer(&self) -> bool {
+        self.defer && self.dirty_count < self.dirty_limit
+    }
+
+    fn disable_defer(&mut self) {
+        self.defer = false;
+    }
+
+    /// Peak `owned` size, i.e. the transaction's workset. Its only reader is the
+    /// test-only accessor, so it is compiled only for tests.
+    #[cfg(test)]
+    fn owned_peak(&self) -> usize {
+        self.owned_peak
+    }
+
+    fn get(&self, page_id: PageId) -> Option<Arc<Node>> {
+        self.entries.get(&page_id).map(|entry| entry.node.clone())
+    }
+
+    fn owns(&self, page_id: PageId) -> bool {
+        self.owned.contains(&page_id)
+    }
+
+    fn note_owned(&mut self, page_id: PageId) {
+        self.owned.insert(page_id);
+        #[cfg(test)]
+        {
+            self.owned_peak = self.owned_peak.max(self.owned.len());
+        }
+    }
+
+    /// Records a deferred write: the entry becomes the page's only copy, so it is
+    /// never a candidate for eviction.
+    fn insert_dirty(&mut self, page_id: PageId, node: Arc<Node>) {
+        self.note_owned(page_id);
+        match self
+            .entries
+            .insert(
+                page_id,
+                OverlayEntry {
+                    node,
+                    tier: OverlayTier::Dirty,
+                },
+            )
+            .map(|entry| entry.tier)
+        {
+            Some(OverlayTier::Dirty) => {}
+            Some(OverlayTier::Clean) => {
+                self.clean_count -= 1;
+                self.dirty_count += 1;
+            }
+            None => {
+                self.dirty_count += 1;
+                // never evictable. `mark_all_dirty_clean` queues them when they become Clean.
+            }
+        }
+        self.maybe_compact_order();
+    }
+
+    /// Records an already-written page and FIFO-evicts the oldest `Clean` entries down to
+    /// `resident_limit`, oldest first. Dirty entries are skipped by
+    /// construction — only Clean PIDs ever enter `order`.
+    fn insert_clean(&mut self, page_id: PageId, node: Arc<Node>) {
+        self.note_owned(page_id);
+        match self
+            .entries
+            .insert(
+                page_id,
+                OverlayEntry {
+                    node,
+                    tier: OverlayTier::Clean,
+                },
+            )
+            .map(|entry| entry.tier)
+        {
+            Some(OverlayTier::Clean) => {}
+            Some(OverlayTier::Dirty) => {
+                self.dirty_count -= 1;
+                self.clean_count += 1;
+                self.order.push_back(page_id);
+            }
+            None => {
+                self.clean_count += 1;
+                self.order.push_back(page_id);
+            }
+        }
+        self.evict_excess_clean();
+        self.maybe_compact_order();
+    }
+
+    /// Drops oldest Clean entries until `clean_count <= resident_limit`. Only Clean PIDs occupy
+    /// `order`, so the loop always reaches the limit; the tier check is a defensive guard.
+    /// `owned` is never touched: losing residency is a locality loss,
+    /// never a change of ownership.
+    fn evict_excess_clean(&mut self) {
+        while self.clean_count > self.resident_limit {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.get(&old)
+                && entry.tier == OverlayTier::Clean
+            {
+                self.entries.remove(&old);
+                self.clean_count -= 1;
+            }
+        }
+    }
+
+    /// Sweeps the queue slots that no longer name a resident `Clean` entry — a released PID leaves
+    /// its slot behind, and the write-through path releases on every write, so without a sweep
+    /// `order` would grow with the transaction's write count while `clean_count` stayed at the
+    /// workset. A sweep is O(order) and the threshold is only reached after `clean_count` inserts,
+    /// so it costs O(1) amortized per insert; the survivors keep their relative order, so FIFO
+    /// eviction order is unchanged.
+    ///
+    /// Invariant after every overlay mutation: `order.len() <= 2 * clean_count + 1`.
+    fn maybe_compact_order(&mut self) {
+        if self.order.len() <= 2 * self.clean_count + 1 {
+            return;
+        }
+        let entries = &self.entries;
+        self.order.retain(|pid| {
+            matches!(
+                entries.get(pid).map(|entry| entry.tier),
+                Some(OverlayTier::Clean)
+            )
+        });
+    }
+
+    // Reuse flush order so Clean FIFO residency remains deterministic.
+    fn mark_all_dirty_clean(&mut self, pages: &[(PageId, Arc<Node>)]) {
+        for &(pid, _) in pages {
+            let entry = self
+                .entries
+                .get_mut(&pid)
+                .expect("flushed page is resident");
+            entry.tier = OverlayTier::Clean;
+            self.dirty_count -= 1;
+            self.clean_count += 1;
+            self.order.push_back(pid);
+        }
+        self.evict_excess_clean();
+        self.maybe_compact_order();
+    }
+
+    fn dirty_pages_sorted(&self) -> Vec<(PageId, Arc<Node>)> {
+        let mut pages: Vec<(PageId, Arc<Node>)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.tier == OverlayTier::Dirty)
+            .map(|(pid, entry)| (*pid, entry.node.clone()))
+            .collect();
+        pages.sort_unstable_by_key(|(pid, _)| *pid);
+        pages
+    }
+
+    fn drop_pages(&mut self, page_id: PageId, nr_pages: u32) {
+        for offset in 0..nr_pages {
+            let pid = page_id + offset;
+            self.owned.remove(&pid);
+            if let Some(entry) = self.entries.remove(&pid) {
+                match entry.tier {
+                    OverlayTier::Dirty => self.dirty_count -= 1,
+                    OverlayTier::Clean => self.clean_count -= 1,
+                }
+            }
+        }
+        self.maybe_compact_order();
+    }
+
+    /// Drops every entry and ownership record. The budget is **not** part of what a rollback
+    /// restores: `defer` is sticky for the overlay's whole life, so a transaction that already
+    /// switched to write-through stays there (`take_dirty_slot`), and `owned_peak` is a high-water
+    /// mark that later samples still have to see.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.owned.clear();
+        self.dirty_count = 0;
+        self.clean_count = 0;
+    }
+
+    /// Whether any entry is still `Dirty`; the commit fast path refuses to publish nothing while
+    /// one exists.
+    fn has_dirty(&self) -> bool {
+        self.dirty_count > 0
+    }
+
+    #[cfg(test)]
+    fn defer_enabled(&self) -> bool {
+        self.defer
+    }
+}
+
 struct TxnCore<'a> {
     btree: &'a BTree,
     read: TreeReadContext,
@@ -1879,15 +2450,28 @@ impl<'a> TxnCore<'a> {
     fn new(btree: &'a BTree) -> Self {
         let snapshot = btree.store.cached_snapshot();
         btree.pending_counts.clear();
+        let overlay = Arc::new(RwLock::new(TxnOverlay::new(
+            btree.resident_limit.load(Ordering::Relaxed),
+            btree.dirty_limit.load(Ordering::Relaxed),
+        )));
         Self {
             btree,
-            read: btree.read.clone(),
+            read: btree.read.with_overlay(overlay),
             catalog_root: RootRef::decode(snapshot.catalog_root),
             page_state: TxnPageState::default(),
         }
     }
 
     fn checkpoint(&self) -> TxnCheckpoint {
+        // `rollback_to` restores that state by clearing the whole overlay — so residency must be
+        // empty here. `invariant` is a two-argument *function* (not a macro) and ends the process,
+        // which is why the negative test must run in a subprocess.
+        if !self.read.overlay_is_empty() {
+            invariant(
+                "CHECKPOINT_AT_TXN_START",
+                "a checkpoint must be taken before any page enters the overlay",
+            );
+        }
         TxnCheckpoint {
             catalog_root: self.catalog_root,
             page_state: self.page_state.checkpoint(),
@@ -1896,6 +2480,9 @@ impl<'a> TxnCore<'a> {
 
     fn rollback_to(&mut self, checkpoint: TxnCheckpoint) {
         self.catalog_root = checkpoint.catalog_root;
+        // Everything in the overlay was written after the checkpoint, so it is
+        // dropped wholesale before the checkpoint's sets come back.
+        self.read.clear_overlay();
         self.page_state
             .rollback_to(&self.read, checkpoint.page_state);
         self.sync_pending_counts();
@@ -1930,7 +2517,10 @@ impl<'a> TxnCore<'a> {
 
     fn catalog_bucket_root(&self, key: &[u8]) -> Option<(RootRef, u32)> {
         let (leaf, pos) = Tree::find(&self.read, self.catalog_root(), key)?;
-        let metadata = BucketMetadata::from_slice(leaf.value_at(pos));
+        let metadata = physical_value(
+            BucketMetadata::decode(leaf.value_at(pos)),
+            "bucket metadata record within slot value",
+        );
         Some((metadata.root(), metadata.flags()))
     }
 
@@ -1948,14 +2538,34 @@ impl<'a> TxnCore<'a> {
         self.btree.pending_counts.update(&self.page_state);
     }
 
-    fn persist_nested_rollback_meta(&self, context: &'static str) {
+    /// Retires pages collected from a **published** tree (bucket deletion). They are disjoint from
+    /// the overlay by construction — the transaction has written nothing and the collection only
+    /// reads — which is why this release point does not go through `drop_overlay_pages` like every
+    /// other one. The check makes that argument executable: a page this transaction owns is still
+    /// the only copy of its bytes, so retiring it here would let the commit's flush write stale
+    /// bytes onto a PID the same commit retires.
+    fn retire_published_pages(&mut self, pages: Vec<(PageId, u32)>) {
+        for &(page_id, nr_pages) in &pages {
+            for offset in 0..nr_pages {
+                if self.read.overlay_owns(page_id + offset) {
+                    invariant(
+                        "RELEASED_PAGE_OWNED_BY_TXN",
+                        "a page of a published tree cannot belong to this transaction's overlay",
+                    );
+                }
+            }
+        }
+        self.page_state.pending_free.extend(pages);
+    }
+
+    fn persist_nested_rollback_meta(&mut self, context: &'static str) {
         self.btree.persist_nested_rollback_meta(self, context);
     }
 }
 
 pub struct MultiTxn<'a> {
     core: TxnCore<'a>,
-    bucket_roots: HashMap<String, MultiTxnBucketRoot>,
+    bucket_roots: BTreeMap<String, MultiTxnBucketRoot>,
 }
 
 #[derive(Clone, Copy)]
@@ -2031,11 +2641,6 @@ impl<'a> MultiTxn<'a> {
     }
 }
 
-/// A persistent bucket record stored as the catalog value for a bucket name.
-///
-/// The record is a fixed 8-byte native little-endian pair: the physical root
-/// page id followed by per-bucket flags. `flags & 1` selects prefix encoding
-/// for the bucket's tree nodes.
 #[repr(C)]
 pub(crate) struct BucketMetadata {
     root_page_id: PageId,
@@ -2050,9 +2655,11 @@ impl BucketMetadata {
         }
     }
 
-    pub(crate) fn from_slice(x: &[u8]) -> Self {
-        assert!(x.len() >= std::mem::size_of::<Self>());
-        unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) }
+    pub(crate) fn decode(x: &[u8]) -> StoreResult<Self> {
+        if x.len() < std::mem::size_of::<Self>() {
+            return Err(StoreFault::Corruption);
+        }
+        Ok(unsafe { std::ptr::read_unaligned(x.as_ptr().cast::<Self>()) })
     }
 
     fn root(&self) -> RootRef {
@@ -2079,6 +2686,10 @@ pub struct BTree {
     pub(crate) writer_lock: Arc<Mutex<()>>,
     read: TreeReadContext,
     pending_counts: Arc<PendingPageCounts>,
+    /// Residency budget (pages) handed to every write transaction this handle creates
+    /// (the budget entry point). Shared across clones; never touches the disk format.
+    resident_limit: Arc<AtomicUsize>,
+    dirty_limit: Arc<AtomicUsize>,
     pub(crate) start_seq: Arc<AtomicU64>,
     local_snapshot: Arc<RwLock<MetaSnapshot>>,
     options: OpenOptions,
@@ -2100,20 +2711,77 @@ impl BTree {
     }
 
     fn sync_local_snapshot_from_store(&self) {
-        // Opening an already-live path updates only this handle's snapshot. It
-        // may run from an active view callback while a writer owns a separate
-        // writer-local TxnCore under the write lock.
+        // Opening an already-live path updates only this handle's snapshot, so it can run
+        // from inside a view callback while a writer holds the write lock and owns a
+        // separate writer-local transaction core.
         self.apply_handle_snapshot(self.store.cached_snapshot());
     }
 
     /// Open or create a btree database at the given path using default runtime options.
     ///
-    /// This is equivalent to `BTree::open_with_options(path, OpenOptions::default())`.
+    /// This is equivalent to `BTree::open_with_options(path, OpenOptions::default)`.
     pub fn open<P: AsRef<Path>>(path: P) -> OpenResult<Self> {
         Self::open_with_options(path, OpenOptions::default())
     }
 
-    /// Open or create a btree database at the given path using explicit runtime options.
+    /// Opens an **existing** database read-only.
+    ///
+    /// Equivalent to [`BTree::open_with_options`] with [`OpenOptions::read_only`]
+    /// set: the file is not created, nothing is ever written to it, and it is
+    /// locked shared, so several read-only handles can coexist (a read-write open
+    /// of the same path succeeds once they are dropped). The handle serves the
+    /// published generation it opened, rejects every mutating call with
+    /// [`Error::ReadOnly`], and rejects [`BTree::take_snapshot`] with
+    /// [`OpenError::ReadOnly`].
+    ///
+    /// # Failure
+    ///
+    /// - Path missing → `Io(NotFound)`; the path is not created.
+    /// - File present but empty → `Corruption(NO_VALID_META)`; the file is left
+    ///   at zero bytes instead of being initialised into a database.
+    /// - Another process holds the exclusive lock → `DatabaseBusy`.
+    /// - A live read-write instance of this path exists in this process → refused
+    ///   with `InvalidOptions(LiveInstanceOptionsMismatch)`; a read-write and a
+    ///   read-only handle are never the same instance.
+    /// - Both metadata slots invalid → `Corruption(NO_VALID_META)`; a torn newest
+    ///   slot serves the older generation.
+    /// - Allocator or page corruption that the open-time validation reaches →
+    ///   `Corruption(report)`, whose `check` names the validation that failed; the
+    ///   process stays alive. (Corruption that only a page *read* can reach is the
+    ///   next case.)
+    /// - A file that cannot be read at all (permissions, read-only medium) →
+    ///   `Io(PermissionDenied)`; a file that can be read opens as usual.
+    /// - A mutating call on the returned handle, e.g. `exec` or `commit` →
+    ///   `Error::ReadOnly`; nothing is written and nothing panics.
+    /// - Corruption or a page-IO failure found *while reading* → the engine
+    ///   prints its `fatal` diagnostic and aborts the process. A fault the store
+    ///   can attribute to a page carries `generation`/`pid`; a node-level slot
+    ///   fault prints `page_kind=node` with `generation=none`/`pid=none`, because
+    ///   the node decoders do not know which page they were handed. Either way it
+    ///   is deliberately not a returnable error and never a panic, so a caller
+    ///   that must survive a damaged database has to isolate the read in a
+    ///   subprocess.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> OpenResult<BTree> {
+        Self::open_with_options(
+            path,
+            OpenOptions {
+                read_only: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Rejects mutating calls on a read-only handle.
+    #[inline]
+    fn require_writable(&self) -> Result<()> {
+        if self.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        Ok(())
+    }
+
+    /// Open or create a btree database at the given path using explicit runtime
+    /// options.
     ///
     /// Within a single process, opening the same path again reuses the live
     /// instance. Reopens must use identical runtime options.
@@ -2179,6 +2847,8 @@ impl BTree {
             pending_counts: Arc::new(PendingPageCounts {
                 snapshot: AtomicU64::new(0),
             }),
+            resident_limit: Arc::new(AtomicUsize::new(DEFAULT_RESIDENT_LIMIT)),
+            dirty_limit: Arc::new(AtomicUsize::new(DEFAULT_DIRTY_LIMIT)),
             start_seq: Arc::new(AtomicU64::new(initial_seq)),
             local_snapshot: Arc::new(RwLock::new(initial_snapshot)),
             options: options.clone(),
@@ -2225,6 +2895,7 @@ impl BTree {
     where
         F: FnOnce(&mut Txn) -> Result<R>,
     {
+        self.require_writable()?;
         validate_bucket_input(bucket)?;
 
         let _lock = self.writer_lock.lock();
@@ -2254,13 +2925,13 @@ impl BTree {
                         "catalog bucket update",
                     );
                 }
-                self.commit_txn_core(&core);
+                self.commit_txn_core(&mut core);
                 Ok(res)
             }
             Err(e) => {
                 drop(txn);
                 core.rollback_to(origin);
-                self.persist_rollback_meta(&core, "transaction rollback meta publication");
+                self.persist_rollback_meta(&mut core, "transaction rollback meta publication");
                 Err(e)
             }
         }
@@ -2273,6 +2944,7 @@ impl BTree {
     /// `enable_prefix_encoding` flag to select the node encoding. Returns
     /// [`Error::BucketExists`] when the name is already present in the catalog.
     pub fn new_bucket(&self, name: &str, enable_prefix_encoding: bool) -> Result<()> {
+        self.require_writable()?;
         validate_bucket_input(name)?;
 
         let _lock = self.writer_lock.lock();
@@ -2291,7 +2963,7 @@ impl BTree {
             core.catalog_put(name_bytes, metadata.as_slice()),
             "new_bucket catalog put",
         );
-        self.commit_txn_core(&core);
+        self.commit_txn_core(&mut core);
         Ok(())
     }
 
@@ -2316,6 +2988,7 @@ impl BTree {
     where
         F: FnOnce(&mut MultiTxn) -> Result<R>,
     {
+        self.require_writable()?;
         let _lock = self.writer_lock.lock();
 
         physical_value(self.refresh_internal(true), "BTree::exec_multi refresh");
@@ -2324,7 +2997,7 @@ impl BTree {
 
         let mut multi_txn = MultiTxn {
             core,
-            bucket_roots: HashMap::new(),
+            bucket_roots: BTreeMap::new(),
         };
 
         match f(&mut multi_txn) {
@@ -2341,13 +3014,13 @@ impl BTree {
                         "multi catalog bucket update",
                     );
                 }
-                self.commit_txn_core(&multi_txn.core);
+                self.commit_txn_core(&mut multi_txn.core);
                 Ok(res)
             }
             Err(e) => {
                 multi_txn.core.rollback_to(origin);
                 self.persist_rollback_meta(
-                    &multi_txn.core,
+                    &mut multi_txn.core,
                     "multi-transaction rollback meta publication",
                 );
                 Err(e)
@@ -2355,22 +3028,26 @@ impl BTree {
         }
     }
 
-    fn persist_rollback_meta(&self, core: &TxnCore<'_>, context: &'static str) {
-        // Physical page allocation is monotonic. A failed transaction restores roots
-        // and pending ownership, but it must publish any consumed MetaNode state.
+    fn persist_rollback_meta(&self, core: &mut TxnCore<'_>, context: &'static str) {
+        // Page allocation is monotonic: a failed transaction rolls the roots and its
+        // pending ownership back, but the MetaNode state it already consumed still has
+        // to be published, or the next reader would re-allocate those page ids.
         physical_value(self.commit_internal(core), context);
     }
 
-    fn persist_nested_rollback_meta(&self, core: &TxnCore<'_>, context: &'static str) {
+    fn persist_nested_rollback_meta(&self, core: &mut TxnCore<'_>, context: &'static str) {
         let snapshot = self.store.cached_snapshot();
         let published_snapshot = *self.local_snapshot.read();
         if snapshot == published_snapshot {
             return;
         }
 
-        // The outer transaction's bucket roots are still unpublished. Keep the
-        // durable catalog root at the last published generation while the
-        // working allocations remain quarantined until outer success.
+        // This path publishes the **live** high-water mark without going through
+        // `commit_internal`, so it must flush the retained Dirty items and cover the id space
+        // released-but-never-written PID outside the file.
+        core.read.flush_overlay();
+        core.read.cover_id_space();
+
         physical_value(
             self.runtime
                 .commit_generation_only(snapshot.catalog_root, &core.page_state.pending_alloc),
@@ -2379,7 +3056,7 @@ impl BTree {
         self.sync_local_snapshot_from_store();
     }
 
-    fn commit_txn_core(&self, core: &TxnCore<'_>) {
+    fn commit_txn_core(&self, core: &mut TxnCore<'_>) {
         physical_value(self.commit_internal(core), "transaction core commit");
     }
 
@@ -2404,10 +3081,6 @@ impl BTree {
     {
         validate_bucket_input(bucket)?;
 
-        // Pin the current epoch before any page read: the reader's snapshot
-        // pages stay protected from reuse for the whole closure, and the pin
-        // value being older than the refreshed snapshot only makes the
-        // allocator's promotion condition more conservative.
         let _guard = self.store.epoch.pin();
 
         // Refresh only when the shared published sequence is newer than this
@@ -2415,8 +3088,11 @@ impl BTree {
         let (latest_seq, mut latest_root) = self.store.shared_snapshot();
         let seq_changed = latest_seq != self.start_seq.load(Ordering::Acquire);
         if seq_changed {
-            // readers never install a disk-newer generation into the shared
-            // snapshot (see Store::refresh_sb)
+            // A reader passes `false`: the refresh reports the current *shared*
+            // generation and never installs a disk-newer one into the shared
+            // snapshot, because that would advance shared state mid-exec and trip
+            // the writer's sequence-conflict check. Only a writer, holding the
+            // writer lock, may install one.
             let snapshot = physical_value(self.store.refresh_sb(false), "BTree::view refresh");
             latest_root = snapshot.catalog_root;
             self.runtime.clear_cache();
@@ -2428,7 +3104,10 @@ impl BTree {
         let (catalog_leaf, catalog_pos) =
             Tree::find(read, RootRef::decode(latest_root), name_bytes)
                 .ok_or(Error::BucketNotFound)?;
-        let metadata = BucketMetadata::from_slice(catalog_leaf.value_at(catalog_pos));
+        let metadata = physical_value(
+            BucketMetadata::decode(catalog_leaf.value_at(catalog_pos)),
+            "bucket metadata record within catalog value",
+        );
         let bucket_root = metadata.root();
         let bucket_layout = layout_from_flags(metadata.flags());
         let read = read.with_layout(bucket_layout);
@@ -2444,11 +3123,11 @@ impl BTree {
         N: AsRef<str>,
     {
         let name = name.as_ref();
+        self.require_writable()?;
         validate_bucket_input(name)?;
 
         let _lock = self.writer_lock.lock();
 
-        // ensure we are operating on the latest state
         physical_value(self.refresh_internal(true), "BTree::del_bucket refresh");
 
         let name_bytes = name.as_bytes();
@@ -2456,7 +3135,11 @@ impl BTree {
         let read = core.read.clone();
         let (catalog_leaf, catalog_pos) =
             Tree::find(&read, core.catalog_root(), name_bytes).ok_or(Error::BucketNotFound)?;
-        let bucket_root = BucketMetadata::from_slice(catalog_leaf.value_at(catalog_pos)).root();
+        let bucket_root = physical_value(
+            BucketMetadata::decode(catalog_leaf.value_at(catalog_pos)),
+            "bucket metadata record within catalog value",
+        )
+        .root();
 
         let mut pages_to_free = Vec::new();
         let mut node_pages = Vec::new();
@@ -2485,13 +3168,13 @@ impl BTree {
             );
         }
         core.catalog_root = new_catalog_root;
-        core.page_state.pending_free.extend(pages_to_free);
+        core.retire_published_pages(pages_to_free);
         core.sync_pending_counts();
-        physical_value(self.commit_internal(&core), "BTree::del_bucket commit");
+        physical_value(self.commit_internal(&mut core), "BTree::del_bucket commit");
         Ok(())
     }
 
-    fn commit_internal(&self, core: &TxnCore<'_>) -> StoreResult<()> {
+    fn commit_internal(&self, core: &mut TxnCore<'_>) -> StoreResult<()> {
         let start_seq = self.start_seq.load(Ordering::Acquire);
         let (latest_seq, _) = self.store.shared_snapshot();
         if latest_seq != start_seq {
@@ -2515,8 +3198,17 @@ impl BTree {
             && snapshot.catalog_root == catalog_root
             && !meta_changed
         {
+            if core.read.overlay_has_dirty() {
+                invariant(
+                    "COMMIT_FAST_PATH_WITH_DEFERRED_PAGES",
+                    "a deferred page must reach the disk before a commit may publish nothing",
+                );
+            }
             return Ok(());
         }
+
+        core.read.flush_overlay();
+        core.read.cover_id_space();
 
         self.runtime.commit_roots_with_pending_alloc(
             catalog_root,
@@ -2537,7 +3229,7 @@ impl BTree {
     ///
     /// If there are no pending page allocations/frees and the current catalog
     /// root already matches the cached snapshot, this is a no-op and
-    /// returns `Ok(())`.
+    /// returns `Ok()`.
     ///
     /// Unlike [`BTree::exec`] and [`BTree::exec_multi`], this method does not
     /// refresh the handle to the latest on-disk state before attempting the
@@ -2549,9 +3241,10 @@ impl BTree {
     /// [`BTree::exec_multi`] closure on the same instance: the writer mutex is
     /// not reentrant and the call deadlocks.
     pub fn commit(&self) -> Result<()> {
+        self.require_writable()?;
         let _lock = self.writer_lock.lock();
-        let core = TxnCore::new(self);
-        physical_value(self.commit_internal(&core), "BTree::commit");
+        let mut core = TxnCore::new(self);
+        physical_value(self.commit_internal(&mut core), "BTree::commit");
         Ok(())
     }
 
@@ -2575,22 +3268,65 @@ impl BTree {
         Ok(physical_value(self.buckets_internal(), "BTree::buckets"))
     }
 
-    fn buckets_internal(&self) -> StoreResult<Vec<String>> {
-        let _guard = self.store.epoch.pin();
+    /// Bucket names with their persisted prefix-encoding policy, in catalog order.
+    ///
+    /// This is the migration's read-back surface: it must not skip an entry, so a
+    /// name that is not UTF-8 or a metadata record with an unexpected length is an
+    /// engine invariant violation rather than something to filter out (the engine
+    /// only ever writes `&str` names and fixed-width metadata records).
+    pub fn buckets_with_policy(&self) -> Result<Vec<(String, bool)>> {
+        Ok(physical_value(
+            self.buckets_with_policy_internal(),
+            "BTree::buckets_with_policy",
+        ))
+    }
 
-        // Same-process handles share the published sequence, so avoid rereading
-        // both superblock pages when the local snapshot is already current.
-        // readers never install a disk-newer generation into the shared
-        // snapshot (see Store::refresh_sb)
+    fn buckets_with_policy_internal(&self) -> StoreResult<Vec<(String, bool)>> {
+        let _guard = self.store.epoch.pin();
         self.refresh_internal(false)?;
         let snapshot = *self.local_snapshot.read();
         let read = TreeReadContext::new(self.runtime.clone());
 
-        let mut iter = Tree::iterator(
-            &read,
-            RootRef::decode(snapshot.catalog_root),
-            IteratorCacheMode::Default,
-        );
+        let mut iter = Tree::iterator(&read, RootRef::decode(snapshot.catalog_root));
+        let mut key_buf = Vec::new();
+        let mut val_buf = Vec::new();
+        let mut res = Vec::new();
+        while iter.next_ref(&mut key_buf, &mut val_buf) {
+            let Ok(name) = std::str::from_utf8(&key_buf) else {
+                invariant(
+                    "BUCKET_NAME_NOT_UTF8",
+                    "a catalog bucket name must be valid UTF-8",
+                );
+            };
+            if val_buf.len() != std::mem::size_of::<BucketMetadata>() {
+                invariant(
+                    "BUCKET_METADATA_LENGTH",
+                    "bucket metadata is a fixed-width record",
+                );
+            }
+            let flags = physical_value(
+                BucketMetadata::decode(&val_buf),
+                "bucket metadata record within catalog value",
+            )
+            .flags();
+            res.push((name.to_string(), layout_from_flags(flags) == Layout::Prefix));
+        }
+        Ok(res)
+    }
+
+    fn buckets_internal(&self) -> StoreResult<Vec<String>> {
+        let _guard = self.store.epoch.pin();
+
+        // Same-process handles share the published sequence, so avoid rereading
+        // both superblock pages when the local snapshot is already current. Passing
+        // `false` reports the current shared generation without installing a
+        // disk-newer one into the shared snapshot; only a writer, which holds the
+        // writer lock, may do that.
+        self.refresh_internal(false)?;
+        let snapshot = *self.local_snapshot.read();
+        let read = TreeReadContext::new(self.runtime.clone());
+
+        let mut iter = Tree::iterator(&read, RootRef::decode(snapshot.catalog_root));
         let mut key_buf = Vec::new();
         let mut val_buf = Vec::new();
         let mut res = Vec::new();
@@ -2602,18 +3338,112 @@ impl BTree {
         Ok(res)
     }
 
-    /// Returns the current transaction sequence number.
-    /// Useful for monitoring and testing.
+    /// Writes a snapshot of this store to `dst`.
+    ///
+    /// The snapshot is a standalone database file equal to the generation named
+    /// by the returned [`Snapshot::seq`]: every byte is read while that
+    /// generation is pinned, so commits running during the copy are neither
+    /// blocked nor included, and later generations never appear in it.
+    /// [`BTree::open`] accepts the result, and it can be written to afterwards.
+    /// Late writes can still be present as bytes in pages the frozen generation
+    /// classifies as free; no traversal can reach them, and a page is always
+    /// rewritten before it is referenced again.
+    ///
+    /// `dst` is used exactly as given: it is created when missing and truncated
+    /// when present, and its contents are replaced. The bytes are written
+    /// directly to `dst` — there is no staging file and no rename — so a failed
+    /// call can leave a partial file behind.
+    ///
+    /// This store's own file is refused: if `dst` resolves to the same file as
+    /// this store, the call returns [`OpenError::Io`] and the database is left
+    /// untouched. The refusal matches files that share an inode where the
+    /// platform exposes file identity (unix) and otherwise compares resolved
+    /// paths, so a hard link to this store's own file is only recognised on
+    /// unix.
+    ///
+    /// Any other destination is the caller's responsibility: the destination
+    /// must not be read, opened, or written by anyone else while the call runs,
+    /// and that includes another open [`BTree`] on the same path, which this
+    /// call would silently overwrite.
+    ///
+    /// Calling this from inside a transaction closure of this instance snapshots
+    /// the last published generation; the closure's uncommitted changes are not
+    /// part of it.
+    pub fn take_snapshot<P: AsRef<Path>>(&self, dst: P) -> OpenResult<Snapshot> {
+        if self.options.read_only {
+            return Err(OpenError::ReadOnly);
+        }
+        self.store.take_snapshot(dst.as_ref())
+    }
+
     #[doc(hidden)]
     pub fn current_seq(&self) -> u64 {
         self.store.get_seq()
     }
 
-    /// Returns the number of (allocated, freed) pages currently pending commit in this handle.
-    /// Useful for monitoring and testing.
+    /// Returns whether `path` still names the file held by this handle.
+    ///
+    /// A path can be replaced with `rename` without changing the inode locked by
+    /// this handle, so callers that audit a path and then read through this handle
+    /// must check the identity at their phase boundaries. Platforms without a
+    /// file identity API return an error rather than accepting an unproven match.
+    #[doc(hidden)]
+    pub fn path_is_same_file<P: AsRef<Path>>(&self, path: P) -> io::Result<bool> {
+        self.store.path_is_same_file(path.as_ref())
+    }
+
     #[doc(hidden)]
     pub fn pending_pages(&self) -> (usize, usize) {
         self.pending_counts.snapshot()
+    }
+
+    /// Sets the residency budget (in pages) used by write transactions this handle creates
+    /// afterwards; `0` keeps ownership but no residency (the budget entry point). Monitoring
+    /// and testing only: the default stays an internal constant.
+    #[cfg(test)]
+    fn set_resident_limit(&self, limit: usize) {
+        self.resident_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// Sets the dirty budget (in pages) used by write transactions this handle creates afterwards;
+    /// `0` writes through immediately (the budget is exhausted). Monitoring and testing only.
+    #[cfg(test)]
+    fn set_dirty_limit(&self, limit: usize) {
+        self.dirty_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// Puts one page into a write transaction's overlay and takes a checkpoint, which must abort
+    /// the process (the subprocess test asserts the fatal path, not the `unreachable!` below).
+    #[cfg(test)]
+    pub(crate) fn checkpoint_with_a_resident_page(&self) {
+        let _lock = self.writer_lock.lock();
+        physical_value(
+            self.refresh_internal(true),
+            "checkpoint precondition refresh",
+        );
+        let core = TxnCore::new(self);
+        if let Some(overlay) = &core.read.overlay {
+            overlay.write().insert_dirty(7, Arc::new(Node::new_leaf()));
+        }
+        let _ = core.checkpoint();
+        unreachable!("the checkpoint precondition must abort before this point");
+    }
+
+    /// The other forbidden state: pages owned while every entry was evicted (reachable with
+    /// `resident_limit = 0`). A checkpoint here must abort too.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_with_owned_pages_only(&self) {
+        let _lock = self.writer_lock.lock();
+        physical_value(
+            self.refresh_internal(true),
+            "checkpoint precondition refresh",
+        );
+        let core = TxnCore::new(self);
+        if let Some(overlay) = &core.read.overlay {
+            overlay.write().note_owned(7);
+        }
+        let _ = core.checkpoint();
+        unreachable!("the checkpoint precondition must abort before this point");
     }
 }
 
@@ -2628,6 +3458,8 @@ impl Clone for BTree {
             writer_lock: self.writer_lock.clone(),
             read: self.read.clone(),
             pending_counts: self.pending_counts.clone(),
+            resident_limit: self.resident_limit.clone(),
+            dirty_limit: self.dirty_limit.clone(),
             start_seq: Arc::new(AtomicU64::new(snapshot.seq)),
             local_snapshot: Arc::new(RwLock::new(snapshot)),
             options: self.options.clone(),
@@ -2641,6 +3473,12 @@ mod tests {
     use super::*;
     use crate::node::Node;
     use crate::node::PAGE_SIZE;
+    use crate::store::BEFORE_META_SLOT_WRITE;
+    use crate::store::PublicationPoint;
+    use crate::test_support::child_test_command;
+
+    const DEFERRED_FAULT_CHILD_PATH: &str = "BTREE_DEFERRED_FAULT_CHILD_PATH";
+    use crate::store::NodeIoKind;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::collections::BTreeMap;
 
@@ -2650,6 +3488,1502 @@ mod tests {
 
     fn test_runtime(store: Arc<Store>) -> Arc<BTreeRuntime> {
         BTreeRuntime::new(store, OpenOptions::default().cache_capacity)
+    }
+
+    /// Eviction is FIFO and drops the oldest entry only. Losing residency must
+    /// never lose ownership — otherwise a later read would be routed to the shared
+    /// cache as if the page were published.
+    #[test]
+    fn overlay_eviction_is_fifo_and_preserves_ownership() {
+        let mut overlay = TxnOverlay::new(2, DEFAULT_DIRTY_LIMIT);
+        let first = Arc::new(Node::new_leaf());
+        let second = Arc::new(Node::new_leaf());
+        let third = Arc::new(Node::new_leaf());
+        overlay.insert_clean(10, first);
+        overlay.insert_clean(11, second.clone());
+        overlay.insert_clean(12, third.clone());
+
+        assert_eq!(overlay.len(), 2, "the budget is honoured");
+        assert!(
+            overlay.get(10).is_none(),
+            "the oldest entry is the one dropped"
+        );
+        assert!(overlay.owns(10), "eviction must not delete ownership");
+        assert!(Arc::ptr_eq(&overlay.get(11).unwrap(), &second));
+        assert!(Arc::ptr_eq(&overlay.get(12).unwrap(), &third));
+    }
+
+    #[test]
+    fn overlay_rewrite_refreshes_and_reinserts_after_eviction() {
+        let mut overlay = TxnOverlay::new(1, DEFAULT_DIRTY_LIMIT);
+        let rewritten = Arc::new(Node::new_leaf());
+        overlay.insert_clean(5, Arc::new(Node::new_leaf()));
+        overlay.insert_clean(5, rewritten.clone());
+        assert_eq!(overlay.len(), 1);
+        assert!(Arc::ptr_eq(&overlay.get(5).unwrap(), &rewritten));
+
+        overlay.insert_clean(6, Arc::new(Node::new_leaf()));
+        assert!(overlay.get(5).is_none() && overlay.get(6).is_some());
+
+        overlay.insert_clean(5, rewritten.clone());
+        assert!(overlay.owns(5) && Arc::ptr_eq(&overlay.get(5).unwrap(), &rewritten));
+    }
+
+    /// `resident_limit = 0` keeps ownership without residency: reads fall back to
+    /// `read_node_without_cache` + re-insert (the zero-budget case).
+    #[test]
+    fn overlay_zero_budget_keeps_ownership_without_residency() {
+        let mut overlay = TxnOverlay::new(0, DEFAULT_DIRTY_LIMIT);
+        overlay.insert_clean(7, Arc::new(Node::new_leaf()));
+        assert_eq!(overlay.len(), 0);
+        assert!(overlay.owns(7));
+    }
+
+    #[test]
+    fn overlay_queue_stays_tied_to_clean_entries_not_to_writes() {
+        let mut overlay = TxnOverlay::new(DEFAULT_RESIDENT_LIMIT, 0);
+        let node = || Arc::new(Node::new_leaf());
+        for _ in 0..1_000 {
+            // released — the freed PID goes straight back to the reusable set.
+            overlay.insert_clean(7, node());
+            overlay.drop_pages(7, 1);
+        }
+        assert_eq!(overlay.clean_count(), 0, "every release drops its entry");
+        assert!(
+            overlay.order_len() <= 2 * overlay.clean_count() + 1,
+            "{} queue slots after 1000 writes; the queue must stay tied to the resident entries",
+            overlay.order_len()
+        );
+    }
+
+    /// Record the workset (= peak of `owned`) first, then drive the
+    /// budgets from it. A write transaction must answer its own reads at every budget —
+    /// including budgets that evict immediately — and **no page it wrote may enter the shared
+    /// cache** (transaction-private pages never enter the shared cache). Ownership survives eviction, so an evicted page still takes the
+    /// overlay-miss path instead of `load_node_miss`.
+    #[test]
+    fn transaction_owns_its_writes_across_residency_budgets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("overlay-budget.db")).unwrap();
+        tree.new_bucket("warm", false).unwrap();
+        tree.set_resident_limit(DEFAULT_RESIDENT_LIMIT);
+        tree.set_dirty_limit(0);
+
+        let workset = tree
+            .exec("warm", |txn| {
+                txn.put(b"k", b"v")?;
+                txn.put(b"shared", b"shared-value")?;
+                Ok(txn.read.overlay_owned_peak())
+            })
+            .unwrap();
+        assert!(
+            workset > 0,
+            "the workset must be recorded before a budget is chosen"
+        );
+
+        fn collect(txn: &Txn<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut it = txn.iter();
+            let (mut key, mut value) = (Vec::new(), Vec::new());
+            let mut out = Vec::new();
+            while it.next_ref(&mut key, &mut value) {
+                out.push((key.clone(), value.clone()));
+            }
+            out
+        }
+
+        for limit in [0usize, 1, workset * 2] {
+            let bucket = format!("b{limit}");
+            tree.set_resident_limit(limit);
+            tree.new_bucket(&bucket, false).unwrap();
+            let writes_before = tree.store.node_io.writes().len();
+            let key = format!("k{limit}").into_bytes();
+            let value = format!("v{limit}").into_bytes();
+
+            tree.exec(&bucket, |txn| {
+                txn.put(&key, &value)?;
+                txn.put(b"shared", b"shared-value")?;
+                assert_eq!(txn.get(&key)?, value);
+                assert_eq!(txn.get(b"shared")?, b"shared-value".to_vec());
+
+                let visible = collect(txn);
+                assert_eq!(
+                    visible.len(),
+                    2,
+                    "both keys are visible inside the transaction"
+                );
+
+                let (_, clean) = txn.read.overlay_tiers();
+                if limit == 0 {
+                    assert_eq!(clean, 0, "a zero residency budget keeps no Clean entry");
+                } else {
+                    assert!(clean > 0, "a non-zero budget holds Clean residency");
+                }
+                assert_eq!(
+                    tree.store.node_io.max_writes_per_incarnation(),
+                    1,
+                    "no (PID, incarnation) may be written twice"
+                );
+                Ok(())
+            })
+            .unwrap();
+
+            let written = tree.store.node_io.writes()[writes_before..].to_vec();
+            assert!(!written.is_empty(), "the put wrote node pages");
+            tree.set_resident_limit(DEFAULT_RESIDENT_LIMIT);
+        }
+        tree.set_dirty_limit(DEFAULT_DIRTY_LIMIT);
+    }
+
+    /// A PID released inside a transaction and handed out again is a **new
+    /// incarnation**. The second bucket below allocates node pages and then fails, so its PIDs
+    /// return to `reusable` and the outer transaction allocates again — the very case where a
+    /// bare PID count would report a double write that never happened.
+    #[test]
+    fn write_log_attributes_reused_pids_to_separate_incarnations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("incarnation.db")).unwrap();
+        tree.new_bucket("a", false).unwrap();
+        tree.new_bucket("b", false).unwrap();
+
+        tree.exec_multi(|multi| {
+            multi.exec("a", |txn| txn.put(b"k1", b"v1"))?;
+            let failed = multi.exec("b", |txn| -> Result<()> {
+                txn.put(b"k2", b"v2")?;
+                Err(Error::KeyNotFound)
+            });
+            assert!(
+                failed.is_err(),
+                "bucket b must fail after allocating node pages"
+            );
+            multi.exec("a", |txn| txn.put(b"k3", b"v3"))
+        })
+        .unwrap();
+
+        let events = tree.store.node_io.events();
+        let mut allocs: std::collections::HashMap<PageId, usize> = std::collections::HashMap::new();
+        for event in &events {
+            if event.kind == NodeIoKind::Alloc {
+                *allocs.entry(event.pid).or_default() += 1;
+            }
+        }
+        assert!(
+            allocs.values().any(|&count| count >= 2),
+            "the workload must hand a recycled PID out twice, otherwise this test proves nothing"
+        );
+        assert_eq!(
+            tree.store.node_io.max_writes_per_incarnation(),
+            1,
+            "each write belongs to its own incarnation"
+        );
+        let mut per_pid: std::collections::HashMap<PageId, usize> =
+            std::collections::HashMap::new();
+        for pid in tree.store.node_io.writes() {
+            *per_pid.entry(pid).or_default() += 1;
+        }
+        assert!(
+            per_pid.values().any(|&count| count >= 2),
+            "a bare PID count would report a double write for a recycled PID"
+        );
+    }
+
+    /// A checkpoint taken while a page is resident must end the process on the
+    /// invariant path — `rollback_to` could not otherwise restore a state the overlay describes.
+    /// Subprocess, because `invariant` aborts (`#[should_panic]` would kill this test binary).
+    #[test]
+    fn checkpoint_with_a_nonempty_overlay_aborts() {
+        // The child aborts, so a temporary directory of its own would outlive
+        // the process that made it. The parent owns one and names the file.
+        let dir = tempfile::TempDir::new().unwrap();
+        // Both forbidden shapes: a resident entry, and the ownership-only state that outlives
+        for mode in ["resident", "owned"] {
+            let output = child_test_command(&std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::checkpoint_with_a_resident_page_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("BTREE_CHECKPOINT_CHILD", mode)
+                .env(
+                    "BTREE_CHECKPOINT_CHILD_DB",
+                    dir.path().join(format!("checkpoint-child-{mode}.db")),
+                )
+                .output()
+                .unwrap();
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !output.status.success(),
+                "[{mode}] a forbidden checkpoint must abort: {combined}"
+            );
+            assert!(
+                combined.contains("btree-store fatal code=BTREE_FATAL_INVARIANT")
+                    && combined.contains("fault=CHECKPOINT_AT_TXN_START"),
+                "[{mode}] the failure must name the invariant: {combined}"
+            );
+            assert!(
+                !combined.contains("panicked at"),
+                "[{mode}] the guard must be the fatal path, not a panic: {combined}"
+            );
+            assert!(
+                !combined.contains("unreachable"),
+                "[{mode}] the guard must fire before the helper's `unreachable!`: {combined}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess target for the checkpoint precondition"]
+    fn checkpoint_with_a_resident_page_child() {
+        let Ok(mode) = std::env::var("BTREE_CHECKPOINT_CHILD") else {
+            return;
+        };
+        // The parent owns the directory: this process is about to abort, and a
+        // temporary directory of its own would never be removed.
+        let Ok(path) = std::env::var("BTREE_CHECKPOINT_CHILD_DB") else {
+            return;
+        };
+        let tree = BTree::open(path).unwrap();
+        tree.new_bucket("b", false).unwrap();
+        match mode.as_str() {
+            "owned" => tree.checkpoint_with_owned_pages_only(),
+            _ => tree.checkpoint_with_a_resident_page(),
+        }
+    }
+
+    /// A whole-transaction rollback restores its checkpoint by clearing the overlay,
+    /// so the publication that follows cannot flush the discarded pages. Witnesses: no node page
+    /// reaches the disk, and the earlier content survives a reopen.
+    #[test]
+    fn whole_transaction_rollback_clears_residency() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rollback-clears.db");
+        let tree = BTree::open(&path).unwrap();
+        tree.new_bucket("a", false).unwrap();
+        tree.exec("a", |txn| txn.put(b"keep", b"value")).unwrap();
+
+        let writes_before = tree.store.node_io.writes().len();
+        let failed = tree.exec_multi(|multi| -> Result<()> {
+            multi.exec("a", |txn| txn.put(b"gone", b"value"))?;
+            Err(Error::KeyNotFound)
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            tree.store.node_io.writes().len(),
+            writes_before,
+            "a rolled-back transaction must leave nothing for the publication to flush"
+        );
+
+        drop(tree);
+        let reopened = BTree::open(&path).unwrap();
+        assert_eq!(
+            reopened.view("a", |v| v.get(b"keep")).unwrap(),
+            b"value".to_vec()
+        );
+        assert!(reopened.view("a", |v| v.get(b"gone")).is_err());
+    }
+
+    /// Across the dirty budgets the write path must switch exactly once —
+    /// exhaust the budget, write through from then on, keep the already-dirty pages dirty until the
+    /// commit flush — and the documented bounds must hold at every sampling point.
+    #[test]
+    fn dirty_budget_matrix_holds_the_documented_bounds() {
+        for (dirty_limit, resident_limit, puts, survives) in [
+            (1024usize, 8usize, 128usize, true),
+            (64, 8, 128, true),
+            (8, 8, 128, true),
+            (64, 8, 4000, false),
+            (8, 8, 4000, false),
+            (1, 8, 4000, false),
+            (8, 4096, 4000, false),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join(format!("budget-{dirty_limit}.db"));
+            let tree = BTree::open(&path).unwrap();
+            tree.new_bucket("b", false).unwrap();
+            tree.set_dirty_limit(dirty_limit);
+            tree.set_resident_limit(resident_limit);
+
+            let mut dirty_before_flush = 0usize;
+            let mut dirty_pids = Vec::new();
+            tree.exec("b", |txn| {
+                for index in 0..puts {
+                    txn.put(format!("k{index:06}").as_bytes(), b"value")?;
+                }
+                let (dirty, clean) = txn.read.overlay_tiers();
+                assert_eq!(
+                    txn.read.overlay_defer_enabled(),
+                    survives,
+                    "dirty_limit {dirty_limit} over {puts} puts: the budget must {} have been exhausted",
+                    if survives { "not" } else { "" }
+                );
+                assert!(
+                    dirty <= txn.read.overlay_owned_peak(),
+                    "dirty_limit {dirty_limit}: the dirty set is a subset of the pages written within the budget"
+                );
+                if survives {
+                    assert!(
+                        dirty > 0,
+                        "dirty_limit {dirty_limit}: pages written within the budget stay Dirty"
+                    );
+                    assert_eq!(
+                        clean, 0,
+                        "dirty_limit {dirty_limit}: nothing is written through while the budget lasts"
+                    );
+                } else {
+                    assert!(
+                        dirty <= dirty_limit,
+                        "dirty_limit {dirty_limit}: {dirty} dirty entries must stay within budget"
+                    );
+                    assert!(
+                        clean > 0,
+                        "pages written after the budget ran out go to disk immediately"
+                    );
+                }
+                assert!(
+                    clean <= resident_limit,
+                    "resident_limit {resident_limit}: {clean} clean entries exceed the budget"
+                );
+                assert!(
+                    dirty + clean <= dirty_limit + resident_limit,
+                    "entry memory must stay within dirty_limit + resident_limit"
+                );
+                assert!(
+                    txn.read.overlay_order_len() <= 2 * clean + 1,
+                    "dirty_limit {dirty_limit}: {} eviction-queue slots for {clean} resident \
+                     entries; the queue must not grow with the transaction's writes",
+                    txn.read.overlay_order_len()
+                );
+                dirty_before_flush = dirty;
+                dirty_pids = txn.read.overlay_dirty_pids();
+                Ok(())
+            })
+            .unwrap();
+
+            let stats = tree
+                .store
+                .node_io
+                .flushes()
+                .last()
+                .cloned()
+                .expect("a commit flush");
+            assert!(
+                stats.dirty_pages >= dirty_before_flush,
+                "dirty_limit {dirty_limit}: the flush must hand over at least the Dirty tier"
+            );
+            assert!(
+                dirty_pids.iter().all(|pid| stats.pids.contains(pid)),
+                "dirty_limit {dirty_limit}: every page that was Dirty at commit time must be written by the flush (the commit path may dirty the catalog/root on top)"
+            );
+            assert_eq!(
+                stats.pids.len(),
+                stats.dirty_pages,
+                "dirty_limit {dirty_limit}: the flush writes each handed page once"
+            );
+            let mut unique = stats.pids.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                stats.pids.len(),
+                "dirty_limit {dirty_limit}: the flush must not hand a page over twice"
+            );
+            for pid in &stats.pids {
+                assert_eq!(
+                    tree.store
+                        .node_io
+                        .writes()
+                        .iter()
+                        .filter(|written| *written == pid)
+                        .count(),
+                    1,
+                    "dirty_limit {dirty_limit}: page {pid} is written exactly once per incarnation"
+                );
+            }
+            assert_eq!(
+                tree.store.node_io.max_writes_per_incarnation(),
+                1,
+                "dirty_limit {dirty_limit}: a page is written once per incarnation"
+            );
+
+            drop(tree);
+            let reopened = BTree::open(&path).unwrap();
+            for index in (0..puts).step_by(97) {
+                assert_eq!(
+                    reopened
+                        .view("b", |view| view.get(format!("k{index:06}").as_bytes()))
+                        .unwrap(),
+                    b"value".to_vec(),
+                    "dirty_limit {dirty_limit}: reopened content must match"
+                );
+            }
+        }
+    }
+
+    /// Residency must be observable independent of the shared cache. With a
+    /// budget that covers the workset every read-back is answered from the overlay; with a budget
+    /// below it the misses must not backfill the shared cache and the content must still be right.
+    /// `defer` on/off decides which tier provides the residency, not the guarantees.
+    #[test]
+    fn residency_and_misses_are_independent_of_the_shared_cache() {
+        const GENEROUS: usize = 4096;
+        // Enough keys that the leaf splits: the workset must exceed the small budgets below.
+        let requests = 512usize;
+        let value = vec![b'v'; 1024];
+        for defer in [true, false] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let tree = BTree::open(dir.path().join("residency.db")).unwrap();
+            tree.new_bucket("b", false).unwrap();
+            tree.set_dirty_limit(if defer { DEFAULT_DIRTY_LIMIT } else { 0 });
+
+            for (label, resident) in [
+                ("resident>=workset", GENEROUS),
+                ("resident=2<workset", 2),
+                ("resident=0<workset", 0),
+            ] {
+                tree.set_resident_limit(resident);
+                let cache_puts_before = tree.store.node_io.cache_puts().len();
+                let mut owned = Vec::new();
+                let mut hits = 0usize;
+                let mut misses = 0usize;
+                tree.exec("b", |txn| {
+                    for index in 0..requests {
+                        txn.put(format!("k{index:04}").as_bytes(), &value)?;
+                    }
+                    owned = txn.read.overlay_owned_pids();
+                    assert!(
+                        txn.read.overlay_owned_peak() > 2,
+                        "defer={defer} {label}: the workload's workset must exceed the small budgets"
+                    );
+
+                    // The `true` rows below only hold while the dirty budget has not
+                    // been exhausted. Exhausting it turns defer off, after which
+                    // entries become `Clean` and `resident_limit` binds them, so a
+                    // larger workset would break those rows for the wrong reason.
+                    assert_eq!(
+                        txn.read.overlay_defer_enabled(),
+                        defer,
+                        "defer={defer} {label}: the dirty budget must not have been exhausted, \
+                         or this row is testing the clean-tier path under a defer label"
+                    );
+                    for index in 0..requests {
+                        assert_eq!(
+                            txn.get(format!("k{index:04}").as_bytes())?,
+                            value,
+                            "defer={defer} {label}: content must be correct"
+                        );
+                    }
+                    hits = tree
+                        .store
+                        .node_io
+                        .overlay_hits()
+                        .iter()
+                        .filter(|pid| owned.contains(pid))
+                        .count();
+                    // A miss is the owned-PID read-back that residency could not answer. It
+                    // counts node loads, not keys: one `get` may traverse several levels.
+                    misses = tree
+                        .store
+                        .node_io
+                        .class_pids(NodeIoKind::OverlayMiss)
+                        .iter()
+                        .filter(|pid| owned.contains(pid))
+                        .count();
+                    Ok(())
+                })
+                .unwrap();
+
+                let cache_puts = tree.store.node_io.cache_puts();
+                assert!(
+                    !cache_puts[cache_puts_before..]
+                        .iter()
+                        .any(|pid| owned.contains(pid)),
+                    "defer={defer} {label}: a miss must never backfill the shared cache"
+                );
+                match (defer, resident) {
+                    // A budget that covers the workset must answer every read from the overlay.
+                    (_, GENEROUS) => {
+                        assert!(
+                            hits >= requests,
+                            "defer={defer} {label}: every read-back must hit the overlay, saw {hits}"
+                        );
+                        assert_eq!(
+                            misses, 0,
+                            "defer={defer} {label}: a budget over the workset misses nothing"
+                        );
+                    }
+                    (false, 0) => {
+                        assert_eq!(
+                            hits, 0,
+                            "defer={defer} {label}: with no residency at all nothing can hit"
+                        );
+                        assert!(
+                            misses > 0,
+                            "defer={defer} {label}: with no residency every read-back misses"
+                        );
+                    }
+                    // With `defer` on, `Dirty` entries are the page's only copy and are never
+                    // evicted, so `resident_limit` cannot bound them however small it is:
+                    // `evict_excess_clean` only pops PIDs that entered the `Clean` queue, and
+                    // `insert_dirty` never enqueues one. Evicting a Dirty entry would drop the
+                    // only copy of a page that is not on disk yet, so the read-back must still
+                    // be served at every budget.
+                    (true, 2) | (true, 0) => {
+                        assert!(
+                            hits >= requests,
+                            "defer={defer} {label}: Dirty residency ignores the budget, so every \
+                             read-back must hit the overlay, saw {hits}"
+                        );
+                        assert_eq!(
+                            misses, 0,
+                            "defer={defer} {label}: a Dirty entry is never an eviction candidate, \
+                             so a budget of {resident} must still miss nothing"
+                        );
+                    }
+                    // Without defer the entries are `Clean` and the budget binds them, so a
+                    // budget below the workset *must* cost residency — that is what makes
+                    // `resident=2` a residency test at all. Eviction is only a locality loss:
+                    // the content assertion above covers correctness either way.
+                    (false, 2) => assert!(
+                        misses > 0,
+                        "defer={defer} {label}: a budget below the workset must miss at least one \
+                         owned read-back, saw {misses} misses over {hits} hits"
+                    ),
+                    (defer, resident) => unreachable!(
+                        "defer={defer} {label}: unclassified residency row (defer={defer}, \
+                         resident={resident})"
+                    ),
+                }
+                eprintln!(
+                    "residency report: defer={defer} {label} reads={requests} overlay-hits={hits} \
+                     misses={misses} shared-cache-puts=0"
+                );
+            }
+            tree.set_dirty_limit(DEFAULT_DIRTY_LIMIT);
+            tree.set_resident_limit(DEFAULT_RESIDENT_LIMIT);
+        }
+    }
+
+    /// A reachable Dirty page must not leave its tier except through a flush:
+    /// inside one transaction a page that sits in the `Dirty` tier stays there — it may leave only
+    /// because it was released (`releases` holds it) or because a flush ran. Sampled after every
+    /// put, so a silent drop between the flush and the commit would fail here.
+    #[test]
+    fn a_reachable_dirty_page_never_leaves_the_dirty_tier() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("dirty-monotone.db")).unwrap();
+        tree.new_bucket("b", false).unwrap();
+        tree.set_dirty_limit(DEFAULT_DIRTY_LIMIT);
+
+        let mut samples: Vec<(Vec<PageId>, Vec<PageId>, usize)> = Vec::new();
+        tree.exec("b", |txn| {
+            for index in 0..24u32 {
+                txn.put(format!("k{index:03}").as_bytes(), b"value")?;
+                let (_, clean) = txn.read.overlay_tiers();
+                assert_eq!(
+                    clean, 0,
+                    "no page is written through while the budget lasts"
+                );
+                samples.push((
+                    txn.read.overlay_dirty_pids(),
+                    tree.store.node_io.releases(),
+                    tree.store.node_io.flushes().len(),
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!samples.is_empty(), "the workload sampled the tier");
+        for window in samples.windows(2) {
+            let (before, _, flushes_before) = &window[0];
+            let (after, releases_after, flushes_after) = &window[1];
+            assert_eq!(
+                flushes_before, flushes_after,
+                "a transaction must not flush before its commit"
+            );
+            for pid in before {
+                assert!(
+                    after.contains(pid) || releases_after.contains(pid),
+                    "page {pid} left the Dirty tier with neither a flush nor a release"
+                );
+            }
+        }
+        assert!(
+            !samples.last().unwrap().0.is_empty(),
+            "the transaction must still hold Dirty pages when it ends"
+        );
+    }
+
+    /// The bucket-deletion path frees *published* pages
+    /// only — it hands no page of its own transaction back — so it needs no overlay hook. This is
+    /// the executable form of that claim: the deletion reports no release (a release would have to
+    /// come from its own overlay) and the deleted tree's pages land in the durable allocator.
+    #[test]
+    fn bucket_deletion_releases_published_pages_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bucket-drop.db");
+        let tree = BTree::open(&path).unwrap();
+        tree.new_bucket("keep", false).unwrap();
+        tree.new_bucket("drop", false).unwrap();
+        tree.exec("drop", |txn| {
+            for index in 0..64u32 {
+                txn.put(format!("k{index:03}").as_bytes(), b"value")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let releases_before = tree.store.node_io.releases().len();
+        let free_before = tree.store.free_page_count_for_test();
+        tree.del_bucket("drop").unwrap();
+
+        assert_eq!(
+            tree.store.node_io.releases().len(),
+            releases_before,
+            "dropping a bucket frees published pages only: it releases no page of its own transaction"
+        );
+        assert!(
+            tree.store.free_page_count_for_test() > free_before,
+            "the deleted tree's pages are returned to the allocator"
+        );
+        assert!(
+            tree.buckets().unwrap().iter().all(|name| name != "drop"),
+            "the bucket is gone"
+        );
+        assert!(tree.view("keep", |view| view.get(b"k000")).is_err());
+        assert_nonempty_generation_page_accounting(&tree);
+
+        drop(tree);
+        let reopened = BTree::open(&path).unwrap();
+        assert_nonempty_generation_page_accounting(&reopened);
+    }
+
+    #[test]
+    fn publication_io_classes_name_the_written_meta_and_allocator_pages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("publication-classes.db");
+        let tree = BTree::open(&path).unwrap();
+        tree.new_bucket("b", false).unwrap();
+        tree.exec("b", |txn| txn.put(b"k", b"first")).unwrap();
+        let events_before = tree.store.node_io.events().len();
+        tree.exec("b", |txn| txn.put(b"k", b"second")).unwrap();
+        let events = tree.store.node_io.events();
+        let events = &events[events_before..];
+        // An open store locks its file for as long as it lives, so the pages are
+        // read after the handle is gone: Windows refuses a second handle on a
+        // locked range even inside the same process.
+        drop(tree);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut allocator_pages = HashSet::new();
+        let meta = snapshot_meta(&path);
+        for root in [meta.reusable_root, meta.retired_root] {
+            let mut pid = root;
+            while pid != 0 {
+                assert!(allocator_pages.insert(pid));
+                let start = pid as usize * PAGE_SIZE;
+                pid = u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap());
+            }
+        }
+        assert!(!allocator_pages.is_empty());
+        let observed: HashSet<_> = events
+            .iter()
+            .filter(|event| event.kind == NodeIoKind::AllocatorWrite)
+            .map(|event| event.pid)
+            .collect();
+        assert_eq!(observed, allocator_pages);
+        let meta_writes: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == NodeIoKind::MetaWrite)
+            .map(|event| event.pid)
+            .collect();
+        assert_eq!(meta_writes.len(), 1);
+        let start = meta_writes[0] as usize * PAGE_SIZE;
+        assert_eq!(
+            MetaNode::from_slice(&bytes[start..start + 40]).seq,
+            meta.seq
+        );
+        assert_eq!(events.last().unwrap().kind, NodeIoKind::MetaWrite);
+    }
+
+    /// An update/delete of an **absent** key must not allocate or write any page: the lookup fails
+    /// before anything is modified, so only read-class events may appear.
+    #[test]
+    fn absent_key_update_and_delete_touch_no_page() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("noop.db")).unwrap();
+        tree.new_bucket("b", false).unwrap();
+        tree.exec("b", |txn| txn.put(b"k", b"v")).unwrap();
+
+        tree.exec("b", |txn| {
+            let events_before = tree.store.node_io.events().len();
+            let owned_before = txn.read.overlay_owned_pids();
+            assert!(
+                !txn.update(b"missing", b"x")?,
+                "an absent key is not updated"
+            );
+            assert!(
+                matches!(txn.del(b"missing"), Err(Error::KeyNotFound)),
+                "an absent key cannot be deleted"
+            );
+            assert_eq!(
+                txn.read.overlay_owned_pids(),
+                owned_before,
+                "a no-op update/delete must not own a page"
+            );
+            let writes = tree.store.node_io.events()[events_before..]
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        NodeIoKind::Alloc
+                            | NodeIoKind::Write
+                            | NodeIoKind::ValueWrite
+                            | NodeIoKind::IndirectWrite
+                            | NodeIoKind::AllocatorWrite
+                            | NodeIoKind::MetaWrite
+                            | NodeIoKind::Cover
+                    )
+                })
+                .count();
+            assert_eq!(
+                writes, 0,
+                "a no-op update/delete must not allocate or write any page (reads are fine)"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            tree.view("b", |view| view.get(b"k")).unwrap(),
+            b"v".to_vec()
+        );
+    }
+
+    /// The observable form of the one-write-per-incarnation rule. After a PID is
+    /// released and handed out again, every read path — the same handle, a later write transaction,
+    /// and a reopen — must see the *new* incarnation's content, and a later write transaction must
+    /// never COW from the previous incarnation's bytes.
+    #[test]
+    fn reused_page_ids_never_expose_a_previous_incarnation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t10.db");
+        let tree = BTree::open(&path).unwrap();
+        tree.new_bucket("b", false).unwrap();
+
+        let first = vec![0xAAu8; 200_000];
+        tree.exec("b", |txn| txn.put(b"first", &first)).unwrap();
+        assert_eq!(tree.view("b", |v| v.get(b"first")).unwrap(), first);
+        tree.exec("b", |txn| txn.del(b"first")).unwrap();
+
+        let second = vec![0xBBu8; 200_000];
+        tree.exec("b", |txn| txn.put(b"second", &second)).unwrap();
+
+        assert!(
+            matches!(tree.view("b", |v| v.get(b"first")), Err(Error::KeyNotFound)),
+            "the deleted key must not come back through a recycled PID"
+        );
+        assert_eq!(
+            tree.view("b", |v| v.get(b"second")).unwrap(),
+            second,
+            "a recycled PID must expose the new incarnation's bytes"
+        );
+
+        // A later write transaction must not COW from the previous incarnation: rewriting the
+        tree.exec("b", |txn| txn.put(b"second", b"small")).unwrap();
+        assert_eq!(
+            tree.view("b", |v| v.get(b"second")).unwrap(),
+            b"small".to_vec()
+        );
+        tree.exec("b", |txn| txn.put(b"third", &first)).unwrap();
+        assert_eq!(tree.view("b", |v| v.get(b"third")).unwrap(), first);
+
+        // from the first transaction must have been handed out again. Those pages are written
+        // immediately and never live in the overlay, so they are the reuse case where stale bytes
+        let value_pids: Vec<PageId> = tree
+            .store
+            .node_io
+            .class_pids(NodeIoKind::ValueWrite)
+            .into_iter()
+            .chain(tree.store.node_io.class_pids(NodeIoKind::IndirectWrite))
+            .collect();
+        assert!(
+            !value_pids.is_empty(),
+            "the spilled value must write value pages"
+        );
+        let events = tree.store.node_io.events();
+        let mut allocs: std::collections::HashMap<PageId, usize> = std::collections::HashMap::new();
+        for event in &events {
+            if event.kind == NodeIoKind::Alloc {
+                *allocs.entry(event.pid).or_default() += 1;
+            }
+        }
+        assert!(
+            value_pids
+                .iter()
+                .any(|pid| allocs.get(pid).copied().unwrap_or(0) >= 2),
+            "the workload must hand a value/indirect PID out twice, otherwise this test does not \
+             exercise the reuse path it claims"
+        );
+
+        // Reopen: the durable state matches what the handle reported.
+        drop(tree);
+        let reopened = BTree::open(&path).unwrap();
+        assert_eq!(
+            reopened.view("b", |v| v.get(b"second")).unwrap(),
+            b"small".to_vec()
+        );
+        assert_eq!(reopened.view("b", |v| v.get(b"third")).unwrap(), first);
+        assert!(matches!(
+            reopened.view("b", |v| v.get(b"first")),
+            Err(Error::KeyNotFound)
+        ));
+        assert_nonempty_generation_page_accounting(&reopened);
+    }
+
+    /// `TxnCore::rollback_to` restores the checkpoint by clearing the
+    /// whole overlay, and `TxnOverlay::clear` is the only thing it does to it — so entries *and*
+    /// ownership must both be gone, while the write-through decision stays: exhausting the dirty
+    /// budget is sticky for the overlay's whole life, and a rollback does not re-open it.
+    #[test]
+    fn clear_overlay_drops_entries_and_ownership_but_not_the_budget() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = test_store(&dir);
+        let overlay = Arc::new(RwLock::new(TxnOverlay::new(8, 8)));
+        let read = TreeReadContext::new(test_runtime(store)).with_overlay(overlay.clone());
+
+        read.insert_overlay_dirty(7, Arc::new(Node::new_leaf()));
+        read.insert_overlay_dirty(9, Arc::new(Node::new_leaf()));
+        assert_eq!(overlay.read().len(), 2);
+        assert_eq!(read.overlay_owned_pids(), vec![7, 9]);
+
+        for pid in 11..17 {
+            read.insert_overlay_dirty(pid, Arc::new(Node::new_leaf()));
+        }
+        assert!(
+            !read.take_dirty_slot(),
+            "a full budget sends the write through"
+        );
+        assert!(!read.overlay_defer_enabled(), "exhaustion turns defer off");
+
+        read.clear_overlay();
+        assert_eq!(overlay.read().len(), 0, "entries are gone");
+        assert!(
+            read.overlay_owned_pids().is_empty(),
+            "ownership goes with the entries (`rollback_to` must not leave an owned PID)"
+        );
+        assert_eq!(read.overlay_tiers(), (0, 0), "both tiers restart empty");
+        assert!(
+            !read.overlay_defer_enabled(),
+            "a rollback must not re-open the budget: `defer` is sticky for the overlay's whole life"
+        );
+    }
+
+    /// The shared cache's capacity must not change any observable result, and a
+    /// transaction's own pages must never be backfilled into it (zero `cache.put` for an
+    /// owned PID), including on the `del_bucket` path.
+    #[test]
+    fn shared_cache_capacity_does_not_change_results_and_never_sees_owned_pages() {
+        for capacity in [0usize, 1, 8192] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("cache-capacity.db");
+            let options = OpenOptions {
+                cache_capacity: capacity,
+                ..OpenOptions::default()
+            };
+            let tree = BTree::open_with_options(&path, options).unwrap();
+            tree.new_bucket("b", false).unwrap();
+            tree.new_bucket("drop", false).unwrap();
+            tree.exec("drop", |txn| txn.put(b"x", b"y")).unwrap();
+            tree.del_bucket("drop").unwrap();
+
+            let cache_puts_before = tree.store.node_io.cache_puts().len();
+            let mut reads = Vec::new();
+            let mut owned = Vec::new();
+            tree.exec("b", |txn| {
+                txn.put(b"k1", b"v1")?;
+                txn.put(b"k2", b"v2")?;
+                reads.push(txn.get(b"k1")?);
+                let (mut key, mut value) = (Vec::new(), Vec::new());
+                let mut iter = txn.iter();
+                while iter.next_ref(&mut key, &mut value) {
+                    reads.push(value.clone());
+                }
+                owned = txn.read.overlay_owned_pids();
+                Ok(())
+            })
+            .unwrap();
+
+            assert_eq!(
+                reads,
+                vec![b"v1".to_vec(), b"v1".to_vec(), b"v2".to_vec()],
+                "capacity {capacity} must not change what a transaction reads"
+            );
+            assert!(!owned.is_empty(), "the transaction owns pages");
+            let hits = tree.store.node_io.overlay_hits();
+            assert!(
+                hits.iter().any(|pid| owned.contains(pid)),
+                "capacity {capacity}: reading own writes must be answered by the overlay"
+            );
+            let puts = tree.store.node_io.cache_puts();
+            for pid in &owned {
+                assert!(
+                    !puts[cache_puts_before..].contains(pid),
+                    "capacity {capacity}: transaction-private page {pid} must never enter the \
+                     shared cache"
+                );
+            }
+            assert_eq!(
+                tree.view("b", |view| view.get(b"k1")).unwrap(),
+                b"v1".to_vec(),
+                "published reads keep working at capacity {capacity}"
+            );
+        }
+    }
+
+    /// One ownership class per PID, entries ⊆ owned ⊆ pending, every owned PID
+    /// came from an allocation, and only node writes create entries — a spilled value allocates
+    /// dozens of pages but adds none.
+    #[test]
+    fn overlay_ownership_invariants() {
+        let measure = |value_len: usize| {
+            const PUTS: u32 = 16;
+            let dir = tempfile::TempDir::new().unwrap();
+            let tree = BTree::open(dir.path().join("ownership.db")).unwrap();
+            tree.new_bucket("b", false).unwrap();
+            let mut entries = Vec::new();
+            let mut owned = Vec::new();
+            // a PID can be handed out again in a later transaction after a legitimate release).
+            let window_start = tree.store.node_io.events().len();
+            tree.exec("b", |txn| {
+                for index in 0..PUTS {
+                    txn.put(format!("k{index:03}").as_bytes(), vec![b'x'; value_len])?;
+                }
+                entries = txn.read.overlay_entry_pids();
+                owned = txn.read.overlay_owned_pids();
+                assert!(
+                    entries.iter().all(|pid| owned.contains(pid)),
+                    "every resident entry belongs to an owned PID"
+                );
+                assert!(
+                    owned
+                        .iter()
+                        .all(|pid| txn.page_state.pending_alloc.contains(pid)),
+                    "every owned PID is still pending"
+                );
+                Ok(())
+            })
+            .unwrap();
+            let allocs: Vec<PageId> = tree
+                .store
+                .node_io
+                .events()
+                .into_iter()
+                .filter(|event| event.kind == NodeIoKind::Alloc)
+                .map(|event| event.pid)
+                .collect();
+            assert!(
+                owned.iter().all(|pid| allocs.contains(pid)),
+                "ownership only comes from allocations"
+            );
+            // only transaction-allocated page ids may be reused: every owned PID's *current* incarnation was handed out by
+            // this transaction, which is what keeps pages referenced by a published generation out
+            // of the overlay (an older generation's reader can therefore never see them change).
+            // released it is legitimately free to come back from `reusable` here.
+            let in_window_allocs: Vec<PageId> = tree
+                .store
+                .node_io
+                .events()
+                .into_iter()
+                .skip(window_start)
+                .filter(|event| event.kind == NodeIoKind::Alloc)
+                .map(|event| event.pid)
+                .collect();
+            assert!(
+                owned.iter().all(|pid| in_window_allocs.contains(pid)),
+                "every owned PID must have been handed out by this transaction"
+            );
+            // reuse is exercised, and it stays inside one transaction's own page ids.
+            assert!(
+                in_window_allocs.len() > owned.len(),
+                "the workload must reuse transaction-born PIDs (in-window allocations {} vs owned {})",
+                in_window_allocs.len(),
+                owned.len()
+            );
+            (entries.len(), owned.len())
+        };
+
+        let (small_entries, _) = measure(8);
+        let (large_entries, _) = measure(200_000);
+        assert!(small_entries > 0, "a put creates overlay entries");
+        assert_eq!(
+            small_entries, large_entries,
+            "value and indirect pages are not nodes, so a spilled value must not create overlay entries"
+        );
+    }
+
+    /// At the instant the meta slot is written, the live file
+    /// must already cover the id space that publication declares.
+    #[test]
+    fn publication_never_declares_an_uncovered_id_space() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = dir.path().join("publish-hook.db");
+        let tree = BTree::open(&database).unwrap();
+        tree.new_bucket("b", false).unwrap();
+        tree.exec("b", |txn| txn.put(b"keep", b"value")).unwrap();
+
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = observations.clone();
+        let live_file = tree.store.clone();
+        let arming_thread = std::thread::current().id();
+        *BEFORE_META_SLOT_WRITE.lock() = Some(Arc::new(move |point: PublicationPoint| {
+            // Only this test's thread: other tests publish in parallel.
+            if std::thread::current().id() != arming_thread {
+                return;
+            }
+            assert!(
+                u64::from(point.next_page_id) * PAGE_SIZE as u64 <= point.file_len,
+                "a publication declared {} pages while the file holds {} bytes",
+                point.next_page_id,
+                point.file_len
+            );
+            // A pre-write hook must find the slot still holding an *older* generation; if the hook
+            // ran after the write this would read back `point.seq`.
+            let mut bytes = [0u8; 40];
+            let slot_seq = live_file
+                .test_pread_exact(&mut bytes, point.write_offset)
+                .map(|()| MetaNode::from_slice(&bytes).seq);
+            recorded.lock().unwrap().push((point.seq, slot_seq));
+        }));
+
+        // cover the id space before its meta slot goes out.
+        let failed = tree.exec("b", |txn| -> Result<()> {
+            txn.put(b"gone", b"value")?;
+            Err(Error::KeyNotFound)
+        });
+        assert!(failed.is_err());
+
+        let observed = observations.lock().unwrap();
+        *BEFORE_META_SLOT_WRITE.lock() = None;
+        assert!(
+            !observed.is_empty(),
+            "the publication hook must have inspected at least one meta slot write"
+        );
+        let readable = observed.iter().filter(|(_, slot)| slot.is_ok()).count();
+        assert!(
+            readable > 0,
+            "the hook must be able to read the slot it is about to write: {observed:?}"
+        );
+        for (seq, slot) in observed.iter() {
+            if let Ok(slot_seq) = slot {
+                assert_ne!(
+                    *slot_seq, *seq,
+                    "meta slot at write_offset already held generation {seq}: the hook ran *after* the write"
+                );
+            }
+        }
+        drop(observed);
+
+        // The snapshot's own file must cover the id space its meta declares, and
+        // the frozen copy must open with the same content.
+        let snapshot_path = dir.path().join("frozen.db");
+        let snapshot = tree.take_snapshot(&snapshot_path).unwrap();
+        let frozen = snapshot_meta(&snapshot_path).next_page_id;
+        let length = std::fs::metadata(&snapshot_path).unwrap().len();
+        assert!(
+            u64::from(frozen) * PAGE_SIZE as u64 <= length,
+            "the snapshot declares {frozen} pages but its file holds only {length} bytes"
+        );
+        let copy = BTree::open(&snapshot_path).unwrap();
+        assert_eq!(copy.current_seq(), snapshot.seq);
+        assert_eq!(
+            copy.view("b", |view| view.get(b"keep")).unwrap(),
+            b"value".to_vec(),
+            "the frozen copy must hold the same content"
+        );
+    }
+
+    fn snapshot_meta(path: &Path) -> MetaNode {
+        let bytes = std::fs::read(path).unwrap();
+        let mut newest: Option<MetaNode> = None;
+        for slot in [0usize, 1] {
+            let start = slot * PAGE_SIZE;
+            if start + PAGE_SIZE > bytes.len() {
+                continue;
+            }
+            let meta = MetaNode::from_slice(&bytes[start..start + PAGE_SIZE]);
+            if meta.validate().is_err() {
+                continue;
+            }
+            let newer = match &newest {
+                Some(current) => meta.seq > current.seq,
+                None => true,
+            };
+            if newer {
+                newest = Some(meta);
+            }
+        }
+        newest.expect("a valid meta page")
+    }
+
+    /// While the dirty budget lasts, node writes stay in the overlay and no
+    /// page reaches the disk; the commit flush writes them all and degrades them to `Clean`. The
+    /// budget never re-opens once exhausted, and later writes go straight through.
+    #[test]
+    fn dirty_budget_defers_then_sticks_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("dirty-budget.db")).unwrap();
+        tree.new_bucket("b", false).unwrap();
+
+        let writes_before = tree.store.node_io.writes().len();
+        let covers_before = tree.store.node_io.covers().len();
+        let cover_calls_before = tree.store.node_io.cover_calls();
+        let mut deferred = 0usize;
+        tree.exec("b", |txn| {
+            txn.put(b"a", b"1")?;
+            txn.put(b"b", b"2")?;
+            let (dirty, clean) = txn.read.overlay_tiers();
+            assert!(
+                txn.read.overlay_defer_enabled(),
+                "defer is on while the budget lasts"
+            );
+            assert!(
+                dirty > 0 && clean == 0,
+                "every node write is deferred, got {dirty}/{clean}"
+            );
+            assert_eq!(
+                tree.store.node_io.writes().len(),
+                writes_before,
+                "no node page may reach the disk before the commit flush"
+            );
+            assert_eq!(
+                tree.store.node_io.cover_calls(),
+                cover_calls_before,
+                "the cover step belongs to the publication, not to the operations"
+            );
+            deferred = txn.read.overlay_len();
+            Ok(())
+        })
+        .unwrap();
+
+        let flushed = tree.store.node_io.writes()[writes_before..].to_vec();
+        assert!(
+            !flushed.is_empty(),
+            "the commit flush wrote the deferred pages"
+        );
+        assert!(
+            deferred >= 1,
+            "the transaction held residency while it deferred"
+        );
+        let stats = tree
+            .store
+            .node_io
+            .flushes()
+            .last()
+            .cloned()
+            .expect("a commit flush");
+        assert_eq!(
+            stats.dirty_pages,
+            flushed.len(),
+            "the flush wrote exactly the Dirty pages it was handed"
+        );
+        assert!(
+            stats.runs < stats.dirty_pages,
+            "a deferred batch must be written as runs: {} runs for {} pages",
+            stats.runs,
+            stats.dirty_pages
+        );
+        assert_eq!(
+            tree.store.node_io.covers().len(),
+            covers_before,
+            "the flush covered the id space, so the gate must not have fired"
+        );
+        assert_eq!(
+            tree.store.node_io.cover_calls(),
+            cover_calls_before + 1,
+            "one publication, one cover call"
+        );
+        assert_eq!(
+            tree.store.node_io.max_writes_per_incarnation(),
+            1,
+            "a deferred page is written exactly once, by the commit flush that publishes it"
+        );
+
+        tree.set_dirty_limit(1);
+        tree.exec("b", |txn| {
+            txn.put(b"c", b"3")?;
+            let after_first = tree.store.node_io.writes().len();
+            txn.put(b"d", b"4")?;
+            let after_second = tree.store.node_io.writes().len();
+            txn.put(b"e", b"5")?;
+            let after_third = tree.store.node_io.writes().len();
+            assert!(
+                !txn.read.overlay_defer_enabled(),
+                "the dirty budget must not re-open once exhausted"
+            );
+            assert!(
+                after_second > after_first,
+                "a write after the budget is gone must write through, not defer again"
+            );
+            assert!(
+                after_third > after_second,
+                "and it must keep writing through after that op's page is released"
+            );
+            let (dirty, clean) = txn.read.overlay_tiers();
+            assert_eq!(
+                dirty + clean,
+                txn.read.overlay_len(),
+                "the tier counts must describe exactly the resident entries"
+            );
+            Ok(())
+        })
+        .unwrap();
+        tree.set_dirty_limit(DEFAULT_DIRTY_LIMIT);
+    }
+
+    /// A PID released inside the transaction loses its entry **and** its
+    /// ownership, so the publication that follows a failure cannot flush stale node bytes, and the
+    /// dense-coverage step has to extend the file because the topmost allocated page was never
+    /// written (its non-crash part).
+    #[test]
+    fn failed_transaction_releases_deferred_pages_and_covers_the_id_space() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("released-deferred.db");
+        let tree = BTree::open(&path).unwrap();
+        tree.new_bucket("b", false).unwrap();
+        tree.exec("b", |txn| txn.put(b"keep", b"value")).unwrap();
+
+        let writes_before = tree.store.node_io.writes().len();
+        let covers_before = tree.store.node_io.covers().len();
+        let mut owned_by_the_failed_txn = Vec::new();
+        let failed = tree.exec("b", |txn| -> Result<()> {
+            txn.put(b"gone", b"value")?; // deferred: nothing written yet
+            owned_by_the_failed_txn = txn.read.overlay_owned_pids();
+            Err(Error::KeyNotFound)
+        });
+        assert!(failed.is_err());
+        assert!(
+            !owned_by_the_failed_txn.is_empty(),
+            "the failed transaction owned the pages it deferred"
+        );
+
+        assert_eq!(
+            tree.store.node_io.writes().len(),
+            writes_before,
+            "pages of a failed transaction must never be flushed"
+        );
+        assert_eq!(
+            tree.store.node_io.covers().len(),
+            covers_before + 1,
+            "the released top PID left the id space uncovered, so the rollback publication covers it"
+        );
+        // wrote nothing — the deferred bytes died with the rollback.
+        let released = tree.store.node_io.releases();
+        // `writes` never grew (asserted above), so this is the whole write history: a page the
+        // failed transaction deferred must not appear in it at all.
+        let writes = tree.store.node_io.writes();
+        for pid in &owned_by_the_failed_txn {
+            assert!(
+                released.contains(pid),
+                "a failed transaction releases every page it owned (page {pid})"
+            );
+            assert!(
+                !writes.contains(pid),
+                "releasing page {pid} must not write it"
+            );
+        }
+        let snapshot = tree.store.cached_snapshot();
+        assert!(
+            tree.store.live_file_len() >= u64::from(snapshot.next_page_id) * PAGE_SIZE as u64,
+            "a publication must never declare an id space the live file does not cover"
+        );
+
+        drop(tree);
+        let reopened = BTree::open(&path).unwrap();
+        assert_eq!(
+            reopened.view("b", |view| view.get(b"keep")).unwrap(),
+            b"value".to_vec()
+        );
+        assert!(
+            reopened.view("b", |view| view.get(b"gone")).is_err(),
+            "a failed transaction must leave nothing visible"
+        );
+    }
+
+    #[test]
+    fn nested_publication_keeps_the_outer_deferred_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested-cover.db");
+        let tree = BTree::open(&path).unwrap();
+        tree.new_bucket("a", false).unwrap();
+        tree.new_bucket("b", false).unwrap();
+
+        let flushes_before = tree.store.node_io.flushes().len();
+        let mut outer_residency = 0usize;
+        let mut outer_owned = Vec::new();
+        let mut inner_owned = Vec::new();
+        tree.exec_multi(|multi| {
+            multi.exec("a", |txn| {
+                txn.put(b"k1", b"v1")?;
+                outer_residency = txn.read.overlay_len();
+                outer_owned = txn.read.overlay_owned_pids();
+                Ok(())
+            })?;
+
+            let writes_before = tree.store.node_io.writes().len();
+            let mut inner_writes = usize::MAX;
+            let failed = multi.exec("b", |txn| -> Result<()> {
+                txn.put(b"gone", b"v1")?; // deferred, then released by the savepoint rollback
+                inner_writes = tree.store.node_io.writes().len();
+                inner_owned = txn.read.overlay_owned_pids();
+                Err(Error::KeyNotFound)
+            });
+            assert!(failed.is_err(), "bucket b must fail");
+            assert_eq!(
+                inner_writes, writes_before,
+                "the inner bucket deferred its node write instead of writing it"
+            );
+            assert_eq!(
+                tree.store.node_io.flushes().len(),
+                flushes_before + 1,
+                "the nested publication flushes the retained Dirty set itself"
+            );
+
+            multi.exec("a", |txn| -> Result<()> {
+                assert_eq!(
+                    txn.read.overlay_len(),
+                    outer_residency,
+                    "the savepoint rollback drops the inner bucket's entries and leaves the outer ones"
+                );
+                assert_eq!(
+                    txn.read.overlay_owned_pids(),
+                    outer_owned,
+                    "a released page loses its entry and its ownership together"
+                );
+                assert!(
+                    !inner_owned.is_empty() && inner_owned.len() > outer_owned.len(),
+                    "the failing bucket owned pages of its own"
+                );
+                // A spilled value right after the rollback: its pages may reuse the released PIDs,
+                // and stale deferred bytes must never land on them.
+                txn.put(b"k2", vec![b'x'; 200_000])
+            })
+        })
+        .unwrap();
+
+        let snapshot = tree.store.cached_snapshot();
+        assert!(
+            tree.store.live_file_len() >= u64::from(snapshot.next_page_id) * PAGE_SIZE as u64,
+            "the nested publication must also leave the id space covered"
+        );
+        assert_eq!(tree.view("a", |v| v.get(b"k1")).unwrap(), b"v1".to_vec());
+        assert_eq!(
+            tree.view("a", |v| v.get(b"k2")).unwrap(),
+            vec![b'x'; 200_000],
+            "the spilled value written after the rollback must read back intact"
+        );
+        assert!(tree.view("b", |v| v.get(b"gone")).is_err());
+    }
+
+    /// `dirty_count`/`clean_count` count **entries**, not insertions. One write per (PID, incarnation) means a PID
+    /// is written once per incarnation, so a re-insert cannot happen in production — the invariant
+    /// has to hold anyway, and this is the regression test for it.
+    #[test]
+    fn overlay_tier_counts_count_entries_not_insertions() {
+        let mut overlay = TxnOverlay::new(DEFAULT_RESIDENT_LIMIT, DEFAULT_DIRTY_LIMIT);
+        let node = || Arc::new(Node::new_leaf());
+
+        overlay.insert_dirty(4, node());
+        overlay.insert_dirty(4, node());
+        assert_eq!(overlay.len(), 1);
+        assert_eq!((overlay.dirty_count(), overlay.clean_count()), (1, 0));
+
+        overlay.insert_clean(4, node());
+        assert_eq!(overlay.len(), 1);
+        assert_eq!((overlay.dirty_count(), overlay.clean_count()), (0, 1));
+
+        overlay.insert_clean(4, node());
+        assert_eq!(overlay.len(), 1);
+        assert_eq!((overlay.dirty_count(), overlay.clean_count()), (0, 1));
+    }
+
+    /// Node-class write accounting covers exactly the pages `write_node`
+    /// produces. A spilled large value writes dozens of value/indirect pages through
+    /// `write_value_pages`/`write_physical_pages`; the counter must not see them, so the same
+    /// transaction shape with an 8-byte and a 200 000-byte value must record the same count.
+    #[test]
+    fn node_write_counter_excludes_value_and_indirect_pages() {
+        let count = |value: Vec<u8>| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let tree = BTree::open(dir.path().join("counter.db")).unwrap();
+            tree.new_bucket("b", false).unwrap();
+            let before = tree.store.node_io.writes().len();
+            tree.exec("b", |txn| txn.put(b"k", &value)).unwrap();
+            tree.store.node_io.writes()[before..].to_vec()
+        };
+
+        let small = count(vec![7u8; 8]);
+        let large = count(vec![7u8; 200_000]);
+        assert!(!small.is_empty(), "a put writes node pages");
+        assert_eq!(
+            small.len(),
+            large.len(),
+            "value/indirect pages must stay out of the node-class write counter"
+        );
+    }
+
+    /// Node-class read accounting is recorded at the `read_node_pages` exit.
+    /// A cold handle has no overlay and an empty cache, so resolving a bucket key must fetch
+    /// exactly the node pages the writer published.
+    #[test]
+    fn node_read_counter_sees_the_pages_a_cold_read_fetches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cold-read.db");
+        let writer = BTree::open(&path).unwrap();
+        writer.new_bucket("b", false).unwrap();
+        let before = writer.store.node_io.writes().len();
+        writer.exec("b", |txn| txn.put(b"k", b"v")).unwrap();
+        let published = writer.store.node_io.writes()[before..].to_vec();
+        assert!(!published.is_empty());
+        drop(writer);
+
+        let reader = BTree::open(&path).unwrap();
+        assert!(reader.store.node_io.reads().is_empty(), "nothing read yet");
+        assert_eq!(
+            reader.view("b", |view| view.get(b"k")).unwrap(),
+            b"v".to_vec()
+        );
+        let reads = reader.store.node_io.reads();
+        for pid in published {
+            assert!(
+                reads.contains(&pid),
+                "the cold read must fetch published node page {pid}"
+            );
+        }
+    }
+
+    /// The diagnostic mapping must pass a page id through unchanged and never
+    /// invent one: a buffer-shape failure that names no page reports absence.
+    #[test]
+    fn corruption_site_report_maps_fields_without_inventing_them() {
+        let report = CorruptionSite::crc(7, "PAGE_CRC_MISMATCH", "check", 0xAA, 0xBB)
+            .report(Some(3), "value");
+        assert_eq!(report.pid, Some(7));
+        assert_eq!(report.generation, Some(3));
+        assert_eq!(report.page_kind, "value");
+        assert_eq!(report.expected.as_deref(), Some("170"));
+        assert_eq!(report.actual.as_deref(), Some("187"));
+
+        let report =
+            CorruptionSite::structure(9, "INVALID_LIVE_NODE", "check").report(None, "node");
+        assert_eq!(report.pid, Some(9));
+        assert!(report.expected.is_none() && report.actual.is_none());
+
+        let report = CorruptionSite::buffer_shape("PAGE_ARRAY_LENGTH", None, "check")
+            .report(Some(1), "page");
+        assert_eq!(report.pid, None, "a page-less check must not name page 0");
     }
 
     #[test]
@@ -2688,10 +5022,95 @@ mod tests {
         assert_eq!(*tree.local_snapshot.read(), newer);
     }
 
+    /// `Clone` shares one `Arc<BTreeRuntime>`, hence one `NodeCache`: an entry the
+    /// original handle loaded must be visible through the clone, and an invalidation
+    /// issued on either handle must reach the other's next `load_node`.
+    #[test]
+    fn cloned_btree_handles_share_runtime_node_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("shared-runtime-cache.db")).unwrap();
+        let mut alloc = HashSet::new();
+        let pid = tree.runtime.alloc_data_page(&mut alloc).unwrap();
+        let mut node = Node::new_leaf();
+        tree.store.write_physical_page(pid, node.finalize_mut());
+
+        tree.runtime.clear_cache();
+        let clone = tree.clone();
+        assert_eq!(
+            clone.runtime.cached_node_is_leaf(pid),
+            None,
+            "the cache starts empty"
+        );
+
+        tree.runtime.load_node(pid);
+        assert_eq!(
+            clone.runtime.cached_node_is_leaf(pid),
+            Some(true),
+            "a clone must observe the entry the original handle loaded"
+        );
+
+        // The observer is reached through the shared runtime, so the clone's next
+        // read must not resurrect the node the original handle retired.
+        tree.runtime.free_pages(pid.get(), 1).unwrap();
+        assert_eq!(
+            clone.runtime.cached_node_is_leaf(pid),
+            None,
+            "freeing on one handle must invalidate the entry on the other"
+        );
+    }
+
+    /// The production `PageReuseObserver` is the `NodeCache`, and it is reached only from
+    /// `alloc_page_inner` and `free_pages_observed`. A PID handed out again after a free
+    /// names a *different* page, so a surviving cache entry would alias the previous
+    /// incarnation's node. The re-allocation takes the reusable-extent early return,
+    /// the branch that has no other reason to touch the observer.
+    #[test]
+    fn runtime_allocator_invalidates_reused_page_ids() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("runtime-cache-reuse.db")).unwrap();
+        let mut alloc = HashSet::new();
+        let pid = tree.runtime.alloc_data_page(&mut alloc).unwrap();
+        let mut node = Node::new_leaf();
+        tree.store.write_physical_page(pid, node.finalize_mut());
+
+        tree.runtime.load_node(pid);
+        assert_eq!(
+            tree.runtime.cached_node_is_leaf(pid),
+            Some(true),
+            "the load must leave the page resident"
+        );
+
+        tree.runtime.free_pages(pid.get(), 1).unwrap();
+        assert_eq!(
+            tree.runtime.cached_node_is_leaf(pid),
+            None,
+            "freeing a PID must invalidate its cache entry"
+        );
+
+        // Re-load before the hand-out: the free above already cleared the entry, so
+        // without a fresh residency only the free's invalidation is under test. Now
+        // the re-allocation is the only thing that can drop the entry, and it takes
+        // the reusable-extent early return in `alloc_page_inner`.
+        tree.runtime.load_node(pid);
+        assert_eq!(tree.runtime.cached_node_is_leaf(pid), Some(true));
+
+        let mut reallocated = HashSet::new();
+        assert_eq!(
+            tree.runtime.alloc_data_page(&mut reallocated).unwrap(),
+            pid,
+            "the freed PID must come back out of the reusable set"
+        );
+        assert_eq!(
+            tree.runtime.cached_node_is_leaf(pid),
+            None,
+            "a re-handed-out PID must not resolve to the previous incarnation's node"
+        );
+    }
+
     fn alloc_and_write_node(store: &Store, node: &mut Node) -> DataPid {
         let mut alloc = HashSet::new();
         let pid = store.alloc_data_page(&mut alloc).unwrap();
-        store.write_page(pid, node.finalize());
+        store.write_physical_page(pid, node.finalize_mut());
         pid
     }
 
@@ -2733,8 +5152,8 @@ mod tests {
             Tree::get(&self.read, self.root, key)
         }
 
-        fn iterator(&self, mode: IteratorCacheMode) -> TreeIterator<'_> {
-            Tree::iterator(&self.read, self.root, mode)
+        fn iterator(&self) -> TreeIterator<'_> {
+            Tree::iterator(&self.read, self.root)
         }
     }
 
@@ -2768,7 +5187,7 @@ mod tests {
     }
 
     fn collect_tree(tree: &TestTree) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut iter = tree.iterator(IteratorCacheMode::Default);
+        let mut iter = tree.iterator();
         let mut key_buf = Vec::new();
         let mut val_buf = Vec::new();
         let mut entries = Vec::new();
@@ -2821,7 +5240,7 @@ mod tests {
             tree.put(&padded_key(key), b"value").unwrap();
         }
 
-        let mut forward = tree.iterator(IteratorCacheMode::Default);
+        let mut forward = tree.iterator();
         assert!(forward.root_node.is_none());
         assert!(!forward.forward_initialized);
         assert!(!forward.reverse_initialized);
@@ -2836,7 +5255,7 @@ mod tests {
         assert!(!forward.reverse_initialized);
         assert!(forward.reverse_stack.is_empty());
 
-        let mut reverse = tree.iterator(IteratorCacheMode::Default);
+        let mut reverse = tree.iterator();
         assert!(reverse.prev_ref(&mut key_buf, &mut val_buf));
         assert!(!reverse.forward_initialized);
         assert!(reverse.stack.is_empty());
@@ -2871,6 +5290,302 @@ mod tests {
         }
     }
 
+    /// A snapshot must not leak pages: opened as its own store, every pid in its
+    /// `[2, next_page_id)` range has to be exactly one of {reachable from the
+    /// catalog, reusable, retired, allocator list page}. The fixture churns to
+    /// leave real free space (deleted keys) and retired pages behind, so a
+    /// snapshot that dropped or mis-copied allocator state would leave untracked
+    /// pids that no later allocation can ever reach.
+    #[test]
+    fn snapshot_has_no_unaccounted_pages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("accounting-source.db");
+        let dst = dir.path().join("accounting-snapshot.db");
+        let tree = BTree::open(&source).unwrap();
+        tree.new_bucket("data", false).unwrap();
+        tree.exec("data", |txn| {
+            for index in 0..600u32 {
+                txn.put(format!("k{index:05}").into_bytes(), vec![0x5A; 2048])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        tree.exec("data", |txn| {
+            for index in 0..500u32 {
+                txn.del(format!("k{index:05}").as_bytes())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let source_free_pages = tree.store.free_page_count_for_test();
+        let snapshot = tree.take_snapshot(&dst).unwrap();
+
+        let copy = BTree::open(&dst).unwrap();
+        assert_eq!(copy.current_seq(), snapshot.seq);
+        assert_nonempty_generation_page_accounting(&copy);
+
+        assert_eq!(
+            copy.store.free_page_count_for_test(),
+            source_free_pages,
+            "the snapshot must carry the frozen generation's free space"
+        );
+    }
+
+    /// The deferred-commit path — deferred writes flushed at commit,
+    /// plus the dense-coverage extension the publication depends on — must survive an I/O cut at
+    /// *every* point with the base generation intact, nothing left behind by the uncommitted
+    /// transaction, no leaked page, and a further commit still possible. The injected cut is the
+    /// deterministic stand-in for a kill between the same two writes (its durable-state coverage).
+    #[test]
+    fn deferred_commit_io_faults_leave_the_base_generation_intact() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let baseline = dir.path().join("baseline.db");
+        {
+            let mut options = OpenOptions::new();
+            options.sync_mode = SyncMode::All;
+            let tree = options.open(&baseline).unwrap();
+            tree.new_bucket("bucket", false).unwrap();
+            tree.exec("bucket", |txn| txn.put(b"stable", b"stable-value"))
+                .unwrap();
+        }
+
+        let mut cuts = 0usize;
+        for (operation, max_occurrence) in [("pwrite", 48usize), ("sync_data", 8), ("sync_all", 8)]
+        {
+            let mut saw_failure = false;
+            let mut reached_clean_run = false;
+            for occurrence in 1..=max_occurrence {
+                let path = dir.path().join(format!("{operation}-{occurrence}.db"));
+                std::fs::copy(&baseline, &path).unwrap();
+                let output = child_test_command(&std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::deferred_commit_fault_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env(DEFERRED_FAULT_CHILD_PATH, &path)
+                    .env(
+                        crate::store::TEST_LIVE_FAULT_ENV,
+                        format!("{operation}:{occurrence}:5"),
+                    )
+                    .env("LSAN_OPTIONS", "detect_leaks=0")
+                    .output()
+                    .unwrap();
+                if output.status.success() {
+                    assert!(
+                        saw_failure,
+                        "{operation} had no injectable cut in the deferred-commit path"
+                    );
+                    reached_clean_run = true;
+                    break;
+                }
+                saw_failure = true;
+                cuts += 1;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("code=BTREE_FATAL_IO")
+                        && stderr.contains(&format!("operation={operation}")),
+                    "{stderr}"
+                );
+                assert_deferred_cut_left_base_generation(&path);
+            }
+            // Falling out of the loop means every occurrence in the range still
+            // failed: no clean run was reached, so the range stopped covering the
+            // operation rather than the operation running out of injectable cuts.
+            assert!(
+                reached_clean_run,
+                "{operation} still failed after {max_occurrence} occurrences"
+            );
+        }
+        assert!(cuts > 0, "the sweep must have exercised at least one cut");
+    }
+
+    /// The child of `deferred_commit_io_faults_leave_the_base_generation_intact`: it allocates and
+    /// releases pages without publishing (leaving the id space ahead of the file, so the next
+    /// publication has to cover it), then commits a deferred transaction.
+    #[test]
+    #[ignore = "spawned by deferred_commit_io_faults_leave_the_base_generation_intact"]
+    fn deferred_commit_fault_child() {
+        let path = std::env::var(DEFERRED_FAULT_CHILD_PATH).expect("child path");
+        let tree = BTree::open(&path).unwrap();
+        let failed = tree.exec("bucket", |txn| -> Result<()> {
+            // A spilled value: dozens of allocations, all released by the rollback below.
+            txn.put(b"ghost", vec![0x7E; 300_000])?;
+            Err(Error::KeyNotFound)
+        });
+        assert!(failed.is_err(), "the ghost transaction must roll back");
+
+        tree.set_dirty_limit(4096);
+        tree.exec("bucket", |txn| {
+            for index in 0..64u32 {
+                txn.put(format!("new{index:03}").as_bytes(), b"value")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        tree.set_dirty_limit(DEFAULT_DIRTY_LIMIT);
+    }
+
+    /// After a fatal cut the database must reopen with the baseline content and no unaccounted page;
+    /// the interrupted transaction is all-or-nothing (the cut may land after the publication, in
+    /// which case its whole work is durable), and the database must still accept a commit.
+    fn assert_deferred_cut_left_base_generation(path: &Path) {
+        let tree = BTree::open(path).unwrap();
+        assert_eq!(
+            tree.view("bucket", |view| view.get(b"stable")).unwrap(),
+            b"stable-value".to_vec(),
+            "the base generation must survive an I/O cut"
+        );
+        // Rolled back before any publication, so it may never be visible.
+        assert!(
+            matches!(
+                tree.view("bucket", |view| view.get(b"ghost")),
+                Err(Error::KeyNotFound)
+            ),
+            "a rolled-back transaction may not leave a key behind"
+        );
+        let mut committed = 0usize;
+        for index in 0..64u32 {
+            if let Ok(value) = tree.view("bucket", |view| {
+                view.get(format!("new{index:03}").as_bytes())
+            }) {
+                assert_eq!(value, b"value".to_vec(), "a committed key keeps its value");
+                committed += 1;
+            }
+        }
+        assert!(
+            committed == 0 || committed == 64,
+            "the interrupted transaction must be all-or-nothing, saw {committed}/64 keys"
+        );
+        assert_nonempty_generation_page_accounting(&tree);
+        tree.exec("bucket", |txn| txn.put(b"continued", b"ok"))
+            .unwrap();
+        drop(tree);
+
+        let reopened = BTree::open(path).unwrap();
+        assert_eq!(
+            reopened
+                .view("bucket", |view| view.get(b"continued"))
+                .unwrap(),
+            b"ok".to_vec(),
+            "a commit after the cut must be durable"
+        );
+    }
+
+    /// A transaction that fails (`exec` rollback and a per-bucket failure
+    /// inside `exec_multi`) must leave nothing behind — the content equals the pre-failure state
+    /// after a reopen, and only the failing bucket's work is dropped.
+    #[test]
+    fn failed_transactions_leave_no_residue_after_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("residue.db");
+        let tree = BTree::open(&path).unwrap();
+        tree.new_bucket("a", false).unwrap();
+        tree.new_bucket("b", false).unwrap();
+        tree.exec("a", |txn| txn.put(b"keep", b"a-value")).unwrap();
+        tree.exec("b", |txn| txn.put(b"keep", b"b-value")).unwrap();
+
+        let failed = tree.exec("a", |txn| -> Result<()> {
+            txn.put(b"rolled-back", b"value")?;
+            Err(Error::KeyNotFound)
+        });
+        assert!(failed.is_err());
+
+        let failed = tree.exec_multi(|multi| -> Result<()> {
+            multi.exec("a", |txn| txn.put(b"committed", b"a2"))?;
+            multi.exec("b", |txn| -> Result<()> {
+                txn.put(b"dropped", b"b2")?;
+                Err(Error::KeyNotFound)
+            })?;
+            Ok(())
+        });
+        assert!(failed.is_err());
+
+        // (3) A `del_bucket` that fails (no such bucket) must leave the database untouched.
+        assert!(
+            tree.del_bucket("missing").is_err(),
+            "deleting a missing bucket fails"
+        );
+
+        drop(tree);
+
+        let reopened = BTree::open(&path).unwrap();
+        assert_eq!(
+            reopened.view("a", |view| view.get(b"keep")).unwrap(),
+            b"a-value".to_vec()
+        );
+        assert_eq!(
+            reopened.view("b", |view| view.get(b"keep")).unwrap(),
+            b"b-value".to_vec()
+        );
+        assert!(
+            matches!(
+                reopened.view("a", |view| view.get(b"rolled-back")),
+                Err(Error::KeyNotFound)
+            ),
+            "a rolled-back transaction must leave no key behind"
+        );
+        // survive: (no failure path may publish).
+        for (bucket, key) in [("a", b"committed".as_slice()), ("b", b"dropped")] {
+            assert!(
+                matches!(
+                    reopened.view(bucket, |view| view.get(key)),
+                    Err(Error::KeyNotFound)
+                ),
+                "{bucket}/{key:?} must not survive a failed `exec_multi`"
+            );
+        }
+        assert_nonempty_generation_page_accounting(&reopened);
+    }
+
+    /// A bucket-metadata record that is shorter than the record struct must end in
+    /// the engine's corruption diagnostic, not in a panic: it is reachable from a
+    /// read-only handle that only walks buckets.
+    #[test]
+    fn bucket_metadata_short_record_aborts() {
+        let output = child_test_command(&std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::bucket_metadata_short_record_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("BTREE_SHORT_RECORD_CHILD", "1")
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "a short record must not be served: {combined}"
+        );
+        assert!(
+            combined.contains("btree-store fatal code=BTREE_FATAL_"),
+            "the failure must carry the engine diagnostic: {combined}"
+        );
+        assert!(
+            !combined.contains("panicked at"),
+            "the failure must not be a bare panic: {combined}"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess target for the short bucket-metadata record"]
+    fn bucket_metadata_short_record_child() {
+        if std::env::var("BTREE_SHORT_RECORD_CHILD").is_err() {
+            return;
+        }
+        let _ = physical_value(
+            BucketMetadata::decode(&[0u8; 4]),
+            "bucket metadata record within slot value",
+        );
+        println!("short record was accepted");
+    }
+
     fn assert_nonempty_generation_page_accounting(tree: &BTree) {
         let mut reachable_pids = HashSet::new();
         let read = &tree.read;
@@ -2878,13 +5593,15 @@ mod tests {
 
         collect_physical_tree_pages(read, catalog_root, &mut reachable_pids);
 
-        let mut catalog = Tree::iterator(read, catalog_root, IteratorCacheMode::ByPass);
+        let mut catalog = Tree::iterator(read, catalog_root);
         let mut key = Vec::new();
         let mut value = Vec::new();
         while catalog.next_ref(&mut key, &mut value) {
             collect_physical_tree_pages(
                 read,
-                BucketMetadata::from_slice(&value).root(),
+                BucketMetadata::decode(&value)
+                    .expect("fixture record")
+                    .root(),
                 &mut reachable_pids,
             );
         }
@@ -2893,11 +5610,6 @@ mod tests {
 
     #[test]
     fn prefix_encoding_establishes_shared_prefix_from_first_insert() {
-        // A fresh encoded leaf has prefix_len 0; the empty prefix matches every
-        // key, so without establishing a prefix a small bucket stores every key
-        // at full length until a split. Seeding the prefix on the first insert
-        // makes the second shared-prefix key trigger a rebuild that computes
-        // the real common prefix.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("prefix-from-first.db");
         let tree = BTree::open(&path).unwrap();
@@ -2921,7 +5633,6 @@ mod tests {
             "two shared-prefix keys must compress to the common prefix"
         );
 
-        // Values and iteration stay correct.
         tree.view("encoded", |txn| {
             let mut iter = txn.iter();
             let mut key = Vec::new();
@@ -2940,7 +5651,9 @@ mod tests {
         let read = &tree.read;
         let catalog_root = RootRef::decode(tree.store.cached_snapshot().catalog_root);
         let (catalog_leaf, pos) = Tree::find(read, catalog_root, bucket.as_bytes()).unwrap();
-        let bucket_root = BucketMetadata::from_slice(catalog_leaf.value_at(pos)).root();
+        let bucket_root = BucketMetadata::decode(catalog_leaf.value_at(pos))
+            .expect("fixture record")
+            .root();
         let node = read.load_node(bucket_root.node().expect("bucket root"));
         assert!(node.is_leaf(), "a two-entry bucket root must be a leaf");
         node.test_encoded_prefix_len()
@@ -2948,16 +5661,13 @@ mod tests {
 
     #[test]
     fn prefix_encoding_cross_prefix_splits_keep_page_ownership_exact() {
-        // Shared-prefix inserts fill leaves; cross-prefix inserts with large
         // overflow values repeatedly hit the rebuild-or-split path. Before the
         // fix this path allocated the overflow pages before checking whether
-        // the rebuild fit, leaking an orphan page on every split trigger.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("encoded-cross-prefix-ownership.db");
         let tree = BTree::open(&path).unwrap();
         tree.new_bucket("encoded", true).unwrap();
 
-        // Fill one leaf toward capacity with shared-prefix keys, then a
         // cross-prefix overflow insert whose rebuild cannot fit must split
         // without leaking the freshly allocated overflow page.
         for i in 0..24u32 {
@@ -2996,7 +5706,9 @@ mod tests {
 
         let catalog_root = RootRef::decode(tree.store.cached_snapshot().catalog_root);
         let (catalog_leaf, pos) = Tree::find(&tree.read, catalog_root, b"encoded").unwrap();
-        let bucket_root = BucketMetadata::from_slice(catalog_leaf.value_at(pos)).root();
+        let bucket_root = BucketMetadata::decode(catalog_leaf.value_at(pos))
+            .expect("fixture record")
+            .root();
         assert!(tree_height(&tree.read, bucket_root) >= 2);
     }
 
@@ -3069,137 +5781,6 @@ mod tests {
             .collect();
         assert!(child_heights.iter().all(|h| *h == child_heights[0]));
         1 + child_heights[0]
-    }
-
-    #[test]
-    fn uncached_iterator_caches_leaf_root() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = test_store(&dir);
-        let mut tree = TestTree::new(store.clone(), RootRef::Empty);
-        tree.put(b"key", b"value").unwrap();
-
-        let root = tree.root.node().expect("test tree root");
-        tree.read.runtime.clear_cache();
-        assert_eq!(tree.read.runtime.cached_node_is_leaf(root), None);
-
-        let mut iter = tree.iterator(IteratorCacheMode::ByPass);
-        let mut key = Vec::new();
-        let mut value = Vec::new();
-        assert!(iter.next_ref(&mut key, &mut value));
-        assert_eq!(key, b"key");
-        assert_eq!(value, b"value");
-        assert_eq!(tree.read.runtime.cached_node_is_leaf(root), Some(true));
-    }
-
-    fn collect_node_ids(
-        read: &TreeReadContext,
-        id: DataPid,
-        branches: &mut Vec<DataPid>,
-        leaves: &mut Vec<DataPid>,
-    ) {
-        let node = read.load_node(id);
-        if node.is_leaf() {
-            leaves.push(id);
-            return;
-        }
-
-        branches.push(id);
-        for index in 0..node.num_children() {
-            collect_node_ids(read, node.child_at(index), branches, leaves);
-        }
-    }
-
-    #[test]
-    fn uncached_iterator_bypasses_leaf_cache_but_keeps_branch_cache() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = test_store(&dir);
-        let mut tree = TestTree::new(store.clone(), RootRef::Empty);
-
-        for key in 0..200u32 {
-            tree.put(&padded_key(key), b"value").unwrap();
-        }
-
-        let root = tree.root.node().expect("test tree root");
-        let mut branches = Vec::new();
-        let mut leaves = Vec::new();
-        collect_node_ids(&tree.read, root, &mut branches, &mut leaves);
-        assert!(!branches.is_empty(), "test tree must have branch nodes");
-        assert!(!leaves.is_empty(), "test tree must have leaf nodes");
-
-        tree.read.runtime.clear_cache();
-        let mut iter = tree.iterator(IteratorCacheMode::ByPass);
-        let mut key = Vec::new();
-        let mut value = Vec::new();
-        let mut count = 0;
-        while iter.next_ref(&mut key, &mut value) {
-            count += 1;
-        }
-        assert_eq!(count, 200);
-
-        for page_id in branches {
-            assert_eq!(
-                tree.read.runtime.cached_node_is_leaf(page_id),
-                Some(false),
-                "uncached iteration must keep branch node {page_id:?} cached"
-            );
-        }
-        for page_id in &leaves {
-            assert_eq!(
-                tree.read.runtime.cached_node_is_leaf(*page_id),
-                None,
-                "uncached iteration must not cache leaf node {page_id:?}"
-            );
-        }
-
-        tree.read.runtime.clear_cache();
-        let mut iter = tree.iterator(IteratorCacheMode::Default);
-        while iter.next_ref(&mut key, &mut value) {}
-        for page_id in leaves {
-            assert_eq!(
-                tree.read.runtime.cached_node_is_leaf(page_id),
-                Some(true),
-                "default iteration must cache leaf node {page_id:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn cloned_btree_handles_share_runtime_node_cache() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let tree = BTree::open(dir.path().join("shared-runtime-cache.db")).unwrap();
-        let mut alloc = HashSet::new();
-        let page_id = tree.runtime.alloc_data_page(&mut alloc).unwrap();
-        let node = Node::new_leaf();
-        tree.store.write_page(page_id, node.finalize());
-
-        tree.runtime.clear_cache();
-        let clone = tree.clone();
-        assert_eq!(clone.runtime.cached_node_is_leaf(page_id), None);
-
-        tree.runtime.load_node(page_id);
-        assert_eq!(clone.runtime.cached_node_is_leaf(page_id), Some(true));
-    }
-
-    #[test]
-    fn runtime_allocator_invalidates_reused_page_ids() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let tree = BTree::open(dir.path().join("runtime-cache-reuse.db")).unwrap();
-        let mut alloc = HashSet::new();
-        let page_id = tree.runtime.alloc_data_page(&mut alloc).unwrap();
-        let node = Node::new_leaf();
-        tree.store.write_page(page_id, node.finalize());
-        tree.runtime.load_node(page_id);
-        assert_eq!(tree.runtime.cached_node_is_leaf(page_id), Some(true));
-
-        tree.runtime.free_pages(page_id.get(), 1).unwrap();
-        assert_eq!(tree.runtime.cached_node_is_leaf(page_id), None);
-
-        let mut reallocated = HashSet::new();
-        assert_eq!(
-            tree.runtime.alloc_data_page(&mut reallocated).unwrap(),
-            page_id
-        );
-        assert_eq!(tree.runtime.cached_node_is_leaf(page_id), None);
     }
 
     #[test]
@@ -3535,7 +6116,7 @@ mod tests {
         let mut containing_record = [0xa5; 8];
         containing_record[..4].copy_from_slice(&23u32.to_ne_bytes());
         containing_record[4..].copy_from_slice(&1u32.to_ne_bytes());
-        let parsed = BucketMetadata::from_slice(&containing_record);
+        let parsed = BucketMetadata::decode(&containing_record).expect("fixture record");
         assert_eq!(parsed.root(), RootRef::Node(DataPid::new(23).unwrap()));
         assert_eq!(parsed.flags(), 1);
     }

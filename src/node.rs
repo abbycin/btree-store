@@ -1,12 +1,47 @@
-use crate::{DataPid, PageId, StoreResult, TreeReadContext, TreeWriteContext};
-use std::alloc::{Layout, alloc, dealloc};
+use crate::{
+    CorruptionReport, DataPid, FatalReason, PageId, StoreResult, TreeReadContext, TreeWriteContext,
+    fatal,
+};
+use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 use std::cmp::Ordering;
 use std::ptr;
 
 pub const PAGE_SIZE: usize = 4096;
+/// Bytes of a physical page available to node content: the whole page, because a
+/// node page carries its checksum in its header rather than in a trailer.
+pub(crate) const CONTENT_SIZE: usize = PAGE_SIZE;
 pub const MAX_INLINE_LEN: usize = 256;
 pub const MAX_KEY_LEN: usize = 128;
 pub const MAX_VAL_LEN: usize = 2 << 30;
+
+fn require_inline(is_inline: bool) {
+    if !is_inline {
+        fatal(FatalReason::Corruption(CorruptionReport {
+            code: "INVALID_LIVE_NODE",
+            generation: None,
+            page_kind: "node",
+            pid: None,
+            check: "inline value expected",
+            expected: None,
+            actual: None,
+        }));
+    }
+}
+
+fn page_slice<'a>(page: &'a [u8], range: std::ops::Range<usize>, check: &'static str) -> &'a [u8] {
+    match page.get(range) {
+        Some(bytes) => bytes,
+        None => fatal(FatalReason::Corruption(CorruptionReport {
+            code: "INVALID_LIVE_NODE",
+            generation: None,
+            page_kind: "node",
+            pid: None,
+            check,
+            expected: None,
+            actual: None,
+        })),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ChildPos(usize);
@@ -53,8 +88,13 @@ pub(crate) enum NodeDecodeError {
     Corruption,
 }
 
-const OFFSET_NEXT_INDIRECT: usize = PAGE_SIZE - 4;
-const IDS_PER_INDIRECT_PAGE: usize = OFFSET_NEXT_INDIRECT / std::mem::size_of::<PageId>();
+const OFFSET_NEXT_INDIRECT: usize = crate::page::TRAILER_CRC_OFFSET - 4;
+/// Bytes of value data one value (overflow) page carries: it holds a trailer too,
+/// so a value page is not a whole page of value bytes.
+/// Value bytes a page holds: the page minus its four-byte checksum trailer.
+pub const VALUE_PAGE_CONTENT: usize = crate::page::TRAILER_CONTENT_SIZE;
+/// Value page ids one indirect page names.
+pub const IDS_PER_INDIRECT_PAGE: usize = OFFSET_NEXT_INDIRECT / std::mem::size_of::<PageId>();
 
 pub(crate) struct AlignedPage {
     ptr: *mut u8,
@@ -62,9 +102,29 @@ pub(crate) struct AlignedPage {
 }
 
 impl AlignedPage {
+    /// Uninitialized page buffer, for callers that overwrite every byte before
+    /// interpreting the page (disk reads verify the CRC first).
     pub(crate) fn new() -> Self {
         let layout = Layout::from_size_align(PAGE_SIZE, 8).unwrap();
         let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Self { ptr, layout }
+    }
+
+    /// Zeroed page buffer, for *work* pages: the bytes a builder never writes stay
+    /// zero instead of being whatever the allocator handed back, so a page never
+    /// carries stale process memory into the file - and reading the page for its
+    /// checksum is not a read of uninitialized memory.
+    ///
+    /// The whole page is covered by the checksum, so a page class that does not
+    /// write every byte has to write it deterministically. The allocator, indirect
+    /// and value writers zero what they leave; node pages are built in this buffer,
+    /// so the zeroing happens once, at construction.
+    pub(crate) fn new_zeroed() -> Self {
+        let layout = Layout::from_size_align(PAGE_SIZE, 8).unwrap();
+        let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -109,8 +169,17 @@ impl Drop for AlignedPage {
     }
 }
 
+/// Test-only 4 KiB clone counter (baseline metric: every op still copies the
+/// leaf and each rewritten parent). `Arc::make_mut` routes through this `Clone` too, so one counter
+/// covers both clone shapes.
+#[cfg(test)]
+pub(crate) static PAGE_CLONES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Clone for AlignedPage {
     fn clone(&self) -> Self {
+        #[cfg(test)]
+        PAGE_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let new_page = Self::new();
         unsafe {
             ptr::copy_nonoverlapping(self.ptr, new_page.ptr, PAGE_SIZE);
@@ -119,23 +188,23 @@ impl Clone for AlignedPage {
     }
 }
 
-/// Plain node header: 12 bytes. `is_leaf` is 0 for a branch and 1 for a leaf.
 #[repr(C, align(4))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PlainHeader {
+    pub checksum: u32,
     pub is_leaf: u32,
     pub elems: u32,
     pub offset: u32,
 }
 
 const PLAIN_HEADER_SIZE: usize = std::mem::size_of::<PlainHeader>();
+/// Offset of the plain header's checksum field: the header's first field.
+pub(crate) const PLAIN_CHECKSUM_OFFSET: usize = 0;
 
-/// Encoded node header: 16 bytes. The first u32 `kind` doubles as the class
-/// discriminant: `ENCODED_BRANCH` (2) / `ENCODED_LEAF` (3). `prefix_len` is
-/// the length of the shared prefix stored immediately after the header.
 #[repr(C, align(4))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EncodedHeader {
+    pub checksum: u32,
     pub kind: u32,
     pub elems: u32,
     pub offset: u32,
@@ -143,14 +212,22 @@ pub(crate) struct EncodedHeader {
 }
 
 const ENCODED_HEADER_SIZE: usize = std::mem::size_of::<EncodedHeader>();
+// The encoded header's checksum is its first field too, i.e. the same offset as
+// the plain header's: sealing a node page needs `PLAIN_CHECKSUM_OFFSET` alone.
+const _: () = assert!(
+    std::mem::offset_of!(EncodedHeader, checksum) == PLAIN_CHECKSUM_OFFSET,
+    "the class word is read at offset 4, so the checksum field must stay first"
+);
 
 /// Encoded node discriminant values: the only first-u32 values whose bit0
-/// (0/1) overlaps the plain `is_leaf` domain, so a page's first u32 alone
-/// distinguishes the two node classes without a magic constant.
+/// (0/1) overlaps the plain `is_leaf` domain, so the u32 after the checksum
+/// alone distinguishes the two node classes without a magic constant.
 pub(crate) const ENCODED_BRANCH: u32 = 2;
 pub(crate) const ENCODED_LEAF: u32 = 3;
 
-const SLOT_SIZE: usize = std::mem::size_of::<Slot>();
+/// Bytes one entry occupies in the slot array: `pos`, `klen`, `vlen` and five
+/// page ids. The estimator must price the same number the writer lays out.
+pub const SLOT_SIZE: usize = std::mem::size_of::<Slot>();
 const NR_INLINE_PAGE: usize = 5;
 
 #[repr(C, align(4))]
@@ -183,7 +260,7 @@ impl Slot {
         if self.vlen == 0 {
             0
         } else {
-            self.vlen.div_ceil(PAGE_SIZE as u32)
+            self.vlen.div_ceil(VALUE_PAGE_CONTENT as u32)
         }
     }
 
@@ -216,11 +293,10 @@ pub(crate) fn common_prefix_len(keys: &[&[u8]]) -> usize {
     n
 }
 
-/// Compares a full key against a node's shared `prefix` + stored `tail`
-/// without reconstructing the full key. For one shared prefix, ordering is
-/// preserved: `prefix + tail1 < prefix + tail2` iff `tail1 < tail2`, so binary
-/// search on the stored suffixes stays valid. Ported from mace
-/// `data.rs::cmp_raw_with_prefixed_tail`.
+/// Compares a full key against a stored tail plus the prefix that tail was
+/// encoded against. Stripping one common prefix from every key preserves their
+/// relative order, so ordering the stored tails orders the full keys; binary
+/// search over tails is therefore valid as a search over full keys.
 #[inline]
 pub(crate) fn cmp_raw_with_prefixed_tail(
     lhs: &[u8],
@@ -238,10 +314,8 @@ pub(crate) fn cmp_raw_with_prefixed_tail(
     lhs[n..].cmp(rhs_base)
 }
 
-// ---------------------------------------------------------------------------
 // Overflow / indirect helpers shared by both node classes. They operate on a
 // `Slot` and a read/write context, never on the node's key layout.
-// ---------------------------------------------------------------------------
 
 pub(crate) fn free_slot_pages_for(
     read: &TreeReadContext,
@@ -261,8 +335,8 @@ pub(crate) fn free_slot_pages_for(
         let mut curr_index_page = decode_pid(slot.page_id[0]);
         let mut collected_data_pages = 0;
         while collected_data_pages < nr_pages {
-            let data = read.load_page(curr_index_page);
             let to_free = std::cmp::min(nr_pages - collected_data_pages, IDS_PER_INDIRECT_PAGE);
+            let data = read.load_page(curr_index_page);
 
             for i in 0..to_free {
                 let start = i * 4;
@@ -275,8 +349,11 @@ pub(crate) fn free_slot_pages_for(
 
             freed.push((curr_index_page.get(), 1));
             if collected_data_pages < nr_pages {
-                let next =
-                    u32::from_le_bytes(data[OFFSET_NEXT_INDIRECT..PAGE_SIZE].try_into().unwrap());
+                let next = u32::from_le_bytes(
+                    data[OFFSET_NEXT_INDIRECT..OFFSET_NEXT_INDIRECT + 4]
+                        .try_into()
+                        .unwrap(),
+                );
                 curr_index_page = decode_pid(next);
             }
         }
@@ -298,12 +375,26 @@ fn write_index_chain(ctx: &mut TreeWriteContext, pages: &[DataPid]) -> StoreResu
             page[off..off + 4].copy_from_slice(&pid.get().to_le_bytes());
         }
 
-        if i + 1 < nr_index_pages {
-            let next_pid = index_page_ids[i + 1];
-            page[OFFSET_NEXT_INDIRECT..PAGE_SIZE].copy_from_slice(&next_pid.get().to_le_bytes());
-        }
+        // The next pointer is always written (zero on the last page), so the
+        // checksum can cover it: it is part of the chain's structure, not padding.
+        let next_pid = if i + 1 < nr_index_pages {
+            index_page_ids[i + 1].get()
+        } else {
+            0
+        };
+        page[OFFSET_NEXT_INDIRECT..OFFSET_NEXT_INDIRECT + 4]
+            .copy_from_slice(&next_pid.to_le_bytes());
+
+        // The checksum covers the whole page, the unused id slots included, so
+        // they must stay zero: the chain's buffer is zeroed when it is allocated and
+        // only the ids and the pointer above are written into it.
+        crate::page::seal_page(
+            page,
+            crate::page::TRAILER_CRC_OFFSET,
+            index_page_ids[i].get(),
+        );
     }
-    ctx.write_pages(&index_page_ids, &index_data)?;
+    ctx.write_physical_pages(&index_page_ids, &mut index_data)?;
 
     Ok(index_page_ids[0])
 }
@@ -313,11 +404,11 @@ fn write_value_pages(
     pages: &[DataPid],
     value: &[u8],
 ) -> StoreResult<()> {
-    ctx.write_pages(pages, value)
+    ctx.write_value_pages(pages, value)
 }
 
 fn make_overflow_slot(ctx: &mut TreeWriteContext, value: &[u8]) -> StoreResult<Slot> {
-    let nr_blocks = value.len().div_ceil(PAGE_SIZE);
+    let nr_blocks = value.len().div_ceil(VALUE_PAGE_CONTENT);
     let pages = ctx.alloc_pages(nr_blocks as u32)?;
     let mut slot = Slot {
         pos: 0,
@@ -403,16 +494,19 @@ fn collect_page_ids(read: &TreeReadContext, slot: &Slot) -> Vec<DataPid> {
     let mut curr_index_page = decode_pid(slot.page_id[0]);
 
     while pages.len() < nr_pages {
-        let data = read.load_page(curr_index_page);
         let to_read = std::cmp::min(nr_pages - pages.len(), IDS_PER_INDIRECT_PAGE);
+        let data = read.load_page(curr_index_page);
         for i in 0..to_read {
             let start = i * 4;
             let raw = u32::from_le_bytes(data[start..start + 4].try_into().unwrap());
             pages.push(decode_pid(raw));
         }
         if pages.len() < nr_pages {
-            let next =
-                u32::from_le_bytes(data[OFFSET_NEXT_INDIRECT..PAGE_SIZE].try_into().unwrap());
+            let next = u32::from_le_bytes(
+                data[OFFSET_NEXT_INDIRECT..OFFSET_NEXT_INDIRECT + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             curr_index_page = decode_pid(next);
         }
     }
@@ -454,8 +548,8 @@ fn collect_slot_storage_ids(read: &TreeReadContext, slot: &Slot) -> Vec<DataPid>
     let mut current = decode_pid(slot.page_id[0]);
     while data_pages < nr_pages {
         all.push(current);
-        let page = read.load_page(current);
         let count = (nr_pages - data_pages).min(IDS_PER_INDIRECT_PAGE);
+        let page = read.load_page(current);
         for index in 0..count {
             let offset = index * 4;
             let raw = u32::from_le_bytes(page[offset..offset + 4].try_into().unwrap());
@@ -463,17 +557,16 @@ fn collect_slot_storage_ids(read: &TreeReadContext, slot: &Slot) -> Vec<DataPid>
         }
         data_pages += count;
         if data_pages < nr_pages {
-            let next =
-                u32::from_le_bytes(page[OFFSET_NEXT_INDIRECT..PAGE_SIZE].try_into().unwrap());
+            let next = u32::from_le_bytes(
+                page[OFFSET_NEXT_INDIRECT..OFFSET_NEXT_INDIRECT + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             current = decode_pid(next);
         }
     }
     all
 }
-
-// ---------------------------------------------------------------------------
-// PlainNode: the original 12-byte-header layout. Each slot stores the full key.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub(crate) struct PlainNode {
@@ -505,8 +598,16 @@ impl PlainNode {
         self.page
     }
 
+    /// Immutable full page view. The commit flush copies it into a staging buffer, which is then
+    /// sealed with the page's final PID, so the resident entry is never mutated.
     pub(crate) fn finalize(&self) -> &[u8] {
         self.page.as_slice()
+    }
+
+    /// Mutable full page for the writer, which seals the CRC trailer in place
+    /// with the page's final PID (no copy of the 4096-byte buffer).
+    pub(crate) fn finalize_mut(&mut self) -> &mut [u8] {
+        self.page.as_mut_slice()
     }
 
     fn header(&self) -> &PlainHeader {
@@ -531,13 +632,13 @@ impl PlainNode {
 
     fn validate(&self) -> std::result::Result<(), NodeDecodeError> {
         let header = self.header();
-        let max_elems = (PAGE_SIZE - PLAIN_HEADER_SIZE) / SLOT_SIZE;
+        let max_elems = (CONTENT_SIZE - PLAIN_HEADER_SIZE) / SLOT_SIZE;
         if header.is_leaf > 1 || header.elems > max_elems as u32 {
             return Err(NodeDecodeError::Corruption);
         }
 
         let min_offset = PLAIN_HEADER_SIZE + header.elems as usize * SLOT_SIZE;
-        if header.offset < min_offset as u32 || header.offset > PAGE_SIZE as u32 {
+        if header.offset < min_offset as u32 || header.offset > CONTENT_SIZE as u32 {
             return Err(NodeDecodeError::Corruption);
         }
 
@@ -546,10 +647,10 @@ impl PlainNode {
 
     fn new(is_leaf: bool) -> Self {
         let mut this = PlainNode {
-            page: AlignedPage::new(),
+            page: AlignedPage::new_zeroed(),
         };
         let h = this.header_mut();
-        h.offset = PAGE_SIZE as u32;
+        h.offset = CONTENT_SIZE as u32;
         h.is_leaf = if is_leaf { 1 } else { 0 };
         h.elems = 0;
         this
@@ -584,7 +685,7 @@ impl PlainNode {
 
     fn branch_entries_fit(entries: &[(Vec<u8>, DataPid)]) -> bool {
         let key_bytes: usize = entries.iter().map(|(key, _)| key.len()).sum();
-        PLAIN_HEADER_SIZE + entries.len() * SLOT_SIZE + key_bytes <= PAGE_SIZE
+        PLAIN_HEADER_SIZE + entries.len() * SLOT_SIZE + key_bytes <= CONTENT_SIZE
     }
 
     pub(crate) fn slot_at(&self, pos: usize) -> &Slot {
@@ -601,15 +702,23 @@ impl PlainNode {
         let slot = self.slot_at(pos);
         let off = slot.data_offset();
         let len = slot.key_len();
-        &self.page.as_slice()[off..off + len]
+        page_slice(
+            self.page.as_slice(),
+            off..off + len,
+            "slot key range within page",
+        )
     }
 
     pub(crate) fn value_at(&self, pos: usize) -> &[u8] {
         let slot = self.slot_at(pos);
-        assert!(slot.is_inline());
+        require_inline(slot.is_inline());
         let off = slot.data_offset() + slot.key_len();
         let len = slot.value_len();
-        &self.page.as_slice()[off..off + len]
+        page_slice(
+            self.page.as_slice(),
+            off..off + len,
+            "slot value range within page",
+        )
     }
 
     fn key_at_mut(&mut self, pos: usize) -> &mut [u8] {
@@ -720,7 +829,7 @@ impl PlainNode {
                     }
             })
             .sum();
-        PLAIN_HEADER_SIZE + elems * SLOT_SIZE + payload_bytes <= PAGE_SIZE
+        PLAIN_HEADER_SIZE + elems * SLOT_SIZE + payload_bytes <= CONTENT_SIZE
     }
 
     fn rebuild_leaf_with_updated_value(
@@ -730,9 +839,9 @@ impl PlainNode {
         replacement_inline_value: &[u8],
     ) {
         let elems = self.header().elems as usize;
-        let mut new_page = AlignedPage::new();
+        let mut new_page = AlignedPage::new_zeroed();
         let src_hdr = *self.header();
-        let mut offset = PAGE_SIZE as u32;
+        let mut offset = CONTENT_SIZE as u32;
 
         new_page.as_mut_slice()[..PLAIN_HEADER_SIZE]
             .copy_from_slice(&self.page.as_slice()[..PLAIN_HEADER_SIZE]);
@@ -905,10 +1014,10 @@ impl PlainNode {
     }
 
     fn compact(&mut self) {
-        let mut new_page = AlignedPage::new();
+        let mut new_page = AlignedPage::new_zeroed();
         let src_hdr = *self.header();
         let elems = src_hdr.elems as usize;
-        let mut offset = PAGE_SIZE as u32;
+        let mut offset = CONTENT_SIZE as u32;
 
         new_page.as_mut_slice()[..PLAIN_HEADER_SIZE]
             .copy_from_slice(&self.page.as_slice()[..PLAIN_HEADER_SIZE]);
@@ -1087,7 +1196,11 @@ impl PlainNode {
             slot.key_len()
         };
         let off = slot.data_offset();
-        &self.page.as_slice()[off..off + len]
+        page_slice(
+            self.page.as_slice(),
+            off..off + len,
+            "slot range within page",
+        )
     }
 
     pub(crate) fn child_at(&self, pos: usize) -> DataPid {
@@ -1186,11 +1299,10 @@ impl PlainNode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// EncodedNode: 16-byte header, shared `prefix` bytes after the header, each
-// slot stores the key tail (`key[prefix..]`). Ordering is preserved so binary
-// search on the tails stays valid (see `cmp_raw_with_prefixed_tail`).
-// ---------------------------------------------------------------------------
+// EncodedNode: 20-byte header, shared `prefix` bytes after the header, each
+// slot storing its key's tail (`key[prefix..]`). Tails are laid out in slot
+// order, which keeps full-key order too, so the binary searches in `search`
+// and `child_pos_for_key` can run over the tails directly.
 
 #[derive(Clone, Copy)]
 struct EncodedLeafEntry {
@@ -1293,8 +1405,6 @@ fn common_prefix_len_pair(lhs: &[u8], rhs: &[u8]) -> usize {
         .unwrap_or(n)
 }
 
-/// Encoded leaf built from full keys and values. The shared prefix is the
-/// common prefix of all keys; inline values follow each tail back-to-front.
 #[cfg(test)]
 fn encoded_leaf_entries_from_full_entries(entries: &[(Vec<u8>, Vec<u8>)]) -> EncodedLeafEntries {
     assert!(!entries.is_empty());
@@ -1347,7 +1457,7 @@ fn write_encoded_page<'a, I>(
         let h = &mut *ptr.cast::<EncodedHeader>();
         h.kind = kind;
         h.elems = elems as u32;
-        h.offset = PAGE_SIZE as u32;
+        h.offset = CONTENT_SIZE as u32;
         h.prefix_len = prefix.len() as u32;
         if !prefix.is_empty() {
             std::ptr::copy_nonoverlapping(
@@ -1358,7 +1468,7 @@ fn write_encoded_page<'a, I>(
         }
 
         let slot_base = (ENCODED_HEADER_SIZE + prefix.len() + 3) & !3;
-        let mut offset = PAGE_SIZE;
+        let mut offset = CONTENT_SIZE;
         for (i, entry) in entries.into_iter().enumerate() {
             offset -= entry.tail.len() + entry.value.len();
             let slot = &mut *ptr.add(slot_base + i * SLOT_SIZE).cast::<Slot>();
@@ -1385,8 +1495,6 @@ fn write_encoded_page<'a, I>(
     }
 }
 
-/// Encoded branch built from full separator keys. Slot 0 is the empty
-/// sentinel; real separators are encoded as `prefix + tail`.
 fn encoded_branch_from_full_entries(entries: &[(Vec<u8>, DataPid)]) -> EncodedNode {
     debug_assert!(entries.len() >= 2);
     let real_keys: Vec<&[u8]> = entries[1..].iter().map(|(k, _)| k.as_slice()).collect();
@@ -1433,7 +1541,7 @@ fn encoded_branch_entries_fit(entries: &[(Vec<u8>, DataPid)]) -> bool {
         .enumerate()
         .map(|(i, (k, _))| if i == 0 { 0 } else { k.len() - prefix_len })
         .sum();
-    slot_base + entries.len() * SLOT_SIZE + tail_bytes <= PAGE_SIZE
+    slot_base + entries.len() * SLOT_SIZE + tail_bytes <= CONTENT_SIZE
 }
 
 #[derive(Clone)]
@@ -1462,8 +1570,16 @@ impl EncodedNode {
         self.page
     }
 
+    /// Immutable full page view. The commit flush copies it into a staging buffer, which is then
+    /// sealed with the page's final PID, so the resident entry is never mutated.
     pub(crate) fn finalize(&self) -> &[u8] {
         self.page.as_slice()
+    }
+
+    /// Mutable full page for the writer, which seals the CRC trailer in place
+    /// with the page's final PID (no copy of the 4096-byte buffer).
+    pub(crate) fn finalize_mut(&mut self) -> &mut [u8] {
+        self.page.as_mut_slice()
     }
 
     fn header(&self) -> &EncodedHeader {
@@ -1492,19 +1608,19 @@ impl EncodedNode {
             return Err(NodeDecodeError::Corruption);
         }
         let prefix_len = header.prefix_len as usize;
-        if ENCODED_HEADER_SIZE + prefix_len > PAGE_SIZE {
+        if ENCODED_HEADER_SIZE + prefix_len > CONTENT_SIZE {
             return Err(NodeDecodeError::Corruption);
         }
         let slot_base = (ENCODED_HEADER_SIZE + prefix_len + 3) & !3;
-        if slot_base > PAGE_SIZE {
+        if slot_base > CONTENT_SIZE {
             return Err(NodeDecodeError::Corruption);
         }
-        let max_elems = (PAGE_SIZE - slot_base) / SLOT_SIZE;
+        let max_elems = (CONTENT_SIZE - slot_base) / SLOT_SIZE;
         if header.elems > max_elems as u32 {
             return Err(NodeDecodeError::Corruption);
         }
         let min_offset = slot_base + header.elems as usize * SLOT_SIZE;
-        if header.offset < min_offset as u32 || header.offset > PAGE_SIZE as u32 {
+        if header.offset < min_offset as u32 || header.offset > CONTENT_SIZE as u32 {
             return Err(NodeDecodeError::Corruption);
         }
         Ok(())
@@ -1512,7 +1628,7 @@ impl EncodedNode {
 
     fn new_encoded(is_leaf: bool) -> Self {
         let mut this = EncodedNode {
-            page: AlignedPage::new(),
+            page: AlignedPage::new_zeroed(),
         };
         let h = this.header_mut();
         h.kind = if is_leaf {
@@ -1521,7 +1637,7 @@ impl EncodedNode {
             ENCODED_BRANCH
         };
         h.elems = 0;
-        h.offset = PAGE_SIZE as u32;
+        h.offset = CONTENT_SIZE as u32;
         h.prefix_len = 0;
         this
     }
@@ -1547,7 +1663,11 @@ impl EncodedNode {
 
     fn prefix(&self) -> &[u8] {
         let len = self.header().prefix_len as usize;
-        &self.page.as_slice()[ENCODED_HEADER_SIZE..ENCODED_HEADER_SIZE + len]
+        page_slice(
+            self.page.as_slice(),
+            ENCODED_HEADER_SIZE..ENCODED_HEADER_SIZE + len,
+            "prefix range within page",
+        )
     }
 
     /// Sets the shared prefix of an empty encoded leaf to `key` so the first
@@ -1560,7 +1680,7 @@ impl EncodedNode {
             let ptr = self.page.as_mut_ptr();
             let h = &mut *ptr.cast::<EncodedHeader>();
             h.prefix_len = prefix_len as u32;
-            h.offset = PAGE_SIZE as u32;
+            h.offset = CONTENT_SIZE as u32;
             if prefix_len > 0 {
                 std::ptr::copy_nonoverlapping(
                     key.as_ptr(),
@@ -1600,20 +1720,26 @@ impl EncodedNode {
         }
     }
 
-    /// Stored tail bytes (`key[prefix..]`) for the slot.
     fn tail_at(&self, pos: usize) -> &[u8] {
         let slot = self.slot_at(pos);
         let off = slot.pos as usize;
         let len = slot.klen as usize;
-        &self.page.as_slice()[off..off + len]
+        page_slice(
+            self.page.as_slice(),
+            off..off + len,
+            "slot tail range within page",
+        )
     }
 
-    /// Inline value bytes: the payload follows the stored tail.
     fn value_at(&self, pos: usize) -> &[u8] {
         let slot = self.slot_at(pos);
-        assert!(slot.is_inline());
+        require_inline(slot.is_inline());
         let off = slot.pos as usize + slot.klen as usize;
-        &self.page.as_slice()[off..off + slot.vlen as usize]
+        page_slice(
+            self.page.as_slice(),
+            off..off + slot.vlen as usize,
+            "slot value range within page",
+        )
     }
 
     fn tail_at_mut(&mut self, pos: usize) -> &mut [u8] {
@@ -1641,9 +1767,6 @@ impl EncodedNode {
         buf.extend_from_slice(self.tail_at(pos));
     }
 
-    /// Collects every entry into one scratch buffer. Full keys are needed to
-    /// compute a new prefix, but keeping keys and inline values in one buffer
-    /// avoids a pair of heap allocations per existing entry on rebuilds.
     fn collect_slot_entries(&self) -> EncodedLeafEntries {
         let count = self.num_children();
         let prefix = self.prefix();
@@ -1721,13 +1844,9 @@ impl EncodedNode {
         } else {
             new_tail_len
         };
-        slot_base + (range.len() + 1) * SLOT_SIZE + data + new_data <= PAGE_SIZE
+        slot_base + (range.len() + 1) * SLOT_SIZE + data + new_data <= CONTENT_SIZE
     }
 
-    /// Rebuilds this leaf from `entries` so it stores exactly `new_prefix_len`
-    /// prefix bytes, re-encoding every tail. The caller has already verified
-    /// the result fits a page; this is the encoded equivalent of the plain
-    /// leaf's `compact`.
     fn rebuild_leaf_with_prefix(
         &mut self,
         entries: &EncodedLeafEntries,
@@ -1781,7 +1900,7 @@ impl EncodedNode {
                 }
             })
             .sum();
-        slot_base + range.len() * SLOT_SIZE + data_bytes <= PAGE_SIZE
+        slot_base + range.len() * SLOT_SIZE + data_bytes <= CONTENT_SIZE
     }
 
     fn updated_leaf_entries(
@@ -1848,11 +1967,6 @@ impl EncodedNode {
         }
 
         if self.is_empty() {
-            // First entry: the empty shared prefix matches every key, which
-            // would keep every slot at full length until the leaf splits.
-            // Establish the prefix as this key so a single-key leaf stores no
-            // per-slot key bytes and the next key that shares bytes triggers a
-            // rebuild that computes the real common prefix.
             self.establish_prefix_for_empty(key);
         }
 
@@ -1870,8 +1984,6 @@ impl EncodedNode {
                     };
                     let total_required = data_len as u32 + SLOT_SIZE as u32;
                     if self.available_space() < total_required {
-                        // Compact first: an insert/delete cycle can leave dead
-                        // payload bytes that available_space() counts as used.
                         // Compacting frees them; only then decide to split.
                         let mut entries = self.collect_slot_entries();
                         let insert_at = entries
@@ -1904,8 +2016,6 @@ impl EncodedNode {
                 }
             }
         } else {
-            // The new key leaves the shared-prefix domain: rebuild the whole
-            // leaf with a fresh prefix. Decide the new prefix, the stored tail
             // length, and whether the entry fits BEFORE allocating any overflow
             // pages, so a split trigger never leaks pages (the plain tail path
             // checks available_space before allocating for the same reason).
@@ -1984,9 +2094,6 @@ impl EncodedNode {
 
     pub(crate) fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
         let prefix = self.prefix();
-        // Leaves have no sentinel; branches skip slot 0, whose decoded full
-        // key is the empty sentinel `""` rather than `prefix`, so comparing it
-        // against `key` via `cmp_raw_with_prefixed_tail` would be wrong.
         let mut lo = if self.is_leaf() { 0usize } else { 1usize };
         let mut hi = self.num_children();
         while lo < hi {
@@ -2007,9 +2114,6 @@ impl EncodedNode {
 
     pub(crate) fn child_pos_for_key(&self, key: &[u8]) -> usize {
         debug_assert!(!self.is_leaf());
-        // Slot 0 is the empty sentinel (always <= key); only real separators
-        // at 1..elems participate, so a key below every separator returns 0
-        // without a comparator special case.
         let prefix = self.prefix();
         let mut lo = 1usize;
         let mut hi = self.num_children();
@@ -2109,8 +2213,6 @@ impl EncodedNode {
                 if !slot.is_inline() {
                     ctx.free_slot(&slot);
                 }
-                // Deleting never shrinks the shared prefix: the old prefix is
-                // still a prefix of every remaining key.
             }
             Err(_) => crate::invariant(
                 "DELETE_MISSING_KEY",
@@ -2125,13 +2227,6 @@ impl EncodedNode {
             crate::invariant("SPLIT_NON_LEAF", "attempted leaf split on branch node");
         }
 
-        // Split by full keys; both halves re-encode tails against their own
-        // (strictly shorter) prefix. LeanStore's Split copies the two ranges
-        // into fresh pages and re-encodes each half against its new fences;
-        // the same structure is used here, so a near-full leaf splits into two
-        // self-consistent halves for the existing entries. The write path uses
-        // `split_leaf_for_insert` so a pending key that changes the prefix is
-        // included in the pivot decision as well.
         let entries = self.collect_slot_entries();
         let mid = entries.len() / 2;
         let sep = NonEmptyKey::new(entries.key(mid).to_vec()).unwrap_or_else(|| {
@@ -2437,12 +2532,6 @@ fn encoded_branch_split_pivot(entries: &[(Vec<u8>, DataPid)]) -> Option<usize> {
     None
 }
 
-// ---------------------------------------------------------------------------
-// Node: the shared handle. Reads and writes dispatch on the page's first u32
-// by matching the node class, so no `is_encoded()` branch appears in the tree
-// logic.
-// ---------------------------------------------------------------------------
-
 #[derive(Clone)]
 pub(crate) enum Node {
     Plain(PlainNode),
@@ -2450,12 +2539,13 @@ pub(crate) enum Node {
 }
 
 impl Node {
-    /// Interprets a page that may be either node class. A first u32 of 0/1 is
-    /// a plain node (`is_leaf`); 2/3 is an encoded node (`kind`).
+    /// Interprets a page that may be either node class. The class word (the u32
+    /// after the checksum field) of 0/1 is a plain node (`is_leaf`); 2/3 is an
+    /// encoded node (`kind`).
     pub(crate) fn from_aligned_page(
         page: AlignedPage,
     ) -> std::result::Result<Self, NodeDecodeError> {
-        let first = unsafe { page.as_ptr().cast::<u32>().read_unaligned() };
+        let first = unsafe { page.as_ptr().add(4).cast::<u32>().read_unaligned() };
         if first >= ENCODED_BRANCH {
             Ok(Node::Encoded(EncodedNode::from_aligned_page(page)?))
         } else {
@@ -2467,7 +2557,7 @@ impl Node {
     pub(crate) fn from_raw(data: Vec<u8>) -> std::result::Result<Self, NodeDecodeError> {
         assert!(data.len() >= PLAIN_HEADER_SIZE);
         let page = AlignedPage::from_vec(data.clone());
-        let first = unsafe { page.as_ptr().cast::<u32>().read_unaligned() };
+        let first = unsafe { page.as_ptr().add(4).cast::<u32>().read_unaligned() };
         if first >= ENCODED_BRANCH {
             EncodedNode::from_raw(data).map(Node::Encoded)
         } else {
@@ -2486,6 +2576,13 @@ impl Node {
         match self {
             Node::Plain(node) => node.finalize(),
             Node::Encoded(node) => node.finalize(),
+        }
+    }
+
+    pub(crate) fn finalize_mut(&mut self) -> &mut [u8] {
+        match self {
+            Node::Plain(node) => node.finalize_mut(),
+            Node::Encoded(node) => node.finalize_mut(),
         }
     }
 
@@ -2744,8 +2841,12 @@ impl Node {
     pub(crate) fn header_mut(&mut self) -> &mut PlainHeader {
         match self {
             Node::Plain(node) => node.header_mut(),
-            // The first three u32 of an encoded header overlap `NodeHeader`;
-            // only used by validation tests that mutate plain pages.
+            // The cast is layout-legal only because the encoded header's first
+            // four u32s (`checksum`, `kind`, `elems`, `offset`) overlap
+            // `PlainHeader` field for field; the const assert near
+            // `ENCODED_HEADER_SIZE` pins only the checksum offset, not the rest
+            // of the overlap. Only used by validation tests that mutate plain
+            // pages.
             Node::Encoded(node) => unsafe { &mut *node.page.as_mut_ptr().cast::<PlainHeader>() },
         }
     }
@@ -2913,8 +3014,9 @@ mod validation_tests {
 
     #[test]
     fn node_validation_preserves_header_bounds() {
-        assert_eq!(std::mem::size_of::<PlainHeader>(), 12);
-        assert_eq!(std::mem::size_of::<EncodedHeader>(), 16);
+        assert_eq!(std::mem::size_of::<PlainHeader>(), 16);
+        assert_eq!(std::mem::size_of::<EncodedHeader>(), 20);
+        assert_eq!(PLAIN_CHECKSUM_OFFSET, 0);
 
         let assert_rejected = |node: Node| {
             let page = node.finalize().to_vec();
@@ -2929,7 +3031,8 @@ mod validation_tests {
         assert_rejected(invalid_leaf);
 
         let mut invalid_count = Node::new_leaf();
-        invalid_count.header_mut().elems = ((PAGE_SIZE - PLAIN_HEADER_SIZE) / SLOT_SIZE + 1) as u32;
+        invalid_count.header_mut().elems =
+            ((CONTENT_SIZE - PLAIN_HEADER_SIZE) / SLOT_SIZE + 1) as u32;
         assert_rejected(invalid_count);
 
         let mut invalid_low_offset = Node::new_leaf();
@@ -2937,7 +3040,7 @@ mod validation_tests {
         assert_rejected(invalid_low_offset);
 
         let mut invalid_high_offset = Node::new_leaf();
-        invalid_high_offset.header_mut().offset = (PAGE_SIZE + 1) as u32;
+        invalid_high_offset.header_mut().offset = (CONTENT_SIZE + 1) as u32;
         assert_rejected(invalid_high_offset);
     }
 
@@ -2955,7 +3058,6 @@ mod validation_tests {
             Ok(Node::Encoded(_))
         ));
 
-        // Round-trip through the shared validator.
         let plain2 = Node::from_aligned_page(plain.clone().into_aligned_page()).unwrap();
         let encoded2 = Node::from_aligned_page(encoded.clone().into_aligned_page()).unwrap();
         assert!(plain2.is_leaf());
@@ -2964,26 +3066,36 @@ mod validation_tests {
 
     #[test]
     fn indirect_layout_has_no_identity_header() {
-        assert_eq!(IDS_PER_INDIRECT_PAGE, (PAGE_SIZE - 4) / 4);
+        assert_eq!(
+            IDS_PER_INDIRECT_PAGE,
+            (crate::page::TRAILER_CRC_OFFSET - 4) / 4
+        );
 
         let mut page = [0u8; PAGE_SIZE];
         page[0..4].copy_from_slice(&11u32.to_le_bytes());
         page[4..8].copy_from_slice(&22u32.to_le_bytes());
         page[8..12].copy_from_slice(&33u32.to_le_bytes());
         page[12..16].copy_from_slice(&44u32.to_le_bytes());
-        page[OFFSET_NEXT_INDIRECT..].copy_from_slice(&55u32.to_le_bytes());
+        page[OFFSET_NEXT_INDIRECT..OFFSET_NEXT_INDIRECT + 4].copy_from_slice(&55u32.to_le_bytes());
         assert_eq!(
-            u32::from_le_bytes(page[OFFSET_NEXT_INDIRECT..].try_into().unwrap()),
+            u32::from_le_bytes(
+                page[OFFSET_NEXT_INDIRECT..OFFSET_NEXT_INDIRECT + 4]
+                    .try_into()
+                    .unwrap()
+            ),
             55
         );
+        // The next pointer is the last field of the covered content; the four
+        // bytes after it are the page's checksum trailer.
+        assert_eq!(OFFSET_NEXT_INDIRECT + 4, crate::page::TRAILER_CRC_OFFSET);
     }
 
     #[test]
-    fn overflow_page_count_uses_full_pages() {
+    fn overflow_page_count_uses_the_value_page_capacity() {
         let mut slot = Slot {
             pos: 0,
             klen: 1,
-            vlen: PAGE_SIZE as u32,
+            vlen: VALUE_PAGE_CONTENT as u32,
             page_id: [2; NR_INLINE_PAGE],
         };
         assert_eq!(slot.nr_pages(), 1);
@@ -3012,7 +3124,6 @@ mod validation_tests {
         assert_eq!(node.search(b"user/001/zz"), Err(2));
         assert_eq!(node.search(b"zzz"), Err(3));
 
-        // The shared handle dispatches to the encoded implementation.
         let handle = Node::Encoded(node);
         for (i, (k, _)) in entries.iter().enumerate() {
             assert_eq!(handle.search(k), Ok(i), "dispatch search {k:?}");
@@ -3024,7 +3135,7 @@ mod validation_tests {
         let mut node = encoded_leaf_from_full_entries(&[(b"ab/1".to_vec(), b"v".to_vec())]);
         unsafe {
             let h = &mut *node.page.as_mut_ptr().cast::<EncodedHeader>();
-            h.prefix_len = (PAGE_SIZE + 1) as u32;
+            h.prefix_len = (CONTENT_SIZE + 1) as u32;
         }
         assert_eq!(
             Node::from_raw(node.finalize().to_vec()).err(),
@@ -3037,10 +3148,6 @@ mod validation_tests {
 
     #[test]
     fn encoded_rebuild_fits_rejects_an_entry_that_would_not_fit() {
-        // The cross-prefix path must decide whether a rebuild fits BEFORE
-        // allocating any overflow pages. Build a near-full inline leaf and
-        // confirm the fit check rejects an additional entry (so the caller
-        // returns SplitRequired without allocating).
         let slot = |vlen: usize| Slot {
             pos: 0,
             klen: 0,
@@ -3052,14 +3159,11 @@ mod validation_tests {
                 .map(|i| (format!("user/{i:03}").into_bytes(), slot(200), vec![0; 200]))
                 .collect::<Vec<_>>(),
         );
-        // Under a shared prefix of 0 (cross-prefix rebuild), each 9-byte key
-        // with a 200-byte inline value plus the new entry exceeds one page.
         assert!(
             !EncodedNode::rebuild_leaf_fits(&near_full, 0..near_full.len(), 0, 9, true, 200),
             "a near-full leaf plus a cross-prefix inline entry must not fit"
         );
 
-        // A sparse leaf leaves room.
         let sparse = leaf_entries(
             &(0..4u32)
                 .map(|i| (format!("user/{i:03}").into_bytes(), slot(200), vec![0; 200]))
@@ -3070,8 +3174,6 @@ mod validation_tests {
             "a sparse leaf must fit the new entry"
         );
 
-        // An overflow entry stores only its tail, so it is far cheaper than
-        // an inline entry of the same value length.
         assert!(
             EncodedNode::rebuild_leaf_fits(&near_full, 0..near_full.len(), 0, 9, false, 300),
             "overflow tails must be cheap enough to fit a near-full leaf"
@@ -3080,8 +3182,6 @@ mod validation_tests {
 
     #[test]
     fn encoded_cross_prefix_rebuild_preserves_entries() {
-        // A leaf whose prefix no longer covers an incoming key must rebuild
-        // with a fresh prefix without losing existing entries.
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (96..100u32)
             .map(|i| {
                 (
@@ -3111,7 +3211,6 @@ mod validation_tests {
         );
         node.rebuild_leaf_from_entries(&collected, 0..collected.len());
 
-        // The new prefix is the common prefix of all five keys.
         assert_eq!(node.prefix(), b"user/");
         assert_eq!(node.num_children(), 5);
 
@@ -3125,8 +3224,9 @@ mod validation_tests {
             if pos < entries.len() {
                 assert_eq!(v, entries[pos].1.as_slice(), "entry {pos} value");
             } else {
-                // The unit test inserts the new entry with an empty inline
-                // payload; it must not disturb existing values.
+                // The freshly appended entry carries no inline value yet, so
+                // the rebuild must leave it empty rather than disturb the
+                // existing entries' payloads.
                 assert!(v.is_empty(), "new entry inline value must be preserved");
             }
         }
@@ -3185,7 +3285,6 @@ mod validation_tests {
         assert_eq!(left_keys, expect_left, "left half keys");
         assert_eq!(right_keys, expect_right, "right half keys");
 
-        // Values survive the structural rebuild.
         for (pos, key) in right_keys.iter().enumerate() {
             let original = entries.iter().find(|(k, _)| k == key).unwrap().1.clone();
             assert_eq!(

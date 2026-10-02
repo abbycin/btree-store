@@ -6,14 +6,10 @@ use tempfile::TempDir;
 fn test_reuse_within_txn() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("reuse_txn.db");
-    // Transaction-local reuse must consume tracked reusable ownership without
-    // exposing the deleted value page as a leaked or reachable page.
 
     let tree = BTree::open(&db_path).unwrap();
     tree.new_bucket("default", false).unwrap();
     tree.exec("default", |txn| {
-        // COW node writes exercise the single-page allocator path as well as
-        // the multi-page overflow path covered below.
         txn.put(b"large1", vec![0u8; 12000]).unwrap();
         let size_after_put = fs::metadata(&db_path).unwrap().len();
         txn.del(b"large1").unwrap();

@@ -57,7 +57,6 @@ fn test_exec_rollback_no_leak() {
     let tree = BTree::open(&db_path).unwrap();
     tree.new_bucket("data", false).unwrap();
 
-    // 1. Initial state
     tree.exec("data", |txn| {
         txn.put(b"initial", b"value").unwrap();
         txn.put(b"overwritten", b"committed").unwrap();
@@ -65,9 +64,7 @@ fn test_exec_rollback_no_leak() {
     })
     .unwrap();
 
-    // 2. Execute a transaction that fails
     let res: btree_store::Result<()> = tree.exec("data", |txn| {
-        // Allocate some pages by putting large values
         txn.put(b"large", vec![0xAA; 1024 * 1024]).unwrap();
         txn.put(b"overwritten", b"aborted").unwrap();
         txn.del(b"initial").unwrap();
@@ -77,7 +74,6 @@ fn test_exec_rollback_no_leak() {
 
     assert_eq!(res, Err(Error::KeyNotFound));
 
-    // 3. Verify that pages were NOT leaked (pending_alloc should be empty)
     assert_eq!(tree.pending_pages().0, 0, "Pending alloc should be empty");
     assert_eq!(tree.pending_pages().1, 0, "Pending free should be empty");
 
@@ -117,8 +113,6 @@ fn long_view_keeps_snapshot_and_recovers_after_quiescence() {
     let tree = BTree::open(&db_path).unwrap();
     tree.new_bucket("data", false).unwrap();
 
-    // one data set is 1000 keys with 2-byte values; the COW rewrite footprint
-    // is ~22 pages (~90KB) per commit, well above allocator-list churn
     let seed_data = |tree: &BTree, val: &[u8]| {
         tree.exec("data", |txn| {
             for i in 0..1000u32 {
@@ -151,8 +145,6 @@ fn long_view_keeps_snapshot_and_recovers_after_quiescence() {
     });
 
     ready.wait();
-    // many commits under the long view: the v0 pages stay quarantined, so each
-    // commit allocates fresh pages and the file keeps growing
     for v in [
         b"v1".as_slice(),
         b"v2".as_slice(),
@@ -169,8 +161,6 @@ fn long_view_keeps_snapshot_and_recovers_after_quiescence() {
     done.wait();
     reader.join().unwrap();
 
-    // after quiescence the engine resumes promotion: the next commit reuses
-    // the quarantined pages and the file stops growing
     seed_data(&tree, b"v5");
     let size_after_v5 = fs::metadata(&db_path).unwrap().len();
     seed_data(&tree, b"v6");

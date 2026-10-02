@@ -43,8 +43,6 @@ fn deterministic_storage_trace_refines_btreemap() {
         .map(str::to_owned)
         .collect();
 
-    // All known buckets exist up front; the model tracks each one as an empty
-    // bucket map until the workload populates it.
     for bucket in &known_buckets {
         tree.new_bucket(bucket, false).unwrap();
         model.insert(bucket.clone(), BucketModel::new());

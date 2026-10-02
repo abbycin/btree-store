@@ -36,7 +36,7 @@ jobs:
         run: cargo build --verbose
 
       - name: Run Tests
-        run: cargo test --verbose -- --nocapture
+        run: cargo test --all-features --verbose -- --nocapture
 
   # Job 2: FreeBSD (Runs in a VM on top of Linux)
   test-freebsd:
@@ -52,7 +52,7 @@ jobs:
           prepare: |
             pkg install -y rust
           run: |
-            cargo test --verbose -- --nocapture
+            cargo test --all-features --verbose -- --nocapture
 
   # Job 3: Linux ARM64 (Cross-compile check)
   # This verifies that the code compiles for Linux on ARM.
@@ -74,7 +74,10 @@ jobs:
       - name: Build for ARM64
         run: cross build --target aarch64-unknown-linux-gnu --verbose
 
-      # Note: Running tests for ARM64 on x86_64 requires QEMU via cross.
-      # If you want to actually run the tests:
+      # Note: Running tests for ARM64 on x86_64 requires QEMU via cross, which runs
+      # every test target under emulation. The bench is excluded: this job exists to
+      # prove the code runs on ARM64, and criterion's test mode would execute every
+      # benchmark once under emulation for no extra coverage.
+      # `--all-features` so the publication failure ladder is not compiled to nothing.
       - name: Run tests for ARM64
-        run: cross test --target aarch64-unknown-linux-gnu --verbose -- --nocapture
+        run: cross test --target aarch64-unknown-linux-gnu --all-features --verbose --lib --tests -- --nocapture

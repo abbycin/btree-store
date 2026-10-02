@@ -7,13 +7,103 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum CacheState {
+    Hot = 1,
+    Warm = 2,
+    Cold = 3,
+}
+
+impl CacheState {
+    fn initial(node: &Node) -> Self {
+        if node.is_leaf() {
+            Self::Warm
+        } else {
+            Self::Hot
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Hot,
+            2 => Self::Warm,
+            3 => Self::Cold,
+            _ => unreachable!("invalid cache state"),
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+const RECENT_BIT: u8 = 0b100;
+const STATE_MASK: u8 = 0b011;
 
 struct CacheEntry {
     page_id: PageId,
     node: Arc<Node>,
-    usage: AtomicBool,
+    flags: AtomicU8,
+}
+
+impl CacheEntry {
+    fn on_hit(&self) {
+        let is_branch = !self.node.is_leaf();
+        let flags = self.flags.load(Ordering::Relaxed);
+        match CacheState::from_u8(flags & STATE_MASK) {
+            CacheState::Hot => {
+                if flags & RECENT_BIT == 0 {
+                    self.flags.store(flags | RECENT_BIT, Ordering::Relaxed);
+                }
+            }
+            CacheState::Warm if is_branch => {
+                self.flags
+                    .store(RECENT_BIT | CacheState::Hot.as_u8(), Ordering::Relaxed);
+            }
+            CacheState::Warm => {
+                if flags & RECENT_BIT == 0 {
+                    self.flags.store(flags | RECENT_BIT, Ordering::Relaxed);
+                }
+            }
+            CacheState::Cold => {
+                let warmed = RECENT_BIT | CacheState::Warm.as_u8();
+                if self
+                    .flags
+                    .compare_exchange(flags, warmed, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+                    && is_branch
+                {
+                    self.flags
+                        .store(RECENT_BIT | CacheState::Hot.as_u8(), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn on_eviction(&self) -> bool {
+        let flags = self.flags.load(Ordering::Relaxed);
+        if flags & RECENT_BIT != 0 {
+            self.flags.store(flags & !RECENT_BIT, Ordering::Relaxed);
+            return false;
+        }
+        match CacheState::from_u8(flags & STATE_MASK) {
+            CacheState::Hot => {
+                self.flags
+                    .store(CacheState::Warm.as_u8(), Ordering::Relaxed);
+                false
+            }
+            CacheState::Warm => {
+                self.flags
+                    .store(CacheState::Cold.as_u8(), Ordering::Relaxed);
+                false
+            }
+            CacheState::Cold => true,
+        }
+    }
 }
 
 struct NodeCacheShard {
@@ -45,50 +135,31 @@ impl NodeCacheShard {
         if let Some(idx) = self.find_entry_idx(page_id)
             && let Some(entry) = &self.entries[idx]
         {
-            if !entry.usage.load(Ordering::Relaxed) {
-                entry.usage.store(true, Ordering::Relaxed);
-            }
+            entry.on_hit();
             return Some(entry.node.clone());
         }
         None
-    }
-
-    fn get_branch(&self, page_id: PageId) -> Option<Arc<Node>> {
-        if let Some(idx) = self.find_entry_idx(page_id)
-            && let Some(entry) = &self.entries[idx]
-            && !entry.node.is_leaf()
-        {
-            if !entry.usage.load(Ordering::Relaxed) {
-                entry.usage.store(true, Ordering::Relaxed);
-            }
-            return Some(entry.node.clone());
-        }
-        None
-    }
-
-    #[cfg(test)]
-    fn peek(&self, page_id: PageId) -> Option<Arc<Node>> {
-        self.find_entry_idx(page_id)
-            .and_then(|idx| self.entries[idx].as_ref().map(|entry| entry.node.clone()))
     }
 
     fn put(&mut self, page_id: PageId, node: Arc<Node>) {
         if self.capacity == 0 {
             return;
         }
+        let initial_state = CacheState::initial(&node);
         if let Some(idx) = self.find_entry_idx(page_id)
             && let Some(entry) = &mut self.entries[idx]
         {
-            entry.usage.store(true, Ordering::Relaxed);
+            entry
+                .flags
+                .store(initial_state.as_u8() | RECENT_BIT, Ordering::Relaxed);
             entry.node = node;
             return;
         }
 
         loop {
-            let evict = match &mut self.entries[self.hand] {
+            let evict = match &self.entries[self.hand] {
                 None => true,
-                Some(entry) if entry.usage.swap(false, Ordering::Relaxed) => false,
-                Some(_) => true,
+                Some(entry) => entry.on_eviction(),
             };
 
             if evict {
@@ -103,7 +174,7 @@ impl NodeCacheShard {
                 self.entries[self.hand] = Some(CacheEntry {
                     page_id,
                     node,
-                    usage: AtomicBool::new(true),
+                    flags: AtomicU8::new(initial_state.as_u8() | RECENT_BIT),
                 });
                 self.page_to_entry.insert(page_id, self.hand);
                 self.hand = (self.hand + 1) % self.capacity;
@@ -178,21 +249,6 @@ impl NodeCache {
         self.get_shard(page_id).read().get(page_id)
     }
 
-    #[cfg(test)]
-    pub(crate) fn peek(&self, page_id: PageId) -> Option<Arc<Node>> {
-        if self.shards.is_empty() {
-            return None;
-        }
-        self.get_shard(page_id).read().peek(page_id)
-    }
-
-    pub(crate) fn get_branch(&self, page_id: PageId) -> Option<Arc<Node>> {
-        if self.shards.is_empty() {
-            return None;
-        }
-        self.get_shard(page_id).read().get_branch(page_id)
-    }
-
     pub(crate) fn put(&self, page_id: PageId, node: Arc<Node>) {
         if self.shards.is_empty() {
             return;
@@ -212,6 +268,19 @@ impl NodeCache {
             return;
         }
         self.get_shard(page_id).write().invalidate(page_id)
+    }
+
+    /// Test-only occupancy probe: reports a resident entry without counting a
+    /// hit, so a test can assert "this PID is cached" without ageing it.
+    #[cfg(test)]
+    pub(crate) fn peek(&self, page_id: PageId) -> Option<Arc<Node>> {
+        if self.shards.is_empty() {
+            return None;
+        }
+        let shard = self.get_shard(page_id).read();
+        shard
+            .find_entry_idx(page_id)
+            .and_then(|idx| shard.entries[idx].as_ref().map(|entry| entry.node.clone()))
     }
 
     pub(crate) fn clear(&self) {
@@ -287,60 +356,6 @@ mod tests {
     }
 
     #[test]
-    fn node_cache_peek_does_not_refresh_usage_bit() {
-        let cache = NodeCache::new(1);
-        let page_id = 7;
-        cache.put(page_id, Arc::new(Node::new_leaf()));
-
-        {
-            let shard = cache.get_shard(page_id);
-            let mut guard = shard.write();
-            let entry = guard.entries[0].as_mut().expect("cached entry");
-            entry.usage.store(false, Ordering::Relaxed);
-        }
-
-        let node = cache.peek(page_id).expect("peeked node");
-        assert!(node.is_leaf());
-
-        let shard = cache.get_shard(page_id);
-        let guard = shard.read();
-        let entry = guard.entries[0].as_ref().expect("cached entry");
-        assert!(
-            !entry.usage.load(Ordering::Relaxed),
-            "peek should not refresh the clock-cache usage bit"
-        );
-    }
-
-    #[test]
-    fn node_cache_get_refreshes_usage_bit() {
-        let cache = NodeCache::new(1);
-        let page_id = 7;
-        cache.put(page_id, Arc::new(Node::new_leaf()));
-
-        {
-            let shard = cache.get_shard(page_id);
-            let guard = shard.read();
-            guard.entries[0]
-                .as_ref()
-                .expect("cached entry")
-                .usage
-                .store(false, Ordering::Relaxed);
-        }
-
-        assert!(cache.get(page_id).is_some());
-
-        let shard = cache.get_shard(page_id);
-        let guard = shard.read();
-        assert!(
-            guard.entries[0]
-                .as_ref()
-                .expect("cached entry")
-                .usage
-                .load(Ordering::Relaxed)
-        );
-    }
-
-    #[test]
     fn node_cache_identity_is_page_id() {
         let cache = NodeCache::new(1);
         let page_id = 7;
@@ -356,5 +371,106 @@ mod tests {
         cache.put(page_id + 1, Arc::new(Node::new_leaf()));
         assert!(cache.take_recycled_page(page_id).is_some());
         assert!(cache.take_recycled_page(page_id).is_none());
+    }
+
+    /// `capacity=128` gives every one of the 64 shards two slots, and the shard
+    /// index is `pid % 64`, so the PIDs used below are exactly the pairs that
+    /// share a shard. Three `put`s into one shard fill it, and the third walks
+    /// the hand over both resident entries, so the tier ladder decides which of
+    /// them survives.
+    fn two_slot_cache() -> NodeCache {
+        NodeCache::new(NUM_SHARDS * 2)
+    }
+
+    fn sibling(pid: PageId) -> PageId {
+        pid + NUM_SHARDS as PageId
+    }
+
+    fn leaf_node() -> Arc<Node> {
+        Arc::new(Node::new_leaf())
+    }
+
+    fn branch_node() -> Arc<Node> {
+        Arc::new(Node::new_branch_root(
+            crate::DataPid::new(2).unwrap(),
+            crate::node::NonEmptyKey::new(b"sep".to_vec()).unwrap(),
+            crate::DataPid::new(3).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn eviction_preserves_a_branch_longer_than_a_leaf_then_drops_it() {
+        let cache = two_slot_cache();
+        cache.put(1, branch_node());
+        cache.put(sibling(1), leaf_node());
+        cache.put(sibling(sibling(1)), leaf_node());
+        assert!(cache.peek(1).is_some());
+        assert!(cache.peek(sibling(1)).is_none());
+
+        cache.put(sibling(sibling(sibling(1))), leaf_node());
+        assert!(cache.peek(1).is_none());
+    }
+
+    fn hand_visits(entry: Arc<Node>, hits: &[usize]) -> Vec<bool> {
+        let cache = two_slot_cache();
+        cache.put(1, entry);
+        let mut alive = Vec::new();
+        for visit in 1..=6 {
+            if hits.contains(&visit) {
+                assert!(
+                    cache.get(1).is_some(),
+                    "visit {visit}: the entry is still cached"
+                );
+            }
+            let filler = 1 + NUM_SHARDS as PageId * visit as PageId;
+            cache.put(filler, leaf_node());
+            cache.invalidate(filler);
+            alive.push(cache.peek(1).is_some());
+        }
+        alive
+    }
+
+    #[test]
+    fn a_hit_ages_an_entry_up_and_defers_its_eviction() {
+        assert_eq!(
+            hand_visits(leaf_node(), &[]),
+            [true, true, true, false, false, false],
+            "a leaf starts Warm, so it is evictable on its fourth hand visit"
+        );
+
+        assert_eq!(
+            hand_visits(leaf_node(), &[4]),
+            [true, true, true, true, true, false],
+            "a hit must warm the entry up and set RECENT, deferring the eviction by one visit"
+        );
+
+        assert_eq!(
+            hand_visits(branch_node(), &[]),
+            [true, true, true, true, false, false],
+            "a branch starts Hot, so it needs one more hand visit than a leaf"
+        );
+    }
+
+    #[test]
+    fn invalidate_drops_an_entry_at_every_tier() {
+        let aged_to = |hit: bool| {
+            let cache = two_slot_cache();
+            cache.put(1, branch_node());
+            cache.put(sibling(1), leaf_node());
+            cache.put(sibling(sibling(1)), leaf_node());
+            if hit {
+                cache.get(1);
+            }
+            assert!(cache.peek(1).is_some(), "hit={hit}: reached resident");
+            cache
+        };
+        for hit in [false, true] {
+            let cache = aged_to(hit);
+            cache.invalidate(1);
+            assert!(
+                cache.peek(1).is_none(),
+                "hit={hit}: invalidate must not depend on the entry's tier"
+            );
+        }
     }
 }

@@ -11,7 +11,6 @@ fn test_exec_multi_basic() {
     tree.new_bucket("bucket1", false).unwrap();
     tree.new_bucket("bucket2", false).unwrap();
 
-    // Execute multi-bucket transaction
     tree.exec_multi(|multi| {
         multi.exec("bucket1", |txn| txn.put(b"key1", b"value1"))?;
         multi.exec("bucket2", |txn| txn.put(b"key2", b"value2"))?;
@@ -19,7 +18,6 @@ fn test_exec_multi_basic() {
     })
     .expect("Failed to execute multi-bucket transaction");
 
-    // Verify both buckets were updated
     tree.view("bucket1", |txn| {
         let val = txn.get(b"key1").expect("Failed to get key1");
         assert_eq!(val, b"value1");
@@ -44,12 +42,10 @@ fn test_exec_multi_rollback() {
     tree.new_bucket("bucket1", false).unwrap();
     tree.new_bucket("bucket2", false).unwrap();
 
-    // Initial state
     tree.exec("bucket1", |txn| txn.put(b"initial", b"state"))
         .unwrap();
     let before_abort_seq = tree.current_seq();
 
-    // Execute multi-bucket transaction that fails
     let res: btree_store::Result<()> = tree.exec_multi(|multi| {
         multi.exec("bucket1", |txn| txn.put(b"key1", b"value1"))?;
         multi.exec("bucket2", |txn| txn.put(b"key2", b"value2"))?;
@@ -60,7 +56,6 @@ fn test_exec_multi_rollback() {
     assert!(tree.current_seq() > before_abort_seq);
     assert_eq!(tree.pending_pages(), (0, 0));
 
-    // Verify bucket1 is still in initial state
     tree.view("bucket1", |txn| {
         let val = txn.get(b"initial").expect("Failed to get initial");
         assert_eq!(val, b"state");
@@ -69,7 +64,6 @@ fn test_exec_multi_rollback() {
     })
     .expect("Failed to view bucket1");
 
-    // Verify bucket2 doesn't exist (or at least doesn't have the key)
     let res2 = tree.view("bucket2", |txn| txn.get(b"key2"));
     assert!(res2.is_err());
 
@@ -129,7 +123,6 @@ fn test_exec_multi_sequential_on_same_bucket() {
 
     tree.exec_multi(|multi| {
         multi.exec("bucket1", |txn| txn.put(b"key1", b"value1"))?;
-        // Second execute on same bucket should see first change
         multi.exec("bucket1", |txn| {
             let val = txn.get(b"key1").expect("Should see key1");
             assert_eq!(val, b"value1");

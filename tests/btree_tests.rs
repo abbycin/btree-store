@@ -49,14 +49,12 @@ fn test_delete_existing_key() {
     let key = b"key_to_delete";
     let value = b"some_value";
 
-    // Insert key-value pair
     tree.exec("default", |txn| {
         txn.put(key, value).expect("Failed to put key-value");
         Ok(())
     })
     .expect("Failed to put");
 
-    // Verify key exists and delete it
     tree.exec("default", |txn| {
         let retrieved = txn.get(key).expect("Failed to get value");
         assert_eq!(retrieved, value);
@@ -65,7 +63,6 @@ fn test_delete_existing_key() {
     })
     .expect("Failed to del");
 
-    // Verify key has been deleted
     tree.view("default", |txn| {
         let retrieved = txn.get(key);
         assert_eq!(retrieved, Err(Error::KeyNotFound));
@@ -84,7 +81,6 @@ fn test_delete_nonexistent_key() {
 
     let key = b"nonexistent_key";
 
-    // Attempt to delete a non-existent key; this returns KeyNotFound
     let result = tree.exec("default", |txn| txn.del(key));
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), btree_store::Error::KeyNotFound);
@@ -98,7 +94,6 @@ fn test_multiple_puts_and_gets() {
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
     tree.new_bucket("default", false).unwrap();
 
-    // Insert multiple key-value pairs
     let test_data = vec![
         ("key1", "value1"),
         ("key2", "value2"),
@@ -116,7 +111,6 @@ fn test_multiple_puts_and_gets() {
     })
     .expect("Failed to put multiple");
 
-    // Verify all key-value pairs can be correctly retrieved
     tree.view("default", |txn| {
         for (key, value) in &test_data {
             let retrieved = txn.get(key.as_bytes()).expect("Failed to get value");
@@ -139,7 +133,6 @@ fn test_overwrite_existing_key() {
     let old_value = b"old_value";
     let new_value = b"new_value";
 
-    // Insert initial key-value pair
     tree.exec("default", |txn| {
         txn.put(key, old_value)
             .expect("Failed to put initial value");
@@ -154,7 +147,6 @@ fn test_overwrite_existing_key() {
     })
     .unwrap();
 
-    // Overwrite key-value pair
     tree.exec("default", |txn| {
         txn.put(key, new_value).expect("Failed to put new value");
         Ok(())
@@ -326,7 +318,6 @@ fn test_delete_complex_scenario() {
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
     tree.new_bucket("default", false).unwrap();
 
-    // Insert multiple sets of key-value pairs
     let keys = ["key1", "key2", "key3", "key4", "key5"];
     tree.exec("default", |txn| {
         for (i, key) in keys.iter().enumerate() {
@@ -338,7 +329,6 @@ fn test_delete_complex_scenario() {
     })
     .unwrap();
 
-    // Verify all keys exist
     tree.view("default", |txn| {
         for (i, key) in keys.iter().enumerate() {
             let value = format!("value{}", i).into_bytes();
@@ -349,7 +339,6 @@ fn test_delete_complex_scenario() {
     })
     .unwrap();
 
-    // Delete middle key
     tree.exec("default", |txn| {
         txn.del(b"key3").expect("Failed to delete key3");
         Ok(())
@@ -358,7 +347,6 @@ fn test_delete_complex_scenario() {
 
     tree.view("default", |txn| {
         assert_eq!(txn.get(b"key3"), Err(Error::KeyNotFound));
-        // Verify other keys still exist
         assert!(txn.get(b"key1").is_ok());
         assert!(txn.get(b"key2").is_ok());
         assert!(txn.get(b"key4").is_ok());
@@ -367,7 +355,6 @@ fn test_delete_complex_scenario() {
     })
     .unwrap();
 
-    // Delete first and last keys
     tree.exec("default", |txn| {
         txn.del(b"key1").expect("Failed to delete key1");
         txn.del(b"key5").expect("Failed to delete key5");
@@ -399,7 +386,6 @@ fn test_operations_on_missing_bucket_return_bucket_not_found() {
     let result = tree.exec("default", |txn| txn.del(b"nonexistent"));
     assert_eq!(result, Err(Error::BucketNotFound));
 
-    // Once created, the empty bucket accepts normal operations.
     tree.new_bucket("default", false).unwrap();
     let result = tree.exec("default", |txn| txn.del(b"nonexistent"));
     assert_eq!(result, Err(Error::KeyNotFound));
@@ -565,7 +551,6 @@ fn test_persistence() {
     let db_path = temp_dir.path().join("test_persistence.db");
 
     {
-        // First open, add data
         let tree = BTree::open(&db_path).expect("Failed to open BTree first time");
         tree.new_bucket("default", false).unwrap();
         tree.exec("default", |txn| {
@@ -577,7 +562,6 @@ fn test_persistence() {
     }
 
     {
-        // Second open, verify data still exists
         let tree = BTree::open(&db_path).expect("Failed to open BTree second time");
         tree.view("default", |txn| {
             let retrieved = txn
@@ -713,8 +697,6 @@ fn prefix_encoded_bucket_refines_plain_bucket() {
     tree.new_bucket("plain", false).unwrap();
     tree.new_bucket("encoded", true).unwrap();
 
-    // Shared-prefix keys plus occasional out-of-domain keys that force the
-    // encoded leaf to rebuild with a fresh prefix.
     for i in 0..120u32 {
         let key = format!("user/{i:03}/profile");
         let value = vec![(i % 251) as u8; 128];
@@ -753,7 +735,6 @@ fn prefix_encoded_bucket_refines_plain_bucket() {
         "encoded iterator must match plain order/values"
     );
 
-    // Point reads and updates agree.
     for i in 0..120u32 {
         let key = format!("user/{i:03}/profile");
         let expect = tree.view("plain", |txn| txn.get(key.as_bytes())).unwrap();
@@ -761,7 +742,6 @@ fn prefix_encoded_bucket_refines_plain_bucket() {
         assert_eq!(got, expect);
     }
 
-    // Update an existing and delete some keys in both buckets.
     for i in (0..120u32).step_by(3) {
         let key = format!("user/{i:03}/profile");
         let value = format!("updated-{i}");
@@ -783,7 +763,6 @@ fn prefix_encoded_bucket_refines_plain_bucket() {
     }
     assert_eq!(read_bucket(&tree, "encoded"), read_bucket(&tree, "plain"));
 
-    // Reopen: the per-bucket flag and encoded pages survive.
     drop(tree);
     let tree = BTree::open(&path).unwrap();
     assert_eq!(read_bucket(&tree, "encoded"), read_bucket(&tree, "plain"));
@@ -857,8 +836,6 @@ fn prefix_encoded_bucket_splits_left_half_for_cross_prefix_min_key() {
     assert_eq!(count, 301);
 }
 
-/// Alternating cross-prefix min and max keys with deletes keeps the encoded
-/// tree ordered through repeated left- and right-half recursive splits.
 #[test]
 fn prefix_encoded_bucket_stays_ordered_through_both_split_sides() {
     let dir = TempDir::new().unwrap();

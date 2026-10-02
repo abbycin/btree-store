@@ -13,7 +13,6 @@ fn test_delete_until_node_empty() {
         .map(|i| format!("key-{i:04}").into_bytes())
         .collect();
 
-    // Build enough leaves to force branch traversal and branch-child removal.
     tree.exec("default", |txn| {
         for key in &keys {
             txn.put(key, vec![0x5a; 128]).unwrap();
@@ -61,21 +60,18 @@ fn test_delete_from_root() {
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
     tree.new_bucket("default", false).unwrap();
 
-    // Add a key
     tree.exec("default", |txn| {
         txn.put(b"only_key", b"only_value").unwrap();
         Ok(())
     })
     .unwrap();
 
-    // Delete root key
     tree.exec("default", |txn| {
         txn.del(b"only_key").unwrap();
         Ok(())
     })
     .unwrap();
 
-    // Re-add verify tree works
     tree.exec("default", |txn| {
         txn.put(b"new_key", b"new_value").unwrap();
         assert_eq!(txn.get(b"new_key").unwrap(), b"new_value");
@@ -92,7 +88,6 @@ fn test_sequence_of_deletes() {
     let tree = BTree::open(&db_path).expect("Failed to open BTree");
     tree.new_bucket("default", false).unwrap();
 
-    // Add 10 keys
     tree.exec("default", |txn| {
         for i in 0..10 {
             txn.put(
@@ -105,7 +100,6 @@ fn test_sequence_of_deletes() {
     })
     .unwrap();
 
-    // Delete half
     tree.exec("default", |txn| {
         for i in 0..5 {
             txn.del(format!("key{}", i).as_bytes()).unwrap();
@@ -114,7 +108,6 @@ fn test_sequence_of_deletes() {
     })
     .unwrap();
 
-    // Verify remaining
     tree.view("default", |txn| {
         for i in 0..5 {
             assert_eq!(

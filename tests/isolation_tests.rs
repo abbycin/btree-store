@@ -12,7 +12,6 @@ fn test_view_isolation_without_blocking_writer() {
     let bucket_name = "iso_bucket";
     tree.new_bucket(bucket_name, false).unwrap();
 
-    // 1. Setup initial data
     tree.exec(bucket_name, |txn| {
         for i in 0..100 {
             txn.put(
@@ -35,15 +34,10 @@ fn test_view_isolation_without_blocking_writer() {
     let reader_handle = thread::spawn(move || {
         tree_clone_reader
             .view(bucket_name, |txn| {
-                // Read first item
                 let _ = txn.get("key_000").unwrap();
 
-                // Signal writer to start
                 barrier_clone.wait();
 
-                // Hold the view for a significant time. Snapshot isolation is
-                // provided by the pinned fixed root, so the writer must be
-                // able to commit concurrently instead of waiting for us.
                 thread::sleep(Duration::from_millis(500));
 
                 // Continue reading to verify isolation
@@ -64,7 +58,6 @@ fn test_view_isolation_without_blocking_writer() {
         // Wait for reader to start and grab its snapshot
         barrier.wait();
 
-        // Give reader a tiny bit of time to enter sleep
         thread::sleep(Duration::from_millis(10));
 
         let start = Instant::now();
@@ -84,8 +77,6 @@ fn test_view_isolation_without_blocking_writer() {
     let reader_count = reader_handle.join().unwrap();
     let writer_duration = writer_handle.join().unwrap();
 
-    // 4. Verifications
-
     // Consistency: Reader must see exactly the original 100 items (its fixed
     // snapshot predates the writer's commit).
     assert_eq!(reader_count, 100, "Reader should see all original items");
@@ -98,7 +89,6 @@ fn test_view_isolation_without_blocking_writer() {
         writer_duration
     );
 
-    // Verify write eventually succeeded
     tree.view(bucket_name, |txn| {
         assert_eq!(txn.get(b"new_key").unwrap(), b"new_value".to_vec());
         Ok(())

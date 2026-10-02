@@ -65,8 +65,6 @@ fn test_reopen_same_path_shares_live_instance() {
         elapsed
     );
 
-    // Shared published snapshot: the commit through handle_b is visible on
-    // handle_a, and the shared pending-count state is drained.
     handle_a
         .view("reuse", |txn| {
             assert_eq!(txn.get(b"k1").unwrap(), b"v1".to_vec());
@@ -92,8 +90,6 @@ fn test_reopen_after_commit_allows_empty_commit() {
 
     let handle_b = BTree::open(&db_path).unwrap();
 
-    // Same-path handle reuse must align to the latest snapshot; empty commit
-    // should be a no-op.
     handle_b
         .commit()
         .expect("empty commit on reopened handle should succeed");

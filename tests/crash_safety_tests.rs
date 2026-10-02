@@ -75,8 +75,6 @@ fn failed_exec_publishes_consumed_meta_before_returning_error() {
     let tree = BTree::open(&db_path).unwrap();
     tree.new_bucket("data", false).unwrap();
     let before_seq = tree.current_seq();
-    // The failed write still publishes allocator metadata before the caller
-    // receives the closure error, so reopen can continue from that generation.
 
     let result: btree_store::Result<()> = tree.exec("data", |txn| {
         txn.put(b"aborted", vec![0x7a; 16 * 1024]).unwrap();
@@ -106,7 +104,6 @@ fn test_torn_superblock_recovery() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("torn_sb.db");
 
-    // 1. Create a database with several commits
     {
         let tree = BTree::open(&db_path).unwrap();
         tree.new_bucket("default", false).unwrap();
@@ -123,7 +120,6 @@ fn test_torn_superblock_recovery() {
         .unwrap();
     }
 
-    // 2. Simulate a torn write on the LATEST SB
     {
         let file = fs::OpenOptions::new()
             .read(true)
@@ -143,13 +139,11 @@ fn test_torn_superblock_recovery() {
         file.twrite_all(&[0u8; 100], offset_to_corrupt).unwrap();
     }
 
-    // 3. Reopen and verify fallback to previous SB
     {
         let tree = BTree::open(&db_path).expect("Should open even with one corrupted SB");
         tree.commit().unwrap();
         tree.view("default", |txn| {
             assert_eq!(txn.get(b"stable").unwrap(), b"data");
-            // If we fall back to the previous SB, "latest" might be gone depending on seq.
             Ok(())
         })
         .unwrap();
@@ -191,8 +185,6 @@ fn data_sync_publication_reopens_allocator_state_and_continues() {
     let db_path = temp_dir.path().join("data_sync_reopen.db");
     let mut options = OpenOptions::new();
     options.sync_mode = SyncMode::Data;
-    // This exercises durable reusable/retired list reconstruction across a
-    // publication and a subsequent allocation.
 
     {
         let tree = options.open(&db_path).unwrap();

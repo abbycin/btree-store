@@ -11,7 +11,6 @@ fn reproduce_btree_corruption() -> std::result::Result<(), Box<dyn std::error::E
 
     let btree = Arc::new(BTree::open(path)?);
 
-    // Initialize multiple buckets.
     let buckets = ["bucket_1", "bucket_2", "bucket_3", "bucket_4", "bucket_5"];
     for bucket in buckets {
         btree.new_bucket(bucket, false)?;
@@ -19,7 +18,6 @@ fn reproduce_btree_corruption() -> std::result::Result<(), Box<dyn std::error::E
 
     let mut handles = Vec::new();
 
-    // Simulate concurrent independent commits that exercise shared catalog state.
     for thread_id in 0..4 {
         let btree_clone = btree.clone();
         let handle = thread::spawn(move || {

@@ -19,13 +19,12 @@
 use parking_lot::Mutex;
 use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::instance_local::LocalSlot;
 
 const SLOT_COUNT: usize = 256;
 const SHARD_COUNT: usize = 64;
-// The probe covers every shard so that any free fixed slot is found before
-// the overflow path is taken: the "no allocation up to 256 concurrent views"
-// fast-path claim holds exactly, not just for favorable hash distributions.
 const SHARD_PROBE: usize = SHARD_COUNT;
 const SLOTS_PER_SHARD: usize = SLOT_COUNT / SHARD_COUNT; // 4
 
@@ -44,8 +43,8 @@ pub(crate) struct EpochRegistry {
     /// Overflow pins beyond the fixed slot set: `(token, epoch)` pairs.
     /// Presence in the vector means active, so no 0-encoding issue here.
     overflow: Mutex<Vec<(u64, u64)>>,
-    /// Per-thread shard-hint slot id.
-    hint_id: u32,
+    /// Per-thread shard-hint slot: one advisory value per (thread, registry).
+    hint: LocalSlot,
 }
 
 impl EpochRegistry {
@@ -56,7 +55,7 @@ impl EpochRegistry {
             slots,
             next_token: AtomicU64::new(1),
             overflow: Mutex::new(Vec::new()),
-            hint_id: alloc_hint_id(),
+            hint: LocalSlot::allocate(),
         }
     }
 
@@ -75,24 +74,15 @@ impl EpochRegistry {
         self.current.fetch_add(1, Ordering::Release);
     }
 
-    /// Pin the current epoch for the duration of a read view.
-    ///
-    /// Common path (≤ 256 concurrent views): pop one slot index from a sharded
-    /// free list and store `epoch + 1`; no allocation. The probe covers every
-    /// shard, so any free fixed slot is found before the overflow path is
-    /// taken. Overflow path (> 256 concurrent views): append an
-    /// `(token, epoch)` entry; allocation and a possible short lock wait
-    /// happen only here.
+    /// Claims a fixed slot with CAS, probing every shard before using overflow.
     pub(crate) fn pin(&self) -> EpochGuard<'_> {
         let e = self.current();
-        let start = thread_shard(self.hint_id);
+        let start = thread_shard(&self.hint);
         for step in 0..SHARD_PROBE {
             let shard = (start + step) % SHARD_COUNT;
             let base = shard * SLOTS_PER_SHARD;
             for idx in base..base + SLOTS_PER_SHARD {
                 let slot = &self.slots[idx];
-                // CAS directly on the slot: succeeds only while it is idle, so
-                // no free-list head, no tag, and no ABA window exists.
                 if slot.load(Ordering::Relaxed) == 0
                     && slot
                         .compare_exchange(0, e + 1, Ordering::AcqRel, Ordering::Relaxed)
@@ -156,12 +146,6 @@ impl EpochRegistry {
     }
 }
 
-impl Drop for EpochRegistry {
-    fn drop(&mut self) {
-        free_hint_id(self.hint_id);
-    }
-}
-
 enum GuardInner {
     Slot(usize),
     Overflow(u64),
@@ -178,7 +162,6 @@ impl Drop for EpochGuard<'_> {
     fn drop(&mut self) {
         match self.inner {
             GuardInner::Slot(idx) => {
-                // The pinner owns the slot exclusively until this store: a new
                 // pin can only CAS it after it reads 0 here.
                 self.registry.slots[idx].store(0, Ordering::Relaxed);
             }
@@ -190,59 +173,16 @@ impl Drop for EpochGuard<'_> {
     }
 }
 
-// --- per-thread, per-registry shard hint cache ---
-//
-// The pin's probe-start shard is cached per (thread, registry) the way: a global
-// allocator hands each `EpochRegistry` a unique hint id, and each thread keeps
-// a TLS vector of shard hints indexed by that id. The hint is a pure
-// probe-start value, so a thread exiting needs no cleanup and a recycled id
-// only ever sees a stale-but-harmless hint. This keeps per-instance isolation
-// (registry A's hint never overwrites registry B's) without recomputing the
-// thread hash on every pin.
-
-use std::cell::RefCell;
-
-const HINT_UNSET: u64 = u64::MAX;
-
-static NEXT_HINT_ID: AtomicU32 = AtomicU32::new(0);
-static FREE_HINT_IDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-
-thread_local! {
-    static SHARD_HINTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-}
-
-fn alloc_hint_id() -> u32 {
-    if let Some(id) = FREE_HINT_IDS.lock().pop() {
-        return id;
-    }
-    NEXT_HINT_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-fn free_hint_id(id: u32) {
-    FREE_HINT_IDS.lock().push(id);
-}
-
-fn thread_shard(hint_id: u32) -> usize {
-    let cached = SHARD_HINTS.with(|h| {
-        h.borrow()
-            .get(hint_id as usize)
-            .copied()
-            .unwrap_or(HINT_UNSET)
-    });
-    if cached != HINT_UNSET {
-        return cached as usize;
-    }
-    let mut hasher = FxHasher::default();
-    std::thread::current().id().hash(&mut hasher);
-    let shard = (hasher.finish() as usize) % SHARD_COUNT;
-    SHARD_HINTS.with(|h| {
-        let mut v = h.borrow_mut();
-        if v.len() <= hint_id as usize {
-            v.resize(hint_id as usize + 1, HINT_UNSET);
-        }
-        v[hint_id as usize] = shard as u64;
-    });
-    shard
+/// Probe-start shard for this thread, computed once per (thread, registry).
+fn thread_shard(hint: &LocalSlot) -> usize {
+    hint.with(
+        || {
+            let mut hasher = FxHasher::default();
+            std::thread::current().id().hash(&mut hasher);
+            (hasher.finish() as usize % SHARD_COUNT) as u64
+        },
+        |shard| *shard as usize,
+    )
 }
 
 #[cfg(test)]
@@ -256,20 +196,25 @@ mod tests {
         let a = EpochRegistry::new();
         let b = EpochRegistry::new();
         assert_ne!(
-            a.hint_id, b.hint_id,
+            a.hint.slot_id(),
+            b.hint.slot_id(),
             "registries must not share a hint slot"
         );
-        let s1 = thread_shard(a.hint_id);
-        let s2 = thread_shard(a.hint_id);
+        let s1 = thread_shard(&a.hint);
+        let s2 = thread_shard(&a.hint);
         assert_eq!(s1, s2, "hint must be stable per thread");
         assert!(s1 < SHARD_COUNT);
-        let id_a = a.hint_id;
-        drop(a);
-        let s3 = thread_shard(id_a);
-        assert!(
-            s3 < SHARD_COUNT,
-            "recycled id must still yield a valid hint"
-        );
+        // A recycled slot id is still usable: a hint never decides durability.
+        let recycled: LocalSlot = LocalSlot::allocate();
+        let recycled_id = recycled.slot_id();
+        drop(recycled);
+        let reused: LocalSlot = LocalSlot::allocate();
+        if reused.slot_id() == recycled_id {
+            assert!(
+                thread_shard(&reused) < SHARD_COUNT,
+                "a recycled slot id must still yield a valid hint"
+            );
+        }
     }
 
     /// A reader pinned at epoch 0 (the registry's initial value) must store 1

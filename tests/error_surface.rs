@@ -6,6 +6,7 @@ use tempfile::TempDir;
 
 fn classify_runtime_error(error: Error) -> &'static str {
     match error {
+        Error::ReadOnly => "read-only",
         Error::KeyNotFound => "key-not-found",
         Error::BucketNotFound => "bucket-not-found",
         Error::BucketExists => "bucket-exists",
@@ -21,6 +22,7 @@ fn classify_open_error(error: OpenError) -> &'static str {
         OpenError::Corruption(_) => "corruption",
         OpenError::InvalidOptions(_) => "invalid-options",
         OpenError::DatabaseBusy { .. } => "database-busy",
+        OpenError::ReadOnly => "read-only",
     }
 }
 

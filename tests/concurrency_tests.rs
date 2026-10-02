@@ -13,8 +13,8 @@ fn test_concurrent_put_get() {
     let num_threads = 4;
     let ops_per_thread = 200;
 
-    // Concurrent Puts - writers serialize on the shared writer mutex while
-    // readers and the writer no longer block each other (epoch-pinned snapshots).
+    // Concurrent puts: writers serialize on the shared writer lock while readers
+    // and the writer no longer block each other (epoch-pinned snapshots).
     for t in 0..num_threads {
         let btree_clone = btree.clone();
         handles.push(thread::spawn(move || {
@@ -35,7 +35,6 @@ fn test_concurrent_put_get() {
         handle.join().unwrap();
     }
 
-    // Concurrent Gets
     let mut handles = vec![];
     for t in 0..num_threads {
         let btree_clone = btree.clone();

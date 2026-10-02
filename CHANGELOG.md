@@ -2,6 +2,62 @@
 
 All notable changes to the **btree-store** project will be documented in this file.
 
+## [2.0.0] - 2026-10-01
+
+### Breaking
+- **On-disk format version 2.** Every database written by a 1.x release is format version 1 and is
+  refused by the 2.0 runtime with `OpenError::Corruption` code `UNSUPPORTED_FORMAT_VERSION`; the
+  runtime does not read or guess. Rebuild each file offline with
+  `btree-store migrate <source> --output <destination> --to 2`. The source is never modified and is
+  never itself the destination, the source is fully validated before any output file exists, and the
+  destination is replaced by rename only after the rebuilt file passes verification. The
+  `btree-store migrate` CLI is the only code that understands version 1. See the
+  [migration guide](docs/migration.md).
+- **Removed `iter_uncached`.** `Txn::iter_uncached` and `ReadOnlyTxn::iter_uncached` no longer exist;
+  every iterator uses the shared node cache.
+- **`OpenOptions` gained a `read_only` field.** Struct-literal construction must set it.
+  `OpenOptions::new()` and `OpenOptions::default()` are unchanged and default it to `false`.
+- **New error variants `Error::ReadOnly` and `OpenError::ReadOnly`.** Neither enum is
+  `#[non_exhaustive]`, so a downstream exhaustive `match` needs a new arm.
+
+### Changed
+- **Page checksums cover the whole page.** One CRC32C per page, in the node/allocator header or the
+  value/indirect trailer, computed over all 4096 bytes with the field read as zero and bound to the
+  expected physical page id. A wrong offset, a swapped pair or a wrong id now fails verification
+  instead of being read under the wrong identity; a value page carries 4092 bytes, not 4096.
+- **Deterministic page bytes.** Node work pages are allocated zeroed and every page class writes what
+  it leaves, so a page can neither persist stale process memory nor depend on allocation history. The
+  catalog is rewritten in bucket-name order, so the same workload over the same generation history
+  writes the same bytes.
+- **Frozen metadata discovery record.** Magic, generation, format version, the root references and the
+  CRC32C at `[36, 40)` keep their place and meaning in every format version, so a tool can name a
+  file's version before interpreting anything else.
+- **Three-level node cache.** Branch nodes start HOT and leaf nodes WARM; hits age an entry up, hand
+  visits age it down.
+- **Destination names validated up front.** A destination that names no file (`--output dir/.`) is an
+  argument error before the source is opened, not a failure after the rebuild.
+
+### Added
+- **`btree-store check <file> [--summary] [--scan]`** and the `check_path` API: a read-only audit of a
+  static v2 file covering metadata, the catalog and bucket trees, value and indirect chains, allocator
+  extents, page ownership and checksums, without modifying the source. `--summary` and `--scan` add
+  space accounting and a per-bucket block whose totals agree with `compact --info`; neither changes
+  the verdict, and nothing is printed for a file that did not pass. See [the CLI reference](docs/cli.md).
+- **`btree-store compact [rebuild|inplace] <source> [destination] [--info]`**: rebuilds a compact copy
+  through a staging file, keeping the source's bucket prefix policies, and publishes only after the
+  staging file passes the same audit and matches the source record for record. The source is never
+  modified and is never itself a destination; the rebuild needs room for a second copy, and `inplace`
+  is reserved but not implemented.
+- **`BTree::take_snapshot`**: writes the current published generation to a standalone file and returns
+  the generation it equals. Writers are not blocked and later generations never appear in it. The
+  destination is used exactly as given and is refused if it is this store's own file; it is written
+  directly rather than staged, so a failed call can leave a partial file.
+- **Read-only opens (`BTree::open_read_only`, `OpenOptions::read_only`)**: never create or initialise a
+  file and write nothing, not even during open. They take a shared lock, so several coexist and several
+  processes may read one file; mutating calls return `Error::ReadOnly` without touching it.
+- **Bucket policy and same-file queries**: `BTree::buckets_with_policy` reports each bucket's
+  prefix-encoding flag, and `BTree::path_is_same_file` compares a path against this store's own file.
+
 ## [1.1.1] - 2026-09-05
 
 ### Fixed

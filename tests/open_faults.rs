@@ -1,4 +1,7 @@
+mod common;
+
 use btree_store::{BTree, MetaNode, OpenError};
+use common::{EXTENT_ENTRY_SIZE, EXTENT_HEADER_SIZE, seal_page};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use tempfile::TempDir;
@@ -81,6 +84,7 @@ fn assert_extent_mutation_rejected(
     .unwrap();
     file.read_exact(&mut page).unwrap();
     mutate(&meta, &mut page);
+    seal_page(&mut page, meta.reusable_root);
     file.seek(SeekFrom::Start(
         u64::from(meta.reusable_root) * PAGE_SIZE as u64,
     ))
@@ -129,7 +133,7 @@ fn new_database_reserves_both_meta_pages_and_uses_initial_format_version() {
     );
     let mut file = OpenOptions::new().read(true).open(&path).unwrap();
     let meta = read_latest_meta(&mut file);
-    assert_eq!(meta.format_version, 1);
+    assert_eq!(meta.format_version, btree_store::FORMAT_VERSION);
     assert_eq!(meta.reusable_root, 0);
 }
 
@@ -194,9 +198,9 @@ fn checksum_valid_meta_is_not_rejected_by_structural_fields() {
 }
 
 #[test]
-fn opening_accepts_unchecked_extent_payload_bytes() {
+fn the_extent_page_checksum_covers_the_whole_page() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("extent-unchecked.db");
+    let path = dir.path().join("extent-coverage.db");
     {
         let tree = BTree::open(&path).unwrap();
         tree.new_bucket("bucket", false).unwrap();
@@ -212,53 +216,81 @@ fn opening_accepts_unchecked_extent_payload_bytes() {
         .unwrap();
     let meta = read_latest_meta(&mut file);
     assert_ne!(meta.reusable_root, 0);
+    let root = u64::from(meta.reusable_root) * PAGE_SIZE as u64;
     let mut page = [0u8; PAGE_SIZE];
-    file.seek(SeekFrom::Start(
-        u64::from(meta.reusable_root) * PAGE_SIZE as u64,
-    ))
-    .unwrap();
+    file.seek(SeekFrom::Start(root)).unwrap();
     file.read_exact(&mut page).unwrap();
-    page[PAGE_SIZE - 1] ^= 1;
-    file.seek(SeekFrom::Start(
-        u64::from(meta.reusable_root) * PAGE_SIZE as u64,
-    ))
-    .unwrap();
-    file.write_all(&page).unwrap();
-    file.sync_all().unwrap();
+    let count = u32::from_le_bytes(page[8..12].try_into().unwrap()) as usize;
+    assert!(count > 0, "the allocator page must hold entries");
+    assert!(
+        page[EXTENT_HEADER_SIZE + count * EXTENT_ENTRY_SIZE..]
+            .iter()
+            .all(|byte| *byte == 0),
+        "the writer must zero the entry slots it leaves"
+    );
 
-    drop(BTree::open(&path).expect("extent payload has no checksum validation"));
+    // allocator never filled is hashed too, so a change there without resealing is a
+    // checksum failure.
+    let mut padding_changed = page;
+    padding_changed[PAGE_SIZE / 2] ^= 1;
+    file.seek(SeekFrom::Start(root)).unwrap();
+    file.write_all(&padding_changed).unwrap();
+    file.sync_all().unwrap();
+    let error = open_error(&path, "bytes past the entries are covered");
+    assert!(
+        matches!(error, OpenError::Corruption(ref report) if report.code == "PAGE_CRC_MISMATCH"),
+        "unexpected error for a changed unused entry slot: {error:?}"
+    );
+
+    let mut entry_changed = page;
+    entry_changed[12] ^= 1;
+    file.seek(SeekFrom::Start(root)).unwrap();
+    file.write_all(&entry_changed).unwrap();
+    file.sync_all().unwrap();
+    let error = open_error(&path, "a stale checksum must not open the database");
+    assert!(
+        matches!(error, OpenError::Corruption(ref report) if report.code == "PAGE_CRC_MISMATCH"),
+        "unexpected error for a changed entry: {error:?}"
+    );
+
+    seal_page(&mut padding_changed, meta.reusable_root);
+    file.seek(SeekFrom::Start(root)).unwrap();
+    file.write_all(&padding_changed).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    drop(BTree::open(&path).expect("resealed extent page must open"));
 }
 
 #[test]
 fn extent_keeps_baseline_cycle_count_and_nonzero_checks() {
     assert_extent_mutation_rejected("cycle", "EXTENT_CYCLE", |meta, page| {
-        page[0..4].copy_from_slice(&meta.reusable_root.to_le_bytes());
+        page[4..8].copy_from_slice(&meta.reusable_root.to_le_bytes());
     });
     assert_extent_mutation_rejected("count", "INVALID_EXTENT_COUNT", |_meta, page| {
-        page[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        page[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     });
     assert_extent_mutation_rejected("zero-extent", "INVALID_EXTENT_ENTRY", |_meta, page| {
-        page[4..8].copy_from_slice(&1u32.to_le_bytes());
-        page[8..12].fill(0);
-        page[12..16].copy_from_slice(&1u32.to_le_bytes());
+        page[8..12].copy_from_slice(&1u32.to_le_bytes());
+        page[12..16].fill(0);
+        page[16..20].copy_from_slice(&1u32.to_le_bytes());
     });
 }
 
 #[test]
 fn extent_rejects_out_of_range_payload_ids() {
     assert_extent_mutation_rejected("out-of-range", "EXTENT_OUT_OF_RANGE", |meta, page| {
-        page[4..8].copy_from_slice(&1u32.to_le_bytes());
-        page[8..12].copy_from_slice(&meta.next_page_id.to_le_bytes());
-        page[12..16].copy_from_slice(&1u32.to_le_bytes());
+        page[8..12].copy_from_slice(&1u32.to_le_bytes());
+        page[12..16].copy_from_slice(&meta.next_page_id.to_le_bytes());
+        page[16..20].copy_from_slice(&1u32.to_le_bytes());
     });
 }
 
 #[test]
 fn extent_rejects_entries_covering_allocator_list_pages() {
     assert_extent_mutation_rejected("list-overlap", "ALLOCATOR_STATE_OVERLAP", |meta, page| {
-        page[4..8].copy_from_slice(&1u32.to_le_bytes());
-        page[8..12].copy_from_slice(&meta.reusable_root.to_le_bytes());
-        page[12..16].copy_from_slice(&1u32.to_le_bytes());
+        page[8..12].copy_from_slice(&1u32.to_le_bytes());
+        page[12..16].copy_from_slice(&meta.reusable_root.to_le_bytes());
+        page[16..20].copy_from_slice(&1u32.to_le_bytes());
     });
 }
 

@@ -7,8 +7,6 @@ use std::process::Stdio;
 use std::time::Duration;
 use tempfile::TempDir;
 
-// Keep the subprocess lock test isolated so its parent cannot inherit database
-// descriptors opened by unrelated tests in the same integration-test binary.
 const LOCK_CHILD_PATH: &str = "BTREE_STORE_LOCK_CHILD_PATH";
 
 fn open_error(path: &std::path::Path, context: &str) -> OpenError {

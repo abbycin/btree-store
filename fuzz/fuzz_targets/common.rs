@@ -17,7 +17,6 @@ pub const MAX_MULTI_STEPS: usize = 16;
 pub const MAX_LIFECYCLE_OPS: usize = 160;
 
 pub const BUCKET_NAMES: [&str; 7] = ["a", "b", "c", "users", "stats", "empty", "zz"];
-// The kv-model target uses a dedicated bucket name outside the arbitrary pool;
 // every harness pre-creates the union so exec/multi never depends on implicit creation.
 const PRE_CREATED_BUCKETS: [&str; 8] = ["a", "b", "c", "users", "stats", "empty", "zz", "kv"];
 
@@ -180,8 +179,6 @@ impl Harness {
         }
     }
 
-    /// Recreates a dropped bucket through the catalog API so the harness can
-    /// keep operating on it without relying on implicit `exec` creation.
     fn ensure_bucket(&mut self, bucket: Bucket) {
         if !self.model.contains_bucket(bucket.as_str()) {
             expect_db_ok(

@@ -42,7 +42,6 @@ fn snapshot_consistency_across_commits() {
             .view("b", |txn| {
                 assert_eq!(txn.get(b"k00000").unwrap(), b"v0");
                 ready_r.wait();
-                // writers commit v1/v2/v3 while this view stays open
                 done_r.wait();
                 for i in 0..KEY_COUNT {
                     let k = format!("k{i:05}");

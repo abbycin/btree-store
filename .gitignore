@@ -2,3 +2,9 @@
 Cargo.lock
 ffi
 *.db
+*.md
+!README.md
+!CHANGELOG.md
+!docs/cli.md
+!docs/design.md
+!docs/migration.md

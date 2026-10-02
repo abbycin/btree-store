@@ -6,6 +6,25 @@
 
 **btree-store** is a persistent, embedded key-value database written in Rust, built on a Copy-On-Write (COW) B+ Tree for data integrity, crash safety, and efficient concurrent access.
 
+## ⚠️ Upgrading from 1.x to 2.0 — read this before opening a 1.x database
+
+**2.0 is a breaking release. A database file written by any 1.x release will not open, and three Rust
+API changes need a code edit.**
+
+1.x wrote on-disk **format version 1**; 2.0 reads and writes **format version 2**. The runtime
+refuses a version-1 file by name rather than reading it, so rebuilding the file is mandatory:
+
+```bash
+btree-store migrate old.db --output new.db --to 2
+```
+
+The source is never modified. The rebuilt file is verified against it bucket by bucket and
+published by rename only after it passes. Bump the dependency to `btree-store = "2.0"` at the same
+time. Stop your application first — it holds an exclusive lock on the file while it runs.
+
+**[→ Full migration guide](docs/migration.md)** — the complete procedure, how to verify and roll
+back, and the three API changes with their replacements.
+
 ## Features
 
 *   **Copy-on-Write B+ Tree:** Atomic commits without in-place updates.
@@ -15,14 +34,18 @@
 *   **Prefix Encoding:** Optional per-bucket key-prefix compression, persisted as part of the bucket layout policy.
 *   **Crash Safety:** Double-buffered metadata publication and recovery from the newest complete generation.
 *   **Durable, Reader-Gated Reclamation:** Reusable and quarantined pages are persisted and recovered with the database generation; retired pages are promoted to reusable only while no in-flight reader can still reference them. Long-lived views delay reclamation and grow the file, but writes are never blocked.
+*   **Read-Only Opens:** `BTree::open_read_only` opens an existing database without write access. The path is never created, an empty file is not initialised, and the handle writes nothing — not even during open. Mutating calls return `Error::ReadOnly` instead of touching the file.
 
-> **Warning:** Multi-process concurrent access is not supported. A competing process receives `OpenError::DatabaseBusy` if the exclusive file lock remains held after the bounded open wait.
+> **Warning:** Concurrent *write* access from more than one process is not supported. A competing process receives `OpenError::DatabaseBusy` if the exclusive file lock remains held after the bounded open wait. Read-only opens take a shared lock instead, so several processes may read one file at once.
 >
 > Within a single process, re-opening the same path returns the existing `BTree` instance as a clone. Use `BTree::clone()` to share handles across threads.
 
 ## Architecture
 
 See [the design document](docs/design.md) for the complete architecture, transaction, persistence, recovery, and format-evolution model.
+See the [migration guide](docs/migration.md) when upgrading across a version bump that changes the
+file format or the Rust API.
+See [the CLI reference](docs/cli.md) for the `btree-store` commands.
 
 
 ## Basic Example
@@ -74,41 +97,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Benchmarks
 
 Environment:
-*   **Date:** 2026-08-08
-*   **OS:** openSUSE Tumbleweed, kernel 7.1.3-1-default
+*   **Date:** 2026-09-24
+*   **OS:** openSUSE Tumbleweed, kernel 7.2.4-1-default
 *   **CPU:** AMD Ryzen 5 3600, 6C/12T
 *   **Command:** `cargo bench --bench btree_bench -- --noplot`
-*   **Method:** One Criterion run of the current version; values below are the center estimate from each benchmark
 
 Results (lower is better):
 | Benchmark | Estimate |
 | --- | --- |
-| bucket_ops/create_drop_empty_bucket | 8.7369 us |
-| bucket_ops/drop_large_bucket_100k | 2.0382 ms |
-| concurrent_get/4_threads_random_get | 366.84 ns |
-| delete/delete_insert_cycle_1k | 9.2958 ms |
-| exec_multi/mixed_1k_exec_multi_1k | 1.0670 s |
-| get/random_get_100k | 425.37 ns |
-| insert/insert_1k_tx | 8.8122 ms |
+| bucket_ops/create_drop_empty_bucket | 14.960 us |
+| bucket_ops/drop_large_bucket_100k | 3.8496 ms |
+| concurrent_get/4_threads_random_get | 331.08 ns |
+| delete/delete_insert_cycle_1k | 16.121 ms |
+| exec_multi/mixed_1k_exec_multi_1k | 315.87 ms |
+| get/random_get_100k | 426.26 ns |
+| insert/insert_1k_tx | 15.518 ms |
 
 Plain vs. prefix-encoded buckets, using the same workload:
 | Workload | Plain | Prefix |
 | --- | --- | --- |
-| insert | 8.0452 ms | 8.1435 ms |
-| point_get | 8.4084 ms | 8.5309 ms |
-| update | 19.071 ms | 15.484 ms |
-| delete | 17.077 ms | 15.543 ms |
-| iterate | 8.1412 ms | 8.2080 ms |
-| mixed | 1.5102 ms | 1.5734 ms |
+| insert | 2.2791 ms | 2.5898 ms |
+| point_get | 2.8024 ms | 3.1190 ms |
+| update | 5.3343 ms | 4.9033 ms |
+| delete | 4.7901 ms | 4.7878 ms |
+| iterate | 2.5537 ms | 2.8267 ms |
+| mixed | 891.77 us | 938.98 us |
 
 Interpretation:
 *   **get**: ~0.43 us/op (random get on 100k keys).
-*   **get (4 threads)**: ~0.37 us/op (per get, concurrent reads).
-*   **put**: ~8.81 us/op (**single-op transactions**; `insert_1k_tx` measures 1000 separate `exec` calls).
-*   **del**: ~9.30 us/op (**single-op transactions** after a prefill).
-*   **exec_multi**: ~1067 us/exec_multi (`mixed_1k_exec_multi_1k` performs 1000 outer `exec_multi` calls, each with 1000 nested operations).
-*   **bucket ops**: empty bucket create+drop ~8.74 us; drop 100k-key bucket ~2.04 ms.
-*   **prefix encoding**: the second table compares independent plain and prefix measurements for the same workload. It uses 2000 keys and 64-byte values; prefix encoding is close to plain layout for insert, point get, and iteration, faster for update/delete, and slightly slower for mixed in this run. The 100k random-get and 4-thread random-get benchmarks are only in the standard table and were not run for both layouts.
+*   **get (4 threads)**: ~0.33 us/op (per get, concurrent reads).
+*   **put**: ~15.52 us/op (**single-op transactions**; `insert_1k_tx` measures 1000 separate `exec` calls).
+*   **del**: ~16.12 us/op (**single-op transactions** after a prefill).
+*   **exec_multi**: ~316 us/exec_multi (`mixed_1k_exec_multi_1k` performs 1000 outer `exec_multi` calls, each with 1000 nested operations).
+*   **bucket ops**: empty bucket create+drop ~14.96 us; drop 100k-key bucket ~3.85 ms.
+*   **prefix encoding**: the second table compares independent plain and prefix measurements for the same workload. It uses 2000 keys and 64-byte values. Prefix encoding is clearly faster for update (~8%), a tie for delete (0.05%, inside run-to-run noise), and slower for the rest in these measurements: insert ~14%, point get ~11%, iteration ~11%, and mixed ~5%. The 100k random-get and 4-thread random-get benchmarks are only in the standard table and were not run for both layouts.
 *   These numbers are machine- and load-dependent; rerun on your hardware for comparable results.
 
 
@@ -116,7 +138,6 @@ Interpretation:
 
 *   **Keys and bucket names:** 1..=128 bytes; empty keys and empty bucket names are rejected as invalid input.
 *   **Max file size:** ~16 TB with 4 KB pages (32-bit page ids).
-*   **On-disk format:** initial format version 1.
 
 ## License
 

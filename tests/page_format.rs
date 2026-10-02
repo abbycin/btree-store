@@ -1,24 +1,33 @@
+//! Value pagination across the v2 page boundaries.
+//!
+//! A v2 physical page carries 4092 bytes of content plus a 4-byte CRC trailer, so
+//! the boundaries that matter here are the page content capacity, the five-page
+//! direct/indirect switch and the 1022 page ids an indirect page holds.
+
 use btree_store::{BTree, Error};
 use tempfile::TempDir;
 
-const PAGE_SIZE: usize = 4096;
+const PAGE_CONTENT: usize = 4092;
+const INDIRECT_IDS_PER_PAGE: usize = 1022;
 
 #[test]
-fn overflow_and_indirect_pages_round_trip_full_page_chunks() {
+fn value_pagination_round_trips_across_v2_page_boundaries() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("page-layout.db");
     let tree = BTree::open(&path).unwrap();
     tree.new_bucket("bucket", false).unwrap();
 
     let values = [
-        vec![0x11; PAGE_SIZE - 1],
-        vec![0x22; PAGE_SIZE],
-        vec![0x33; PAGE_SIZE + 1],
-        vec![0x44; PAGE_SIZE * 5],
-        vec![0x55; PAGE_SIZE * 5 + 1],
-        vec![0x66; PAGE_SIZE * 1_023 + 17],
+        vec![0x11; PAGE_CONTENT - 1],
+        vec![0x22; PAGE_CONTENT],
+        vec![0x33; PAGE_CONTENT + 1],
+        vec![0x44; 5 * PAGE_CONTENT - 1],
+        vec![0x55; 5 * PAGE_CONTENT],
+        vec![0x66; 5 * PAGE_CONTENT + 1],
+        vec![0x77; INDIRECT_IDS_PER_PAGE * PAGE_CONTENT + 1],
+        vec![0x88; (INDIRECT_IDS_PER_PAGE + 1) * PAGE_CONTENT + 17],
     ];
-    assert_eq!(values.len(), 6);
+    assert_eq!(values.len(), 8);
 
     tree.exec("bucket", |txn| {
         for (index, value) in values.iter().enumerate() {

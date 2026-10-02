@@ -166,7 +166,6 @@ enum ReaderMode {
     StaleClone,
     CloneAtRead,
     SamePathOpen,
-    /// Uses the harness's original handle so reader and writer share start_seq.
     SharedHandle,
     /// Holds one view open across the writer commits and re-reads from the
     /// same fixed snapshot afterwards (MVCC read/write non-blocking).
@@ -336,8 +335,6 @@ impl ConcurrentHarness {
         let path = dir.path().join("db.btree");
         let db = expect_open_ok(BTree::open(&path), "open database");
         let mut model = Model::default();
-        // exec/multi now require the bucket to exist, so every bucket the
-        // harness can touch is created up front; untouched buckets stay at
         // epoch 0 with no entries.
         for bucket in BUCKET_NAMES {
             expect_db_ok(db.new_bucket(bucket, false), "pre-create bucket");
@@ -371,8 +368,6 @@ impl ConcurrentHarness {
         self.validate();
     }
 
-    // Disjoint buckets keep each writer's before/after state independent of
-    // the serialized commit order while still exercising concurrent exec calls.
     fn race_mixed(&mut self, writers: &[WriterPlan], readers: &[ReaderPlan]) {
         let before = self.model.clone();
         let expected: Vec<DbResult<Model>> = writers

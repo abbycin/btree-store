@@ -32,12 +32,6 @@ fn bench_insert(c: &mut Criterion) {
     group.finish();
 }
 
-/// Same-workload harness for plain vs prefix-encoded buckets. `workload` runs
-/// the identical operations against a `plain` (flags=0) and a `prefix`
-/// (flags=1) bucket; keys are whatever the caller passes, so no specially
-/// shaped prefix key set is constructed. Bucket creation is in the untimed
-/// batch setup; any `setup_fill` work inside a workload is part of the timed
-/// measurement. Criterion records each layout as a separate measurement.
 fn bench_plain_vs_prefix(
     c: &mut Criterion,
     name: &str,
@@ -66,8 +60,6 @@ fn bench_plain_vs_prefix(
     group.finish();
 }
 
-/// Batch-loads `keys`/`values` into `bucket` in chunks; callers invoke this from
-/// the timed workload when setup is part of the measured operation.
 fn setup_fill(tree: &BTree, bucket: &str, keys: &[Vec<u8>], values: &[Vec<u8>], chunk: usize) {
     for (ck, cv) in keys.chunks(chunk).zip(values.chunks(chunk)) {
         tree.exec(bucket, |txn| {
@@ -80,7 +72,6 @@ fn setup_fill(tree: &BTree, bucket: &str, keys: &[Vec<u8>], values: &[Vec<u8>], 
     }
 }
 
-/// The batch-insert workload: every key inserted in one transaction per chunk.
 fn workload_insert(tree: &BTree, bucket: &str, keys: &[Vec<u8>], values: &[Vec<u8>]) {
     setup_fill(tree, bucket, keys, values, 200);
 }
@@ -152,10 +143,6 @@ fn workload_mixed(tree: &BTree, bucket: &str, keys: &[Vec<u8>], _values: &[Vec<u
         tree.exec_multi(|multi| {
             for j in 0..100 {
                 let key = &keys[j % keys.len()];
-                // A get/del in the cycle can target a key that was never put
-                // (or was already deleted), which is a legitimate outcome for
-                // both bucket kinds. Swallow KeyNotFound so the same operation
-                // sequence runs against the plain and prefix buckets.
                 match j % 4 {
                     0 => {
                         multi.exec(bucket, |txn| {
@@ -195,9 +182,6 @@ fn workload_mixed(tree: &BTree, bucket: &str, keys: &[Vec<u8>], _values: &[Vec<u
     }
 }
 
-/// Runs the six workloads against both bucket kinds. Criterion records each
-/// `prefix_encoding/{workload}/{plain,prefix}` measurement separately; the
-/// README presents the two layout measurements side by side.
 fn bench_prefix_encoding_compare(c: &mut Criterion) {
     const N: u32 = 2000;
 
@@ -222,7 +206,6 @@ fn bench_get(c: &mut Criterion) {
     let mut rng = rand::rng();
     let keys: Vec<String> = (0..100_000).map(|i| format!("key_{:06}", i)).collect();
 
-    // Batch insert to speed up setup
     for chunk in keys.chunks(10_000) {
         btree
             .exec("bench", |txn| {
@@ -251,7 +234,6 @@ fn bench_concurrent_get(c: &mut Criterion) {
     let btree = Arc::new(BTree::open(&db_path).unwrap());
     btree.new_bucket("bench", false).unwrap();
 
-    // Pre-fill 100k items
     let keys: Vec<String> = (0..100_000).map(|i| format!("key_{:06}", i)).collect();
     let keys_arc = Arc::new(keys);
 
@@ -282,7 +264,6 @@ fn bench_concurrent_get(c: &mut Criterion) {
                     let mut rng = rand::rng();
                     barrier_clone.wait(); // Sync start
                     for _ in 0..(iters / 4) {
-                        // Distribute load
                         let k = &keys_clone[rng.random_range(0..100_000)];
                         btree_clone
                             .view("bench", |txn| {
@@ -354,7 +335,6 @@ fn bench_exec_multi(c: &mut Criterion) {
 
     group.bench_function("mixed_1k_exec_multi_1k", |b| {
         b.iter(|| {
-            // Each Criterion iteration executes 1,000 outer exec_multi calls.
             for _ in 0..1_000 {
                 btree
                     .exec_multi(|multi| {
@@ -404,10 +384,8 @@ fn bench_bucket_ops(c: &mut Criterion) {
         b.iter(|| {
             i += 1;
             let bucket = format!("b_{}", i);
-            // Create
             btree.new_bucket(&bucket, false).unwrap();
 
-            // Drop
             btree.del_bucket(&bucket).unwrap();
         });
     });
@@ -423,8 +401,6 @@ fn bench_bucket_ops(c: &mut Criterion) {
                 let btree = BTree::open(&db_path).unwrap();
                 btree.new_bucket("heavy", false).unwrap();
 
-                // Setup: fill 100k items
-                // Split into chunks to avoid giant memory usage during transaction
                 for i in 0..10 {
                     btree
                         .exec("heavy", |txn| {

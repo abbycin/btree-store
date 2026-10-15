@@ -2,6 +2,16 @@
 
 All notable changes to the **btree-store** project will be documented in this file.
 
+## [2.1.0] - 2026-10-15
+
+### Breaking
+- **`Txn::del` returns `Result<bool>`.** `Ok(true)` means the key existed and was removed;
+  `Ok(false)` means it was already absent and no key/value state changed, matching `Txn::update`.
+  `Txn::del` no longer returns `Error::KeyNotFound`, so a delete that found nothing no longer aborts
+  the enclosing `exec`/`exec_multi` transaction through `?`. A caller that wants the old strict
+  behavior writes `if !txn.del(key)? { return Err(Error::KeyNotFound); }`. The variant itself is
+  unchanged and is still what `Txn::get` reports for a missing key.
+
 ## [2.0.0] - 2026-10-01
 
 ### Breaking

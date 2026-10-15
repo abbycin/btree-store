@@ -136,8 +136,9 @@ fn workload_iterate(tree: &BTree, bucket: &str, keys: &[Vec<u8>], values: &[Vec<
 
 /// Mixed exec_multi workload: a cycle of put/update/get/del over a small key
 /// set inside exec_multi commits, mirroring the existing exec_multi bench. The
-/// del in a cycle may target a key whose value was never put (get/del of a
-/// missing key are treated as no-ops), so every op is mapped to `Ok`.
+/// del in a cycle may target a key whose value was never put, which reports
+/// `Ok(false)`. Only a get of a missing key returns `Error::KeyNotFound`, so
+/// that arm maps the error onto an empty read.
 fn workload_mixed(tree: &BTree, bucket: &str, keys: &[Vec<u8>], _values: &[Vec<u8>]) {
     for _ in 0..20 {
         tree.exec_multi(|multi| {
@@ -167,10 +168,9 @@ fn workload_mixed(tree: &BTree, bucket: &str, keys: &[Vec<u8>], _values: &[Vec<u
                         })?;
                     }
                     3 => {
-                        multi.exec(bucket, |txn| match txn.del(key) {
-                            Ok(()) => Ok(()),
-                            Err(btree_store::Error::KeyNotFound) => Ok(()),
-                            Err(err) => Err(err),
+                        multi.exec(bucket, |txn| {
+                            txn.del(key)?;
+                            Ok(())
                         })?;
                     }
                     _ => unreachable!(),

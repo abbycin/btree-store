@@ -1738,9 +1738,12 @@ impl<'a> Txn<'a> {
 
     /// Deletes `key` from the current bucket.
     ///
-    /// Returns [`Error::KeyNotFound`] when the key does not exist. The
-    /// key must be non-empty and no longer than [`MAX_KEY_LEN`] bytes.
-    pub fn del<K>(&mut self, key: K) -> Result<()>
+    /// Returns `Ok(true)` when the key existed and was removed, or `Ok(false)`
+    /// when the key was missing and no existing key/value state changed. A
+    /// caller that treats a missing key as an error returns [`Error::KeyNotFound`]
+    /// when the delete reports `false`. The key must be non-empty and no longer
+    /// than [`MAX_KEY_LEN`] bytes.
+    pub fn del<K>(&mut self, key: K) -> Result<bool>
     where
         K: AsRef<[u8]>,
     {
@@ -1755,10 +1758,8 @@ impl<'a> Txn<'a> {
         self.pending_counts.update(self.page_state);
         if deleted {
             self.root = new_root;
-            Ok(())
-        } else {
-            Err(Error::KeyNotFound)
         }
+        Ok(deleted)
     }
 
     /// Returns an iterator over the current bucket in key order.
@@ -4226,8 +4227,8 @@ mod tests {
                 "an absent key is not updated"
             );
             assert!(
-                matches!(txn.del(b"missing"), Err(Error::KeyNotFound)),
-                "an absent key cannot be deleted"
+                !txn.del(b"missing")?,
+                "an absent key is not deleted"
             );
             assert_eq!(
                 txn.read.overlay_owned_pids(),

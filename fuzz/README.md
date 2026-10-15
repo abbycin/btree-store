@@ -8,9 +8,10 @@ and checks these invariants after successful operations:
 
 - `buckets()` matches the modeled bucket set.
 - Point reads match the model.
-- `update()` returns `false` without mutating existing key/value state when the key is missing.
-  A successful transaction may still materialize the bucket under normal `exec`/`exec_multi`
-  semantics if the bucket was previously missing.
+- `update()` returns `false` without mutating existing key/value state when the key is missing, and
+  `del()` reports the same absence as `Ok(false)` without mutating state. A successful transaction may
+  still materialize the bucket under normal `exec`/`exec_multi` semantics if the bucket was previously
+  missing.
 - Iteration returns exactly the modeled key/value pairs.
 - Failed transactions and aborted `exec_multi` calls leave the database unchanged.
 - Reopen, same-path open, and clone reads preserve the model.

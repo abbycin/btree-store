@@ -142,12 +142,10 @@ fn deterministic_storage_trace_refines_btreemap() {
                     );
                 } else {
                     let existed = model.get(bucket).unwrap().contains_key(&key);
-                    let deleted = tree.exec(bucket, |txn| txn.del(&key));
+                    let deleted = tree.exec(bucket, |txn| txn.del(&key)).unwrap();
+                    assert_eq!(deleted, existed);
                     if existed {
-                        deleted.unwrap();
                         model.get_mut(bucket).unwrap().remove(&key);
-                    } else {
-                        assert_eq!(deleted, Err(Error::KeyNotFound));
                     }
                 }
             }

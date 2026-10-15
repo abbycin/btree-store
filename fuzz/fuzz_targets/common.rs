@@ -119,13 +119,9 @@ impl Model {
             .ok_or(Error::KeyNotFound)
     }
 
-    fn del(&mut self, bucket: &str, key: &[u8]) -> DbResult<()> {
-        let entries = self.buckets.get_mut(bucket).ok_or(Error::KeyNotFound)?;
-        if entries.remove(key).is_some() {
-            Ok(())
-        } else {
-            Err(Error::KeyNotFound)
-        }
+    fn del(&mut self, bucket: &str, key: &[u8]) -> DbResult<bool> {
+        let entries = self.buckets.get_mut(bucket).ok_or(Error::BucketNotFound)?;
+        Ok(entries.remove(key).is_some())
     }
 
     fn update(&mut self, bucket: &str, key: &[u8], value: &[u8]) -> bool {
@@ -233,17 +229,13 @@ impl Harness {
             return;
         }
         let mut next_model = self.model.clone();
-        let expected = next_model.del(bucket.as_str(), &key.0);
-        let actual = self.db().exec(bucket.as_str(), |txn| txn.del(&key.0));
-        match expected {
-            Ok(()) => {
-                expect_db_ok(actual, "exec del");
-                self.model = next_model;
-            }
-            Err(expected_err) => {
-                expect_db_err(actual, expected_err, "exec del missing key");
-            }
-        }
+        let expected = expect_db_ok(next_model.del(bucket.as_str(), &key.0), "exec del model");
+        let actual = expect_db_ok(
+            self.db().exec(bucket.as_str(), |txn| txn.del(&key.0)),
+            "exec del",
+        );
+        assert_eq!(actual, expected, "exec del result mismatch");
+        self.model = next_model;
         self.validate();
     }
 
@@ -332,16 +324,12 @@ impl Harness {
 
     pub fn exec_abort_del(&mut self, bucket: Bucket, key: &Key) {
         self.ensure_bucket(bucket);
-        let expected_err = match self.model.get(bucket.as_str(), &key.0) {
-            Ok(_) => abort_marker(),
-            Err(err) => err,
-        };
         expect_db_err(
             self.db().exec(bucket.as_str(), |txn| {
                 txn.del(&key.0)?;
                 Err::<(), Error>(abort_marker())
             }),
-            expected_err,
+            abort_marker(),
             "abort del",
         );
         self.reopen();
@@ -488,7 +476,10 @@ fn apply_multi_model_step(model: &mut Model, step: &MultiStep) -> DbResult<()> {
             let _ = model.update_in_txn(bucket.as_str(), &key.0, &value.0);
             Ok(())
         }
-        MultiStep::Del(bucket, key) => model.del(bucket.as_str(), &key.0),
+        MultiStep::Del(bucket, key) => {
+            model.del(bucket.as_str(), &key.0)?;
+            Ok(())
+        }
         MultiStep::Get(bucket, key) => model.get(bucket.as_str(), &key.0).map(|_| ()),
         MultiStep::Observe(bucket, _) | MultiStep::Touch(bucket) => {
             model.touch_bucket(bucket.as_str());
@@ -522,19 +513,14 @@ fn apply_multi_engine_step(
         }
         MultiStep::Del(bucket, key) => {
             let mut next_model = model.clone();
-            let expected = next_model.del(bucket.as_str(), &key.0);
-            let actual = multi.exec(bucket.as_str(), |txn| txn.del(&key.0));
-            match expected {
-                Ok(()) => {
-                    expect_db_ok(actual, "multi del");
-                    *model = next_model;
-                    Ok(())
-                }
-                Err(expected_err) => {
-                    expect_db_err(actual, expected_err.clone(), "multi del missing key");
-                    Err(expected_err)
-                }
-            }
+            let expected = expect_db_ok(next_model.del(bucket.as_str(), &key.0), "multi del model");
+            let actual = expect_db_ok(
+                multi.exec(bucket.as_str(), |txn| txn.del(&key.0)),
+                "multi del",
+            );
+            assert_eq!(actual, expected, "multi del result mismatch");
+            *model = next_model;
+            Ok(())
         }
         MultiStep::Get(bucket, key) => {
             let expected = model.get(bucket.as_str(), &key.0).cloned();

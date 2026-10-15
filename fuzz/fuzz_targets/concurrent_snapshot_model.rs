@@ -11,7 +11,7 @@ use std::{
 };
 
 use arbitrary::{Arbitrary, Result as ArbitraryResult, Unstructured};
-use btree_store::{BTree, Error, OpenResult, Result as DbResult};
+use btree_store::{BTree, Error, KeyError, OpenResult, Result as DbResult};
 use libfuzzer_sys::fuzz_target;
 use tempfile::{Builder, TempDir};
 
@@ -93,15 +93,17 @@ enum SingleStep {
     Update(DataKey, Value),
     Del(DataKey),
     Touch,
+    Abort,
 }
 
 impl<'a> Arbitrary<'a> for SingleStep {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=3u8)? {
+        match u.int_in_range(0..=4u8)? {
             0 => Ok(Self::Put(DataKey::arbitrary(u)?, Value::arbitrary(u)?)),
             1 => Ok(Self::Update(DataKey::arbitrary(u)?, Value::arbitrary(u)?)),
             2 => Ok(Self::Del(DataKey::arbitrary(u)?)),
-            _ => Ok(Self::Touch),
+            3 => Ok(Self::Touch),
+            _ => Ok(Self::Abort),
         }
     }
 }
@@ -125,11 +127,12 @@ enum MultiStep {
     Update(Bucket, DataKey, Value),
     Del(Bucket, DataKey),
     Touch(Bucket),
+    Abort(Bucket),
 }
 
 impl<'a> Arbitrary<'a> for MultiStep {
     fn arbitrary(u: &mut Unstructured<'a>) -> ArbitraryResult<Self> {
-        match u.int_in_range(0..=3u8)? {
+        match u.int_in_range(0..=4u8)? {
             0 => Ok(Self::Put(
                 Bucket::arbitrary(u)?,
                 DataKey::arbitrary(u)?,
@@ -141,7 +144,8 @@ impl<'a> Arbitrary<'a> for MultiStep {
                 Value::arbitrary(u)?,
             )),
             2 => Ok(Self::Del(Bucket::arbitrary(u)?, DataKey::arbitrary(u)?)),
-            _ => Ok(Self::Touch(Bucket::arbitrary(u)?)),
+            3 => Ok(Self::Touch(Bucket::arbitrary(u)?)),
+            _ => Ok(Self::Abort(Bucket::arbitrary(u)?)),
         }
     }
 }
@@ -244,12 +248,12 @@ impl Model {
                     }
                 }
                 SingleStep::Del(key) => {
-                    if bucket_model.entries.remove(&key.0).is_none() {
-                        return Err(Error::KeyNotFound);
+                    if bucket_model.entries.remove(&key.0).is_some() {
+                        touched = true;
                     }
-                    touched = true;
                 }
                 SingleStep::Touch => {}
+                SingleStep::Abort => return Err(abort_marker()),
             }
         }
         if touched {
@@ -279,15 +283,15 @@ impl Model {
                     let bucket_model = next
                         .buckets
                         .get_mut(bucket.as_str())
-                        .ok_or(Error::KeyNotFound)?;
-                    if bucket_model.entries.remove(&key.0).is_none() {
-                        return Err(Error::KeyNotFound);
+                        .ok_or(Error::BucketNotFound)?;
+                    if bucket_model.entries.remove(&key.0).is_some() {
+                        touched.insert(bucket.as_str().to_string());
                     }
-                    touched.insert(bucket.as_str().to_string());
                 }
                 MultiStep::Touch(bucket) => {
                     next.ensure_bucket(bucket.as_str());
                 }
+                MultiStep::Abort(_) => return Err(abort_marker()),
             }
         }
         for bucket in touched {
@@ -702,8 +706,12 @@ fn apply_single_step(txn: &mut btree_store::Txn<'_>, step: &SingleStep) -> DbRes
             txn.update(&key.0, &value.0)?;
             Ok(())
         }
-        SingleStep::Del(key) => txn.del(&key.0),
+        SingleStep::Del(key) => {
+            txn.del(&key.0)?;
+            Ok(())
+        }
         SingleStep::Touch => Ok(()),
+        SingleStep::Abort => Err(abort_marker()),
     }
 }
 
@@ -718,8 +726,12 @@ fn apply_multi_step(txn: &mut btree_store::Txn<'_>, step: &MultiStep) -> DbResul
             txn.update(&key.0, &value.0)?;
             Ok(())
         }
-        MultiStep::Del(_, key) => txn.del(&key.0),
+        MultiStep::Del(_, key) => {
+            txn.del(&key.0)?;
+            Ok(())
+        }
         MultiStep::Touch(_) => Ok(()),
+        MultiStep::Abort(_) => Err(abort_marker()),
     }
 }
 
@@ -729,6 +741,7 @@ fn multi_step_bucket(step: &MultiStep) -> &str {
         MultiStep::Update(bucket, _, _) => bucket.as_str(),
         MultiStep::Del(bucket, _) => bucket.as_str(),
         MultiStep::Touch(bucket) => bucket.as_str(),
+        MultiStep::Abort(bucket) => bucket.as_str(),
     }
 }
 
@@ -881,6 +894,12 @@ fn expect_db_err<T>(result: DbResult<T>, expected: Error, context: &str) {
         Ok(_) => panic!("{context} unexpectedly succeeded, expected {expected:?}"),
         Err(actual) => assert_eq!(actual, expected, "{context} returned wrong error"),
     }
+}
+
+/// No engine call produces this error on its own, so an `Abort` step and the
+/// model can name the same failure and the harness can still compare them.
+fn abort_marker() -> Error {
+    Error::InvalidKey(KeyError::Empty)
 }
 
 fuzz_target!(|case: ConcurrentCase| {

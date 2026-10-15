@@ -81,9 +81,24 @@ fn test_delete_nonexistent_key() {
 
     let key = b"nonexistent_key";
 
-    let result = tree.exec("default", |txn| txn.del(key));
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), btree_store::Error::KeyNotFound);
+    tree.exec("default", |txn| {
+        txn.put(b"kept", b"value")?;
+        assert!(!txn.del(key)?, "an absent key is reported as not deleted");
+        assert_eq!(
+            txn.get(b"kept")?,
+            b"value".to_vec(),
+            "deleting an absent key must leave existing state alone"
+        );
+        Ok(())
+    })
+    .unwrap();
+
+    tree.view("default", |txn| {
+        assert_eq!(txn.get(key), Err(Error::KeyNotFound));
+        assert_eq!(txn.get(b"kept")?, b"value".to_vec());
+        Ok(())
+    })
+    .expect("Failed to view");
 }
 
 #[test]
@@ -385,10 +400,6 @@ fn test_operations_on_missing_bucket_return_bucket_not_found() {
 
     let result = tree.exec("default", |txn| txn.del(b"nonexistent"));
     assert_eq!(result, Err(Error::BucketNotFound));
-
-    tree.new_bucket("default", false).unwrap();
-    let result = tree.exec("default", |txn| txn.del(b"nonexistent"));
-    assert_eq!(result, Err(Error::KeyNotFound));
 }
 
 #[test]

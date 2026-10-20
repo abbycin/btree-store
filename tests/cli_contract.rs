@@ -753,7 +753,6 @@ fn staging_is_private_and_never_removes_foreign_files() {
     );
 }
 
-
 #[test]
 fn option_terminator_and_non_utf8_paths_are_accepted() {
     let dir = TempDir::new().unwrap();

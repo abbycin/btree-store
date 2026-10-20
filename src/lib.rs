@@ -4226,10 +4226,7 @@ mod tests {
                 !txn.update(b"missing", b"x")?,
                 "an absent key is not updated"
             );
-            assert!(
-                !txn.del(b"missing")?,
-                "an absent key is not deleted"
-            );
+            assert!(!txn.del(b"missing")?, "an absent key is not deleted");
             assert_eq!(
                 txn.read.overlay_owned_pids(),
                 owned_before,

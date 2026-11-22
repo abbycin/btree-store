@@ -5,7 +5,6 @@ edition = "2024"
 rust-version = "1.95"
 authors = ["AbbyCin <abbytsing@gmail.com>"]
 readme = "README.md"
-homepage = "https://github.com/abbycin/btree-store"
 repository = "https://github.com/abbycin/btree-store"
 description = "A persistent, embedded key-value database"
 license = "MIT"

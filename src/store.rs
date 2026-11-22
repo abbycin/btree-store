@@ -253,7 +253,7 @@ impl TestFault {
         self.operation == operation
             && self
                 .remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     (remaining > 0).then_some(remaining - 1)
                 })
                 == Ok(1)

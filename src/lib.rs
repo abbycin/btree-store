@@ -1602,6 +1602,47 @@ impl TreeIterator<'_> {
         }
     }
 
+    /// Positions forward iteration at the first key greater than or equal to
+    /// `key`, without copying it.
+    ///
+    /// Returns whether such a key exists. The cursor is not advanced: the
+    /// positioned pair is returned by the next call to [`Self::next_ref`].
+    /// Reverse iteration is unaffected. A later `seek` discards the previous
+    /// forward position.
+    ///
+    /// `key` does not have to exist. An empty key positions at the smallest
+    /// key, and a key that sorts after every stored key returns `false`.
+    pub fn seek(&mut self, key: &[u8]) -> bool {
+        self.stack.clear();
+        self.current_leaf = None;
+        self.forward_initialized = true;
+
+        let Some(mut node) = self.load_root_node() else {
+            return false;
+        };
+
+        loop {
+            if node.is_leaf() {
+                let pos = match node.search(key) {
+                    Ok(pos) | Err(pos) => pos,
+                };
+                let has_more = pos < node.num_children()
+                    || self
+                        .stack
+                        .iter()
+                        .any(|(parent, next)| *next < parent.num_children());
+                self.current_leaf = Some((node, pos));
+                return has_more;
+            }
+
+            let pos = node.child_pos_for_key(key);
+            let child_id = node.child_at(pos);
+            let child = self.load_child_node(child_id);
+            self.stack.push((node, pos + 1));
+            node = child;
+        }
+    }
+
     /// Fills the supplied buffers with the next key/value pair in ascending
     /// key order. A newly created iterator starts at the smallest key.
     pub fn next_ref(&mut self, key_buf: &mut Vec<u8>, val_buf: &mut Vec<u8>) -> bool {
@@ -5259,6 +5300,127 @@ mod tests {
         assert!(reverse.stack.is_empty());
         assert!(reverse.reverse_initialized);
         assert!(!reverse.reverse_stack.is_empty());
+    }
+
+    #[test]
+    fn iterator_seek_positions_forward_at_the_lower_bound() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = test_store(&dir);
+        let mut tree = TestTree::new(store, RootRef::Empty);
+        for key in 0..200u32 {
+            tree.put(&padded_key(key), b"value").unwrap();
+        }
+
+        let mut iter = tree.iterator();
+        let mut key_buf = Vec::new();
+        let mut val_buf = Vec::new();
+
+        // Pin an existing reverse position so the later seek can be checked
+        // against it rather than against a fresh, uninitialized cursor.
+        assert!(iter.prev_ref(&mut key_buf, &mut val_buf));
+        assert_eq!(key_buf, padded_key(199));
+
+        for key in 0..200u32 {
+            assert!(iter.seek(&padded_key(key)), "seek must find key {key}");
+            assert!(iter.next_ref(&mut key_buf, &mut val_buf));
+            assert_eq!(key_buf, padded_key(key));
+            assert_eq!(val_buf, b"value".to_vec());
+        }
+
+        // This key sorts after the last entry of the leaf holding 71 and
+        // before the next separator, so the routed leaf has no entry at or
+        // after it: `has_more` must consult the ancestor cursor.
+        let mut boundary = padded_key(71);
+        boundary[3] = b'x';
+        assert!(
+            iter.seek(&boundary),
+            "a miss past a leaf's last key must find the sibling"
+        );
+        let (leaf, pos) = iter
+            .current_leaf
+            .as_ref()
+            .expect("seek must land on a leaf");
+        assert_eq!(
+            *pos,
+            leaf.num_children(),
+            "the boundary key must land past this leaf's last entry"
+        );
+        assert!(iter.next_ref(&mut key_buf, &mut val_buf));
+        assert_eq!(key_buf, padded_key(72));
+
+        let mut between = padded_key(73);
+        between[3] = b'x';
+        assert!(iter.seek(&between));
+        assert!(iter.next_ref(&mut key_buf, &mut val_buf));
+        assert_eq!(key_buf, padded_key(74), "a miss must land on the next key");
+
+        assert!(
+            !iter.seek(&padded_key(200)),
+            "a key past the end has no successor"
+        );
+        assert!(!iter.next_ref(&mut key_buf, &mut val_buf));
+
+        assert!(
+            iter.seek(b""),
+            "the empty key positions at the smallest key"
+        );
+        assert!(iter.next_ref(&mut key_buf, &mut val_buf));
+        assert_eq!(key_buf, padded_key(0));
+
+        assert!(iter.prev_ref(&mut key_buf, &mut val_buf));
+        assert_eq!(
+            key_buf,
+            padded_key(198),
+            "seek must not reposition reverse iteration"
+        );
+    }
+
+    #[test]
+    fn iterator_seek_handles_an_empty_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = test_store(&dir);
+        let tree = TestTree::new(store, RootRef::Empty);
+
+        let mut iter = tree.iterator();
+        let mut key_buf = Vec::new();
+        let mut val_buf = Vec::new();
+        assert!(!iter.seek(b"any"));
+        assert!(!iter.next_ref(&mut key_buf, &mut val_buf));
+        assert!(!iter.prev_ref(&mut key_buf, &mut val_buf));
+    }
+
+    #[test]
+    fn iterator_seek_reads_prefix_encoded_nodes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = BTree::open(dir.path().join("seek-prefix.db")).unwrap();
+        tree.new_bucket("encoded", true).unwrap();
+        tree.exec("encoded", |txn| {
+            for key in 0..1000u32 {
+                txn.put(format!("user/{key:05}"), [0x5au8; 64])?;
+            }
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        tree.view("encoded", |txn| {
+            let mut iter = txn.iter();
+            let mut key_buf = Vec::new();
+            let mut val_buf = Vec::new();
+
+            assert!(iter.seek(b"user/00500"));
+            assert!(iter.next_ref(&mut key_buf, &mut val_buf));
+            assert_eq!(key_buf, b"user/00500".to_vec());
+            assert_eq!(val_buf, vec![0x5a; 64]);
+
+            assert!(iter.seek(b"user/00500x"));
+            assert!(iter.next_ref(&mut key_buf, &mut val_buf));
+            assert_eq!(key_buf, b"user/00501".to_vec());
+
+            assert!(!iter.seek(b"user/99999"));
+            assert!(!iter.next_ref(&mut key_buf, &mut val_buf));
+            Ok::<_, Error>(())
+        })
+        .unwrap();
     }
 
     fn collect_physical_tree_pages(

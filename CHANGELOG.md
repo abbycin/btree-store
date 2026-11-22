@@ -2,6 +2,14 @@
 
 All notable changes to the **btree-store** project will be documented in this file.
 
+## [2.1.1] - 2026-11-22
+
+### Added
+- **`TreeIterator::seek(key)`** positions forward iteration at the first key greater than or equal
+  to `key` without copying skipped entries. Resuming a scan from a saved cursor is O(tree height)
+  instead of O(entries before the cursor) and never reads a skipped value. Reverse iteration is
+  unaffected; `Txn` and `ReadOnlyTxn` iterators both expose it.
+
 ## [2.1.0] - 2026-10-15
 
 ### Breaking
